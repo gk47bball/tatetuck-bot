@@ -97,19 +97,19 @@ def _cache_set(key: str, data: Any) -> None:
 
 def _request_with_retry(url: str, params: dict, timeout: int = 15,
                         max_retries: int = 3) -> Optional[requests.Response]:
-    """Make an HTTP GET with exponential backoff."""
+    """Make an HTTP GET with exponential backoff. Does NOT retry on 404s."""
     for attempt in range(max_retries):
         try:
             resp = requests.get(url, params=params, timeout=timeout)
+            if resp.status_code == 404:
+                return None  # Expected for pre-clinical drugs, don't retry
             resp.raise_for_status()
             return resp
         except requests.exceptions.RequestException as e:
             if attempt < max_retries - 1:
                 wait = 2 ** attempt
-                print(f"  [retry] attempt {attempt+1} failed for {url}: {e}, waiting {wait}s")
                 time.sleep(wait)
             else:
-                print(f"  [retry] all {max_retries} attempts failed for {url}: {e}")
                 return None
 
 
