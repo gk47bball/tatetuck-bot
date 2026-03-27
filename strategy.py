@@ -8,6 +8,8 @@ The agent's goal is to minimize valuation_error by making this
 strategy's predictions match real market outcomes.
 """
 
+import math
+
 # ─── Tunable Parameters ─────────────────────────────────────────────────────────
 # The agent can (and should) modify these.
 
@@ -119,9 +121,12 @@ def score_company(data: dict) -> dict:
             "reason": "No market cap data available",
         }
     
-    # Core signal: rNPV vs market cap
+    # Core signal: rNPV vs market cap (log-scaled)
     ratio = rnpv / market_cap
-    base_signal = (ratio - 1.0)  # positive = undervalued, negative = overvalued
+    if ratio > 0:
+        base_signal = math.log10(ratio)
+    else:
+        base_signal = -1.0
     
     # Cash runway adjustment
     cash = data.get("finance", {}).get("cash") or 0
