@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Biopharma AutoResearch — Experiment Dashboard</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  :root {
+    --bg: #0a0e1a;
+    --card: #111827;
+    --border: #1f2937;
+    --accent: #3b82f6;
+    --green: #10b981;
+    --red: #ef4444;
+    --yellow: #f59e0b;
+    --text: #e5e7eb;
+    --muted: #6b7280;
+    --glow: rgba(59, 130, 246, 0.15);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Inter', -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 2rem;
+  }
+
+  .header {
+    text-align: center;
+    margin-bottom: 2.5rem;
+  }
+
+  .header h1 {
+    font-size: 1.75rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, #3b82f6, #8b5cf6, #ec4899);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 0.5rem;
+  }
+
+  .header p {
+    color: var(--muted);
+    font-size: 0.875rem;
+  }
+
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 1rem;
+    margin-bottom: 2rem;
+  }
+
+  .stat-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem;
+    text-align: center;
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+
+  .stat-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 25px var(--glow);
+  }
+
+  .stat-card .label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    margin-bottom: 0.5rem;
+  }
+
+  .stat-card .value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1.5rem;
+    font-weight: 600;
+  }
+
+  .stat-card .value.good { color: var(--green); }
+  .stat-card .value.bad { color: var(--red); }
+  .stat-card .value.neutral { color: var(--yellow); }
+
+  .chart-container {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 2rem;
+  }
+
+  .chart-container h2 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 1rem;
+    color: var(--text);
+  }
+
+  canvas { width: 100% !important; }
+
+  .table-container {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    overflow-x: auto;
+  }
+
+  .table-container h2 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 1rem;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+
+  th, td {
+    padding: 0.6rem 0.8rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  th {
+    color: var(--muted);
+    font-weight: 500;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  tr.keep td { color: var(--green); }
+  tr.discard td { color: var(--muted); }
+  tr.crash td { color: var(--red); }
+
+  .status-badge {
+    display: inline-block;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.65rem;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+
+  .status-badge.keep { background: rgba(16,185,129,.15); color: var(--green); }
+  .status-badge.discard { background: rgba(107,114,128,.15); color: var(--muted); }
+  .status-badge.crash { background: rgba(239,68,68,.15); color: var(--red); }
+
+  .drop-zone {
+    border: 2px dashed var(--border);
+    border-radius: 12px;
+    padding: 3rem;
+    text-align: center;
+    color: var(--muted);
+    cursor: pointer;
+    transition: border-color 0.2s;
+    margin-bottom: 2rem;
+  }
+
+  .drop-zone:hover, .drop-zone.active {
+    border-color: var(--accent);
+    color: var(--text);
+  }
+
+  .drop-zone input { display: none; }
+
+  .hidden { display: none; }
+
+  .footer {
+    text-align: center;
+    margin-top: 2rem;
+    color: var(--muted);
+    font-size: 0.75rem;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🧬 Biopharma AutoResearch Dashboard</h1>
+  <p>Karpathy-style Autonomous Experiment Tracker</p>
+</div>
+
+<div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+  <p>📂 Drop <code>results.tsv</code> here or click to upload</p>
+  <input type="file" id="fileInput" accept=".tsv,.txt">
+</div>
+
+<div id="dashboard" class="hidden">
+
+  <div class="stats-grid" id="statsGrid"></div>
+
+  <div class="chart-container">
+    <h2>📉 Valuation Error Over Time</h2>
+    <canvas id="errorChart" height="250"></canvas>
+  </div>
+
+  <div class="table-container">
+    <h2>📋 Experiment Log</h2>
+    <table>
+      <thead>
+        <tr><th>#</th><th>Commit</th><th>Error</th><th>Δ</th><th>Status</th><th>Description</th></tr>
+      </thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+  </div>
+
+</div>
+
+<div class="footer">
+  <p>Biopharma AutoResearch — Built with the Karpathy Pattern</p>
+</div>
+
+<script>
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+
+fileInput.addEventListener('change', (e) => loadFile(e.target.files[0]));
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('active'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('active'));
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('active');
+  if (e.dataTransfer.files.length) loadFile(e.dataTransfer.files[0]);
+});
+
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = (e) => parseAndRender(e.target.result);
+  reader.readAsText(file);
+}
+
+function parseAndRender(text) {
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) return;
+
+  const experiments = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split('\t');
+    if (cols.length >= 4) {
+      experiments.push({
+        commit: cols[0],
+        error: parseFloat(cols[1]),
+        status: cols[2],
+        description: cols[3],
+      });
+    }
+  }
+
+  renderDashboard(experiments);
+}
+
+function renderDashboard(exps) {
+  document.getElementById('dashboard').classList.remove('hidden');
+  dropZone.classList.add('hidden');
+
+  const keeps = exps.filter(e => e.status === 'keep');
+  const bestError = keeps.length ? Math.min(...keeps.map(e => e.error)) : null;
+  const baseline = exps.length ? exps[0].error : null;
+  const improvement = baseline && bestError ? ((baseline - bestError) / baseline * 100).toFixed(1) : 0;
+  const totalExps = exps.length;
+  const keepRate = ((keeps.length / totalExps) * 100).toFixed(0);
+
+  // Stats cards
+  const statsGrid = document.getElementById('statsGrid');
+  statsGrid.innerHTML = `
+    <div class="stat-card">
+      <div class="label">Best Error</div>
+      <div class="value good">${bestError ? bestError.toFixed(4) : 'N/A'}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Baseline</div>
+      <div class="value neutral">${baseline ? baseline.toFixed(4) : 'N/A'}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Improvement</div>
+      <div class="value ${improvement > 0 ? 'good' : 'bad'}">${improvement}%</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Experiments</div>
+      <div class="value">${totalExps}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Keep Rate</div>
+      <div class="value ${keepRate > 30 ? 'good' : 'neutral'}">${keepRate}%</div>
+    </div>
+  `;
+
+  // Table
+  const tbody = document.getElementById('tableBody');
+  tbody.innerHTML = '';
+  let prevKeepError = null;
+  exps.forEach((exp, i) => {
+    const delta = prevKeepError !== null ? (exp.error - prevKeepError).toFixed(4) : '—';
+    const deltaColor = delta !== '—' ? (parseFloat(delta) < 0 ? 'good' : parseFloat(delta) > 0 ? 'bad' : '') : '';
+    if (exp.status === 'keep') prevKeepError = exp.error;
+
+    const tr = document.createElement('tr');
+    tr.className = exp.status;
+    tr.innerHTML = `
+      <td>${i + 1}</td>
+      <td>${exp.commit}</td>
+      <td>${exp.error.toFixed(6)}</td>
+      <td class="${deltaColor}">${delta}</td>
+      <td><span class="status-badge ${exp.status}">${exp.status}</span></td>
+      <td style="color:var(--text);font-family:'Inter',sans-serif">${exp.description}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  // Chart
+  drawChart(exps);
+}
+
+function drawChart(exps) {
+  const canvas = document.getElementById('errorChart');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  ctx.scale(dpr, dpr);
+
+  const W = rect.width;
+  const H = rect.height;
+  const pad = { top: 20, right: 30, bottom: 30, left: 60 };
+  const plotW = W - pad.left - pad.right;
+  const plotH = H - pad.top - pad.bottom;
+
+  const errors = exps.map(e => e.error);
+  const minE = Math.min(...errors) * 0.95;
+  const maxE = Math.max(...errors) * 1.05;
+
+  function x(i) { return pad.left + (i / (exps.length - 1 || 1)) * plotW; }
+  function y(v) { return pad.top + (1 - (v - minE) / (maxE - minE || 1)) * plotH; }
+
+  // Grid
+  ctx.strokeStyle = '#1f2937';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const yy = pad.top + (i / 4) * plotH;
+    ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(W - pad.right, yy); ctx.stroke();
+    const val = maxE - (i / 4) * (maxE - minE);
+    ctx.fillStyle = '#6b7280';
+    ctx.font = '11px JetBrains Mono';
+    ctx.textAlign = 'right';
+    ctx.fillText(val.toFixed(3), pad.left - 8, yy + 4);
+  }
+
+  // Line
+  ctx.strokeStyle = '#3b82f6';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  exps.forEach((e, i) => { i === 0 ? ctx.moveTo(x(i), y(e.error)) : ctx.lineTo(x(i), y(e.error)); });
+  ctx.stroke();
+
+  // Best-so-far line
+  ctx.strokeStyle = 'rgba(16,185,129,0.4)';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([5, 5]);
+  ctx.beginPath();
+  let best = Infinity;
+  exps.forEach((e, i) => {
+    if (e.status === 'keep' && e.error < best) best = e.error;
+    if (best < Infinity) { i === 0 ? ctx.moveTo(x(i), y(best)) : ctx.lineTo(x(i), y(best)); }
+  });
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Dots
+  exps.forEach((e, i) => {
+    ctx.beginPath();
+    ctx.arc(x(i), y(e.error), 4, 0, Math.PI * 2);
+    ctx.fillStyle = e.status === 'keep' ? '#10b981' : e.status === 'crash' ? '#ef4444' : '#6b7280';
+    ctx.fill();
+  });
+}
+
+// Auto-load if results.tsv is in same directory (for local dev)
+fetch('results.tsv').then(r => r.ok ? r.text() : null).then(t => { if (t) parseAndRender(t); }).catch(() => {});
+</script>
+</body>
+</html>
