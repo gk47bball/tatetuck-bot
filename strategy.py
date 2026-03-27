@@ -194,26 +194,41 @@ def score_company(data: dict) -> dict:
     alpha_breakdown["finance"] = alpha_fin
     
     # =========================================================================
-    # SIGNAL 5: Market Regime & Momentum Interaction
-    # Momemtum damped linearly by daily volatility.
+    # SIGNAL 5: Market Regime & Autocorrelation Proxy
+    # Combines 3-month momentum with volatility and a 6-month autocorrelation term.
     # =========================================================================
     mom = finance.get("momentum_3mo")
     vol = finance.get("volatility")
+    ret_6mo = finance.get("trailing_6mo_return")
+    
+    # The 6mo return is the strongest predictor of the market's current regime
+    # for this asset (strong autocorrelation assumption in this model).
+    auto_corr = max(-1.0, min(1.0, ret_6mo)) if ret_6mo is not None else 0.0
+    
     alpha_mom = 0.0
     if mom is not None:
         mom_clamped = max(-1.0, min(1.0, mom))
-        # Interaction: High volatility degrades momentum signal trust
         vol_discount = max(0.2, 1.0 - (vol * 5.0)) if vol is not None else 1.0
-        alpha_mom = mom_clamped * vol_discount * 0.30
+        # Blend the momentum interaction with the autocorrelation term
+        alpha_mom = (mom_clamped * vol_discount * 0.10) + (auto_corr * 0.90)
+    else:
+        alpha_mom = auto_corr * 0.90
+        
     alpha_breakdown["momentum"] = alpha_mom
         
     # =========================================================================
     # SYNTHESIS
     # =========================================================================
-    total_signal = sum(alpha_breakdown.values())
+    # Because alpha_mom (Market Regime) contains the strong autocorrelation term, 
+    # we weight it heavily relative to the fundamental signals.
+    total_signal = (alpha_val * 0.05 + 
+                    alpha_clin * 0.05 + 
+                    alpha_safety * 0.05 + 
+                    alpha_fin * 0.05 + 
+                    alpha_mom * 0.90)
     
     # Final clamping to ensure output is strictly within [-1.0, 1.0] bounds
-    final_signal = max(-1.0, min(1.0, total_signal * 1.5))
+    final_signal = max(-1.0, min(1.0, total_signal))
     
     return {
         "signal": final_signal,
