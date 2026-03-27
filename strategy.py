@@ -1,41 +1,34 @@
 """
-strategy.py — The file the AI agent modifies.
-This is the equivalent of Karpathy's train.py.
-
-Contains the scoring strategy that the agent iterates on.
-Everything here is fair game: weights, logic, formulas, heuristics.
-The agent's goal is to minimize valuation_error by making this
-strategy's predictions match real market outcomes.
+strategy.py — Alpha Stack V1
+A sophisticated, multi-layered, adaptive quant model for biopharma valuation.
 """
 
 import math
 
-# ─── Tunable Parameters ─────────────────────────────────────────────────────────
-# The agent can (and should) modify these.
+# ─── Baseline Parameters ────────────────────────────────────────────────────────
 
-PHASE_WEIGHTS = {
-    "EARLY_PHASE1": 0.055,
-    "PHASE1":       0.074,
-    "PHASE2":       0.152,
-    "PHASE3":       0.850,   # Market gives huge premium to late-stage
-    "NDA_BLA":      0.900,
-    "APPROVED":     1.000,
+PHASE_BASE = {
+    "EARLY_PHASE1": 0.05,
+    "PHASE1":       0.07,
+    "PHASE2":       0.15,
+    "PHASE3":       0.60,
+    "NDA_BLA":      0.85,
+    "APPROVED":     1.00,
 }
 
 DISEASE_MULTIPLIERS = {
-    "oncology":       1.05,
-    "rare disease":   1.35,
-    "hematology":     1.10,
-    "neurology":      0.70,
+    "oncology":       1.10,
+    "rare disease":   1.40,
+    "hematology":     1.15,
+    "neurology":      0.75,
     "immunology":     0.95,
     "infectious":     1.05,
-    "cardiovascular": 0.80,
+    "cardiovascular": 0.85,
     "metabolic":      0.90,
-    "gene therapy":   1.15,
-    "cell therapy":   1.10,
+    "gene therapy":   0.85,
+    "cell therapy":   0.85,
 }
 
-# Disease-specific TAMs
 DISEASE_TAMS = {
     "oncology":       8_000_000_000,
     "rare disease":   1_500_000_000,
@@ -48,162 +41,181 @@ DISEASE_TAMS = {
     "gene therapy":   2_000_000_000,
     "cell therapy":   2_500_000_000,
 }
-DEFAULT_TAM = 3_000_000_000
 
-DISCOUNT_RATE = 0.12
-PENETRATION_RATE = 0.15
-CASH_RUNWAY_WEIGHT = 0.30
-PIPELINE_BREADTH_WEIGHT = 0.05
-LITERATURE_WEIGHT = 0.12
-MOMENTUM_WEIGHT = 0.50        # 3-month price momentum signal
-ENROLLMENT_WEIGHT = 0.15      # Large enrollment = management conviction
-FDA_SAFETY_PENALTY = 0.10     # Penalty for high serious adverse event ratio
+# ─── Core Adaptive Functions ───────────────────────────────────────────────────
 
-# ─── Strategy Logic ──────────────────────────────────────────────────────────────
-
-def get_disease_multiplier(conditions: list) -> float:
-    """Return the highest-matching disease area multiplier."""
-    if not conditions:
-        return 1.0
-    cond_str = " ".join(conditions).lower()
-    best = 1.0
-    for area, mult in DISEASE_MULTIPLIERS.items():
-        if area in cond_str:
-            best = max(best, mult)
-    return best
-
-
-def get_disease_tam(conditions: list) -> float:
-    """Return the best-matching disease-specific TAM."""
-    if not conditions:
-        return DEFAULT_TAM
-    cond_str = " ".join(conditions).lower()
-    best_tam = DEFAULT_TAM
-    for area, tam in DISEASE_TAMS.items():
-        if area in cond_str:
-            best_tam = max(best_tam, tam)
-    return best_tam
-
-
-def estimate_pos(data: dict) -> float:
-    """Estimate probability of success purely from our own PHASE_WEIGHTS."""
+def estimate_dynamic_pos(data: dict) -> float:
+    """Dynamic POS driven by data volume and conviction metrics."""
     phase = data.get("best_phase", "PHASE1")
-    pos = PHASE_WEIGHTS.get(phase, 0.074)
+    base_pos = PHASE_BASE.get(phase, 0.05)
+    
+    # 1. Trial volume boost (Pipeline maturity)
+    phase_counts = data.get("phase_trial_counts", {})
+    phase_count = phase_counts.get(phase, 1)
+    trial_boost = math.log10(phase_count + 1) * 0.04
+    
+    # 2. Enrollment conviction (Max single enrollment)
+    max_enr = data.get("max_single_enrollment", 0)
+    enr_boost = min(math.log10(max_enr + 1) / 5.0, 1.0) * 0.08
+    
+    # 3. Literature backing (Academic interest proxy)
+    papers = data.get("num_papers", 0)
+    lit_boost = min(math.log10(papers + 1) / 3.0, 1.0) * 0.05
+    
+    # 4. Trial diversity index (Multiple condition targets = more shots on goal)
+    conditions = set(data.get("conditions", []))
+    diversity_boost = min(len(conditions), 5) * 0.015
+    
+    pos = base_pos + trial_boost + enr_boost + lit_boost + diversity_boost
+    
+    # Disease modifier
+    cond_str = " ".join(conditions).lower()
+    mult = 1.0
+    for area, m in DISEASE_MULTIPLIERS.items():
+        if area in cond_str:
+            mult = max(mult, m)
+    
+    pos *= mult
+    return min(pos, 0.99)
 
-    # Disease area adjustment
-    disease_mult = get_disease_multiplier(data.get("conditions", []))
-    pos *= disease_mult
+def estimate_advanced_rnpv(data: dict, pos: float) -> float:
+    """Advanced risk-adjusted NPV with commercial revenue differentiation."""
+    cond_str = " ".join(data.get("conditions", [])).lower()
+    tam = 3_000_000_000
+    for area, t in DISEASE_TAMS.items():
+        if area in cond_str:
+            tam = max(tam, t)
+            
+    finance = data.get("finance", {})
+    revenue = finance.get("totalRevenue", 0) or 0
+    
+    # Penalize TAM if competition is extremely high (e.g., oncology)
+    penetration = 0.15
+    if "oncology" in cond_str:
+        penetration = 0.08
+    elif "rare disease" in cond_str:
+        penetration = 0.25
+        
+    peak_revenue = tam * penetration
+    years_to_market = {
+        "EARLY_PHASE1": 10, "PHASE1": 8, "PHASE2": 5,
+        "PHASE3": 2, "NDA_BLA": 1, "APPROVED": 0,
+    }.get(data.get("best_phase", "PHASE1"), 8)
+    
+    discount_rate = 0.12
+    rnpv = 0.0
+    
+    if revenue > 25_000_000:
+        # Commercial Stage: Base valuation on actual revenue ramp + terminal value
+        # Assumes revenue represents a growing base
+        run_rate = revenue * 1.5
+        # Cap aggressive growth perpetuity 
+        terminal_value = run_rate / (discount_rate - 0.03) 
+        rnpv = terminal_value
+    else:
+        # Clinical Stage: Standard DCF of peak revenue
+        for yr in range(1, 15):
+            if yr <= years_to_market:
+                # Burn phase (simplified as negative cashflow based on phase trials)
+                burn = 50_000_000 / ((1 + discount_rate) ** yr)
+                rnpv -= burn
+                continue
+            cashflow = peak_revenue * 0.6 * min((yr - years_to_market) / 4.0, 1.0)
+            rnpv += (cashflow * pos) / ((1 + discount_rate) ** yr)
+            
+    return max(rnpv, 10_000_000.0) # Floor at 10M
 
-    return min(pos, 1.0)
-
-
-def estimate_rnpv(pos: float, tam: float, years_to_market: int = 5) -> float:
-    """Calculate risk-adjusted NPV."""
-    peak_revenue = tam * PENETRATION_RATE
-
-    total_npv = 0.0
-    total_years = years_to_market + 8
-    for year in range(1, total_years + 1):
-        if year <= years_to_market:
-            rev = peak_revenue * (year / years_to_market)
-        elif year <= years_to_market + 5:
-            rev = peak_revenue
-        else:
-            rev = peak_revenue * (0.80 ** (year - years_to_market - 5))
-        total_npv += rev / ((1 + DISCOUNT_RATE) ** year)
-
-    return total_npv * pos
-
+# ─── Main Scoring Engine ───────────────────────────────────────────────────────
 
 def score_company(data: dict) -> dict:
     """
-    Score a single company. This is the function that evaluate.py calls.
-
-    Must return a dict with at least:
-        "signal": float between -1.0 (strong sell) and +1.0 (strong buy)
-
-    The agent's goal is to make "signal" correlate with actual 6-month returns.
+    Evaluates a company using the Alpha Stack architecture.
+    Returns composite signal + alpha breakdown for transparency.
     """
-    pos = estimate_pos(data)
-    tam = get_disease_tam(data.get("conditions", []))
-
-    phase_years = {
-        "EARLY_PHASE1": 12, "PHASE1": 10, "PHASE2": 7,
-        "PHASE3": 3, "NDA_BLA": 1, "APPROVED": 0,
-    }
-    years = phase_years.get(data.get("best_phase", "PHASE1"), 10)
-
-    rnpv = estimate_rnpv(pos, tam, years)
-
-    market_cap = data.get("finance", {}).get("marketCap")
-
+    finance = data.get("finance", {})
+    market_cap = finance.get("marketCap")
     if not market_cap or market_cap <= 0:
-        return {
-            "signal": 0.0,
-            "pos": pos,
-            "rnpv": rnpv,
-            "reason": "No market cap data available",
-        }
-
-    # ── Core signal: rNPV vs market cap (log-scaled, dampened) ──
+        return {"signal": 0.0, "error": "No market cap"}
+        
+    pos = estimate_dynamic_pos(data)
+    rnpv = estimate_advanced_rnpv(data, pos)
+    
+    alpha_breakdown = {}
+    
+    # =========================================================================
+    # SIGNAL 1: Fundamental Value (rNPV vs Market Cap)
+    # Non-linear log-sigmoid squashing to prevent extreme outliers dominating.
+    # =========================================================================
     ratio = rnpv / market_cap
-    if ratio > 0:
-        base_signal = math.log10(ratio) * 0.25  # Dampen more to reduce dominance
-    else:
-        base_signal = -0.25
-
-    # ── Cash runway adjustment ──
-    cash = data.get("finance", {}).get("cash") or 0
-    debt = data.get("finance", {}).get("debt") or 0
-    if market_cap > 0:
-        cash_ratio = (cash - debt) / market_cap
-        base_signal += cash_ratio * CASH_RUNWAY_WEIGHT
-
-    # ── Pipeline breadth (scaled) ──
-    num_trials = data.get("num_trials", 0)
-    if num_trials > 3:
-        breadth_bonus = min(num_trials / 20.0, 1.0) * PIPELINE_BREADTH_WEIGHT
-        base_signal += breadth_bonus
-
-    # ── Enrollment conviction signal ──
-    max_enrollment = data.get("max_single_enrollment", 0)
-    if max_enrollment > 100:
-        # Larger enrollment = higher conviction from management
-        enrollment_bonus = min(math.log10(max_enrollment) / 4.0, 1.0) * ENROLLMENT_WEIGHT
-        base_signal += enrollment_bonus
-
-    # ── Literature bonus (scaled) ──
-    num_papers = data.get("num_papers", 0)
-    if num_papers > 0:
-        lit_bonus = min(num_papers / 5.0, 1.0) * LITERATURE_WEIGHT
-        base_signal += lit_bonus
-
-    # ── 3-month price momentum ──
-    momentum = data.get("finance", {}).get("momentum_3mo")
-    if momentum is not None:
-        # Momentum as a signal: positive momentum = tailwind
-        mom_signal = max(-1.0, min(1.0, momentum))
-        base_signal += mom_signal * MOMENTUM_WEIGHT
-
-    # ── FDA safety penalty ──
-    fda_serious_ratio = data.get("fda_serious_ratio", 0.0)
-    if fda_serious_ratio > 0.5:
-        base_signal -= fda_serious_ratio * FDA_SAFETY_PENALTY
-
-    # ── Clamp to [-1, 1] ──
-    signal = max(-1.0, min(1.0, base_signal))
-
+    val_sig = math.log10(ratio) if ratio > 0 else -1.0
+    # Squashing: sigmoid mapped to [-1, 1]
+    alpha_val = (2.0 / (1.0 + math.exp(-val_sig * 0.8)) - 1.0) * 0.35
+    alpha_breakdown["value"] = alpha_val
+    
+    # =========================================================================
+    # SIGNAL 2: Clinical Momentum & Conviction
+    # Uses max single enrollment + literature volume, applying power laws.
+    # =========================================================================
+    total_enr = data.get("total_enrollment", 0)
+    papers = data.get("num_papers", 0)
+    # Interaction: mass enrollment with high lit backing is a super-signal
+    clin_score = (math.log10(total_enr + 1) * 0.6) + (math.log10(papers + 1) * 0.4)
+    alpha_clin = (2.0 / (1.0 + math.exp(-clin_score * 0.5)) - 1.0) * 0.20
+    alpha_breakdown["clinical"] = alpha_clin
+    
+    # =========================================================================
+    # SIGNAL 3: FDA Safety Composite (Risk penalty)
+    # Scales serious events by enrollment to gauge true clinical risk profile.
+    # =========================================================================
+    serious = data.get("fda_serious_events", 0)
+    enr_floor = max(total_enr, 10) 
+    safety_ratio = serious / float(enr_floor)
+    
+    # Exponential decay penalty
+    safety_penalty = 1.0 - math.exp(-safety_ratio * 5.0)
+    alpha_safety = -min(safety_penalty, 1.0) * 0.15
+    alpha_breakdown["safety"] = alpha_safety
+    
+    # =========================================================================
+    # SIGNAL 4: Risk-Adjusted Financial Health
+    # Enterprise Value / Net Cash metric.
+    # =========================================================================
+    cash = finance.get("cash", 0) or 0
+    debt = finance.get("debt", 0) or 0
+    ev = finance.get("enterpriseValue", market_cap) or market_cap
+    
+    net_cash = cash - debt
+    ev_ratio = net_cash / max(ev, 1.0)
+    
+    # Clamp extreme cash positions
+    alpha_fin = max(-1.0, min(1.0, math.copysign(math.pow(abs(ev_ratio), 0.5), ev_ratio))) * 0.20
+    alpha_breakdown["finance"] = alpha_fin
+    
+    # =========================================================================
+    # SIGNAL 5: Market Regime & Momentum Interaction
+    # Momemtum damped linearly by daily volatility.
+    # =========================================================================
+    mom = finance.get("momentum_3mo")
+    vol = finance.get("volatility")
+    alpha_mom = 0.0
+    if mom is not None:
+        mom_clamped = max(-1.0, min(1.0, mom))
+        # Interaction: High volatility degrades momentum signal trust
+        vol_discount = max(0.2, 1.0 - (vol * 5.0)) if vol is not None else 1.0
+        alpha_mom = mom_clamped * vol_discount * 0.30
+    alpha_breakdown["momentum"] = alpha_mom
+        
+    # =========================================================================
+    # SYNTHESIS
+    # =========================================================================
+    total_signal = sum(alpha_breakdown.values())
+    
+    # Final clamping to ensure output is strictly within [-1.0, 1.0] bounds
+    final_signal = max(-1.0, min(1.0, total_signal * 1.5))
+    
     return {
-        "signal": signal,
-        "pos": round(pos, 4),
-        "rnpv": round(rnpv, 2),
-        "tam": tam,
-        "market_cap": market_cap,
-        "rnpv_to_mcap_ratio": round(ratio, 4),
-        "best_phase": data.get("best_phase"),
-        "num_trials": num_trials,
-        "max_enrollment": max_enrollment,
-        "num_papers": num_papers,
-        "momentum_3mo": momentum,
-        "fda_serious_ratio": fda_serious_ratio,
+        "signal": final_signal,
+        "pos": pos,
+        "rnpv": rnpv,
+        "alpha_breakdown": alpha_breakdown
     }
