@@ -52,9 +52,9 @@ DEFAULT_TAM = 3_000_000_000
 
 DISCOUNT_RATE = 0.12
 PENETRATION_RATE = 0.15
-CASH_RUNWAY_WEIGHT = 0.10
+CASH_RUNWAY_WEIGHT = 0.20
 PIPELINE_BREADTH_WEIGHT = 0.05
-LITERATURE_WEIGHT = 0.05
+LITERATURE_WEIGHT = 0.12
 MOMENTUM_WEIGHT = 0.40        # 3-month price momentum signal
 ENROLLMENT_WEIGHT = 0.15      # Large enrollment = management conviction
 FDA_SAFETY_PENALTY = 0.10     # Penalty for high serious adverse event ratio
