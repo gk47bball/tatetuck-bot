@@ -145,12 +145,12 @@ def score_company(data: dict) -> dict:
             "reason": "No market cap data available",
         }
 
-    # ── Core signal: rNPV vs market cap (log-scaled) ──
+    # ── Core signal: rNPV vs market cap (log-scaled, dampened) ──
     ratio = rnpv / market_cap
     if ratio > 0:
-        base_signal = math.log10(ratio)
+        base_signal = math.log10(ratio) * 0.5  # Dampen to reduce dominance
     else:
-        base_signal = -1.0
+        base_signal = -0.5
 
     # ── Cash runway adjustment ──
     cash = data.get("finance", {}).get("cash") or 0
