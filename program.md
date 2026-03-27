@@ -19,7 +19,14 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs the scoring strategy against 8 benchmark biopharma tickers. It fetches real clinical trial data from ClinicalTrials.gov, FDA safety data from openFDA, financial data from Yahoo Finance, and scientific literature from PubMed. The evaluation compares your strategy's predicted "signal" against each company's actual trailing 6-month stock return.
+Each experiment runs the scoring strategy against **20 benchmark biopharma tickers**. It fetches real clinical trial data from ClinicalTrials.gov, FDA safety data from openFDA, financial data from Yahoo Finance, and scientific literature from PubMed. API responses are cached to `.data_cache/` for 1 hour, so repeated runs are fast (~5 seconds with cached data).
+
+The evaluation computes a **composite metric** called `valuation_error`:
+- **50% Spearman Rank Correlation**: Did you rank the companies in the right order? (best → worst)
+- **30% Directional Accuracy**: Did you predict the right direction? (up vs down)
+- **20% Mean Absolute Error**: How close was your predicted magnitude?
+
+Note: predicting `0.0` for everything gets **zero credit** for directional accuracy. You must have conviction to score well.
 
 You launch it simply as: `python evaluate.py > run.log 2>&1`
 
@@ -32,7 +39,7 @@ You launch it simply as: `python evaluate.py > run.log 2>&1`
 - Install new packages or add dependencies.
 - Modify the evaluation harness. The `evaluate_strategy` function in `prepare.py` is the ground truth.
 
-**The goal is simple: get the lowest `valuation_error`.** This is the mean absolute error between your strategy's predicted signal and the actual trailing 6-month stock return (normalized to [-1, +1]). Lower is better.
+**The goal is simple: get the lowest `valuation_error`.** This is a composite metric combining Spearman rank correlation, directional accuracy, and MAE. Lower is better.
 
 **The first run**: Your very first run should always be to establish the baseline, so you will run the evaluation as is.
 
@@ -43,8 +50,11 @@ Once the script finishes it prints a summary like this:
 ```
 ---
 valuation_error:  0.543210
-num_scored:       8
-num_total:        8
+rank_correlation: 0.4500
+dir_accuracy:     0.6000
+mae:              0.3500
+num_scored:       20
+num_total:        20
 elapsed_seconds:  45.2
 ---
 ```
@@ -59,7 +69,7 @@ grep "^valuation_error:" run.log
 
 When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated).
 
-The TSV has a header row and 5 columns:
+The TSV has a header row and 4 columns:
 
 ```
 commit	valuation_error	status	description
@@ -101,15 +111,16 @@ The idea is that you are a completely autonomous biopharma researcher trying thi
 **Ideas to try:**
 - Adjust phase transition weights (maybe Phase 3 drugs deserve even more weight?)
 - Change disease area multipliers (maybe oncology is too harsh? maybe gene therapy deserves a premium?)
-- Modify the TAM estimation (use different defaults per disease area instead of one flat number)
+- Modify the TAM estimation (use different defaults per disease area — already seeded in DISEASE_TAMS)
 - Change the discount rate
 - Weight the cash/debt position differently
 - Add momentum signals from the financial data
 - Use the number and quality of PubMed publications as a signal
 - Invent entirely new scoring features from the available data
 - Combine signals in non-linear ways
+- Use `fda_serious_events` as a negative signal
 
-**Timeout**: Each experiment should take ~30-60 seconds total. If a run exceeds 3 minutes, kill it and treat it as a failure.
+**Timeout**: Each experiment should take ~5 seconds with cached data, ~90 seconds on first run. If a run exceeds 3 minutes, kill it and treat it as a failure.
 
 **Crashes**: If a run crashes (a bug, division by zero, etc.), use your judgment: If it's something dumb and easy to fix, fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash", and move on.
 

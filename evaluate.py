@@ -1,7 +1,7 @@
 """
 evaluate.py — Runner script.
 Calls prepare.py's evaluation function with strategy.py's logic.
-Outputs the single metric to stdout.
+Outputs the composite metric to stdout.
 
 Usage: python evaluate.py > run.log 2>&1
 """
@@ -32,9 +32,12 @@ def main():
         err = f"{r['error']:.4f}" if r['error'] is not None else "N/A"
         print(f"{r['ticker']:<8} {pred:>10} {actual:>10} {err:>10}")
     
-    # Print the key metric (same format as Karpathy's val_bpb output)
+    # Print the key metrics
     print(f"\n---")
     print(f"valuation_error:  {results['valuation_error']:.6f}")
+    print(f"rank_correlation: {results['rank_correlation']:.4f}")
+    print(f"dir_accuracy:     {results['directional_accuracy']:.4f}")
+    print(f"mae:              {results['mae']:.4f}" if results['mae'] is not None else "mae:              N/A")
     print(f"num_scored:       {results['num_scored']}")
     print(f"num_total:        {results['num_total']}")
     print(f"elapsed_seconds:  {elapsed:.1f}")

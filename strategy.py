@@ -17,7 +17,7 @@ PHASE_WEIGHTS = {
     "EARLY_PHASE1": 0.055,
     "PHASE1":       0.074,
     "PHASE2":       0.152,
-    "PHASE3":       0.590,
+    "PHASE3":       0.700,   # Experiment 1 finding: market over-weights late-stage
     "NDA_BLA":      0.900,
     "APPROVED":     1.000,
 }
@@ -35,9 +35,23 @@ DISEASE_MULTIPLIERS = {
     "cell therapy":   1.10,
 }
 
+# Disease-specific TAMs (instead of a flat $2B for everyone)
+DISEASE_TAMS = {
+    "oncology":       8_000_000_000,   # $8B  — large, competitive
+    "rare disease":   1_500_000_000,   # $1.5B — small pop, premium pricing
+    "hematology":     4_000_000_000,   # $4B
+    "neurology":      6_000_000_000,   # $6B  — huge unmet need
+    "immunology":     5_000_000_000,   # $5B
+    "infectious":     3_000_000_000,   # $3B
+    "cardiovascular": 7_000_000_000,   # $7B
+    "metabolic":      5_000_000_000,   # $5B
+    "gene therapy":   2_000_000_000,   # $2B  — small pop, very high price per patient
+    "cell therapy":   2_500_000_000,   # $2.5B
+}
+DEFAULT_TAM = 3_000_000_000   # $3B fallback
+
 DISCOUNT_RATE = 0.12
 PENETRATION_RATE = 0.15
-DEFAULT_TAM = 2_000_000_000   # $2B default TAM assumption
 CASH_RUNWAY_WEIGHT = 0.10     # How much cash position influences signal
 PIPELINE_BREADTH_WEIGHT = 0.05  # Bonus for multiple trials
 LITERATURE_WEIGHT = 0.05      # Bonus for strong publication record
@@ -56,12 +70,27 @@ def get_disease_multiplier(conditions: list) -> float:
     return best
 
 
+def get_disease_tam(conditions: list) -> float:
+    """Return the best-matching disease-specific TAM."""
+    if not conditions:
+        return DEFAULT_TAM
+    cond_str = " ".join(conditions).lower()
+    best_tam = DEFAULT_TAM
+    for area, tam in DISEASE_TAMS.items():
+        if area in cond_str:
+            best_tam = max(best_tam, tam)
+    return best_tam
+
+
 def estimate_pos(data: dict) -> float:
-    """Estimate probability of success from trial data."""
-    base_pos = data.get("base_pos", 0.074)
-    phase_pos = PHASE_WEIGHTS.get(data.get("best_phase", "PHASE1"), 0.074)
-    # Use the higher of the two (in case we have better phase data)
-    pos = max(base_pos, phase_pos)
+    """Estimate probability of success from trial data.
+    
+    NOTE: We compute POS purely from our own PHASE_WEIGHTS,
+    ignoring data['base_pos'] from prepare.py, so the agent has
+    full control over these weights.
+    """
+    phase = data.get("best_phase", "PHASE1")
+    pos = PHASE_WEIGHTS.get(phase, 0.074)
     
     # Disease area adjustment
     disease_mult = get_disease_multiplier(data.get("conditions", []))
@@ -99,7 +128,7 @@ def score_company(data: dict) -> dict:
     The agent's goal is to make "signal" correlate with actual 6-month returns.
     """
     pos = estimate_pos(data)
-    tam = DEFAULT_TAM
+    tam = get_disease_tam(data.get("conditions", []))
     
     # Phase-based years to market
     phase_years = {
@@ -135,15 +164,17 @@ def score_company(data: dict) -> dict:
         cash_ratio = (cash - debt) / market_cap
         base_signal += cash_ratio * CASH_RUNWAY_WEIGHT
     
-    # Pipeline breadth bonus
+    # Pipeline breadth bonus (scaled, not binary)
     num_trials = data.get("num_trials", 0)
-    if num_trials > 5:
-        base_signal += PIPELINE_BREADTH_WEIGHT
+    if num_trials > 3:
+        breadth_bonus = min(num_trials / 20.0, 1.0) * PIPELINE_BREADTH_WEIGHT
+        base_signal += breadth_bonus
     
-    # Literature bonus
+    # Literature bonus (scaled, not binary)
     num_papers = data.get("num_papers", 0)
-    if num_papers > 3:
-        base_signal += LITERATURE_WEIGHT
+    if num_papers > 0:
+        lit_bonus = min(num_papers / 5.0, 1.0) * LITERATURE_WEIGHT
+        base_signal += lit_bonus
     
     # Clamp to [-1, 1]
     signal = max(-1.0, min(1.0, base_signal))
@@ -152,6 +183,7 @@ def score_company(data: dict) -> dict:
         "signal": signal,
         "pos": round(pos, 4),
         "rnpv": round(rnpv, 2),
+        "tam": tam,
         "market_cap": market_cap,
         "rnpv_to_mcap_ratio": round(ratio, 4),
         "best_phase": data.get("best_phase"),
