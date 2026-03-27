@@ -55,7 +55,7 @@ PENETRATION_RATE = 0.15
 CASH_RUNWAY_WEIGHT = 0.10
 PIPELINE_BREADTH_WEIGHT = 0.05
 LITERATURE_WEIGHT = 0.05
-MOMENTUM_WEIGHT = 0.20        # 3-month price momentum signal
+MOMENTUM_WEIGHT = 0.40        # 3-month price momentum signal
 ENROLLMENT_WEIGHT = 0.08      # Large enrollment = management conviction
 FDA_SAFETY_PENALTY = 0.10     # Penalty for high serious adverse event ratio
 
