@@ -17,7 +17,7 @@ PHASE_WEIGHTS = {
     "EARLY_PHASE1": 0.055,
     "PHASE1":       0.074,
     "PHASE2":       0.152,
-    "PHASE3":       0.800,   # Market gives huge premium to late-stage
+    "PHASE3":       0.850,   # Market gives huge premium to late-stage
     "NDA_BLA":      0.900,
     "APPROVED":     1.000,
 }
@@ -52,7 +52,7 @@ DEFAULT_TAM = 3_000_000_000
 
 DISCOUNT_RATE = 0.12
 PENETRATION_RATE = 0.15
-CASH_RUNWAY_WEIGHT = 0.20
+CASH_RUNWAY_WEIGHT = 0.30
 PIPELINE_BREADTH_WEIGHT = 0.05
 LITERATURE_WEIGHT = 0.12
 MOMENTUM_WEIGHT = 0.40        # 3-month price momentum signal
@@ -148,9 +148,9 @@ def score_company(data: dict) -> dict:
     # ── Core signal: rNPV vs market cap (log-scaled, dampened) ──
     ratio = rnpv / market_cap
     if ratio > 0:
-        base_signal = math.log10(ratio) * 0.5  # Dampen to reduce dominance
+        base_signal = math.log10(ratio) * 0.25  # Dampen more to reduce dominance
     else:
-        base_signal = -0.5
+        base_signal = -0.25
 
     # ── Cash runway adjustment ──
     cash = data.get("finance", {}).get("cash") or 0
