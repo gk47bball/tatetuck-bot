@@ -160,7 +160,8 @@ def score_company(data: dict) -> dict:
     papers = data.get("num_papers", 0)
     # Interaction: mass enrollment with high lit backing is a super-signal
     clin_score = (math.log10(total_enr + 1) * 0.6) + (math.log10(papers + 1) * 0.4)
-    alpha_clin = (2.0 / (1.0 + math.exp(-clin_score * 0.5)) - 1.0) * 0.20
+    # Zero-center: typical biotech has ~2.0 clinical score. Shift by 2.0.
+    alpha_clin = (2.0 / (1.0 + math.exp(-(clin_score - 2.0) * 1.5)) - 1.0) * 0.20
     alpha_breakdown["clinical"] = alpha_clin
     
     # =========================================================================
@@ -187,8 +188,9 @@ def score_company(data: dict) -> dict:
     net_cash = cash - debt
     ev_ratio = net_cash / max(ev, 1.0)
     
-    # Clamp extreme cash positions
-    alpha_fin = max(-1.0, min(1.0, math.copysign(math.pow(abs(ev_ratio), 0.5), ev_ratio))) * 0.20
+    # Most biotechs have ~0.2 to 0.4 EV ratio (cash represents 20-40% of EV). Shift by 0.3.
+    fin_score = ev_ratio - 0.3
+    alpha_fin = max(-1.0, min(1.0, math.copysign(math.pow(abs(fin_score), 0.7), fin_score) * 2.0)) * 0.20
     alpha_breakdown["finance"] = alpha_fin
     
     # =========================================================================
