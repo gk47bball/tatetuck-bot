@@ -17,7 +17,7 @@ PHASE_WEIGHTS = {
     "EARLY_PHASE1": 0.055,
     "PHASE1":       0.074,
     "PHASE2":       0.152,
-    "PHASE3":       0.700,
+    "PHASE3":       0.800,   # Market gives huge premium to late-stage
     "NDA_BLA":      0.900,
     "APPROVED":     1.000,
 }
@@ -56,7 +56,7 @@ CASH_RUNWAY_WEIGHT = 0.10
 PIPELINE_BREADTH_WEIGHT = 0.05
 LITERATURE_WEIGHT = 0.05
 MOMENTUM_WEIGHT = 0.40        # 3-month price momentum signal
-ENROLLMENT_WEIGHT = 0.08      # Large enrollment = management conviction
+ENROLLMENT_WEIGHT = 0.15      # Large enrollment = management conviction
 FDA_SAFETY_PENALTY = 0.10     # Penalty for high serious adverse event ratio
 
 # ─── Strategy Logic ──────────────────────────────────────────────────────────────
