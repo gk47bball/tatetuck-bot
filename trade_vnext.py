@@ -14,7 +14,13 @@ from dataclasses import replace
 import prepare
 
 from biopharma_agent.vnext import TatetuckPlatform, VNextSettings, build_readiness_report
-from biopharma_agent.vnext.execution import AlpacaPaperBroker, PMExecutionPlanner, execute_plan, record_trade_run
+from biopharma_agent.vnext.execution import (
+    AlpacaPaperBroker,
+    DiscordTradeNotifier,
+    PMExecutionPlanner,
+    execute_plan,
+    record_trade_run,
+)
 from biopharma_agent.vnext.ops import utc_now_iso
 from biopharma_agent.vnext.storage import LocalResearchStore
 
@@ -74,6 +80,7 @@ def main() -> None:
     positions = []
     submissions = []
     plan = None
+    notification = None
     try:
         if broker.is_configured():
             account = broker.account()
@@ -107,6 +114,16 @@ def main() -> None:
             store=store,
             submit=submit,
         )
+        if submit and submissions:
+            notifier = DiscordTradeNotifier(settings=settings)
+            try:
+                notification = notifier.post_trade_alert(
+                    plan=plan,
+                    submissions=submissions,
+                    instructions=plan.instructions,
+                )
+            except Exception as exc:
+                plan.warnings.append(f"Discord trade alert failed: {type(exc).__name__}: {exc}")
         record_trade_run(
             store=store,
             settings=settings,
@@ -157,6 +174,14 @@ def main() -> None:
     print(f"deployable_notional:       {plan.deployable_notional:,.2f}")
     print(f"selected_symbols:          {', '.join(plan.selected_symbols) if plan.selected_symbols else 'none'}")
     print(f"submitted_orders:          {len([item for item in submissions if item.status == 'submitted'])}")
+    if notification is not None:
+        print(
+            "discord_trade_alert:       "
+            f"posted to {notification.channel_id} ({notification.order_count} orders"
+            f"{', fallback' if notification.fallback_used else ''})"
+        )
+    else:
+        print("discord_trade_alert:       none")
 
     print("\n[blockers]")
     if plan.blockers:

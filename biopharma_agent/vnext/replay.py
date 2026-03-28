@@ -181,6 +181,8 @@ class HistoricalReplayEngine:
             self.store.write_feature_vectors(vectors)
             feature_rows_written += len(vectors)
             program_vectors = [vector for vector in vectors if not vector.metadata.get("aggregate")]
+            if not program_vectors:
+                program_vectors = [vector for vector in vectors if vector.metadata.get("aggregate")]
             predictions = self.ensemble.score(program_vectors)
             prediction_rows_written += len(predictions)
 

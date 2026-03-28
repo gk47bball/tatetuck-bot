@@ -28,6 +28,9 @@ class VNextSettings:
     store_dir: str = ".tatetuck_store"
     eodhd_api_key: str | None = None
     sec_user_agent: str = "TatetuckBot/1.0 support@tatetuck.local"
+    discord_token: str | None = None
+    discord_channel_id: str | None = None
+    discord_trade_log_channel_id: str | None = None
     alpaca_api_key_id: str | None = None
     alpaca_api_secret_key: str | None = None
     alpaca_api_base_url: str = "https://paper-api.alpaca.markets"
@@ -61,6 +64,9 @@ class VNextSettings:
             store_dir=os.environ.get("TATETUCK_STORE_DIR", ".tatetuck_store"),
             eodhd_api_key=os.environ.get("EODHD_API_KEY"),
             sec_user_agent=os.environ.get("SEC_USER_AGENT", "TatetuckBot/1.0 support@tatetuck.local"),
+            discord_token=os.environ.get("DISCORD_TOKEN") or os.environ.get("DISCORD_BOT_TOKEN"),
+            discord_channel_id=os.environ.get("DISCORD_CHANNEL_ID") or os.environ.get("TATETUCK_DISCORD_CHANNEL_ID"),
+            discord_trade_log_channel_id=os.environ.get("DISCORD_TRADE_LOG_CHANNEL_ID"),
             alpaca_api_key_id=os.environ.get("APCA_API_KEY_ID"),
             alpaca_api_secret_key=os.environ.get("APCA_API_SECRET_KEY"),
             alpaca_api_base_url=os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets"),
@@ -91,6 +97,9 @@ class VNextSettings:
     def public_metadata(self) -> dict[str, object]:
         payload = asdict(self)
         payload["eodhd_api_key"] = bool(self.eodhd_api_key)
+        payload["discord_token"] = bool(self.discord_token)
+        payload["discord_channel_id"] = bool(self.discord_channel_id)
+        payload["discord_trade_log_channel_id"] = bool(self.discord_trade_log_channel_id)
         payload["alpaca_api_key_id"] = bool(self.alpaca_api_key_id)
         payload["alpaca_api_secret_key"] = bool(self.alpaca_api_secret_key)
         return payload

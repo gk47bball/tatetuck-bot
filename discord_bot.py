@@ -15,6 +15,7 @@ from prepare import HOLDOUT_TICKERS, TRAIN_TICKERS
 
 from biopharma_agent.vnext import TatetuckPlatform, VNextSettings, build_readiness_report
 from biopharma_agent.vnext.storage import LocalResearchStore
+from biopharma_agent.vnext.taxonomy import event_type_priority
 
 
 load_dotenv()
@@ -165,6 +166,7 @@ def build_bot() -> commands.Bot:
                 include_literature=False,
                 prefer_archive=True,
                 fallback_to_archive=True,
+                persist=False,
             ),
         )
 
@@ -178,6 +180,7 @@ def build_bot() -> commands.Bot:
                 include_literature=False,
                 prefer_archive=True,
                 fallback_to_archive=True,
+                persist=False,
             ),
         )
 
@@ -200,9 +203,52 @@ def build_bot() -> commands.Bot:
                     return text_channel
         return None
 
+    def format_money(value: float | None) -> str:
+        if value is None:
+            return "n/a"
+        absolute = abs(float(value))
+        if absolute >= 1_000_000_000:
+            return f"${value / 1_000_000_000:.2f}B"
+        if absolute >= 1_000_000:
+            return f"${value / 1_000_000:.1f}M"
+        return f"${value:,.0f}"
+
+    def runway_label(snapshot) -> str:
+        runway = float(snapshot.metadata.get("runway_months", 0.0) or 0.0)
+        capped = bool(snapshot.metadata.get("runway_months_capped"))
+        if capped:
+            return "120m+"
+        if runway <= 0:
+            return "0m"
+        return f"{runway:.1f}m"
+
+    def primary_catalyst(snapshot, preferred_event_type: str | None = None):
+        if not snapshot.catalyst_events:
+            return None
+        candidates = snapshot.catalyst_events
+        if preferred_event_type:
+            typed_candidates = [event for event in snapshot.catalyst_events if event.event_type == preferred_event_type]
+            if typed_candidates:
+                candidates = typed_candidates
+        return min(
+            candidates,
+            key=lambda event: (-event_type_priority(event.event_type), event.horizon_days, -event.importance),
+        )
+
     def build_tearsheet_embed(analysis) -> discord.Embed:
+        snapshot = analysis.snapshot
+        primary_event = primary_catalyst(snapshot, analysis.signal.primary_event_type)
+        lead_program = snapshot.programs[0] if snapshot.programs else None
+        approved_names = ", ".join(item.name for item in snapshot.approved_products[:2]) if snapshot.approved_products else ""
+        commercial_truth = (
+            approved_names
+            if approved_names
+            else ("reported commercial revenue (product map unverified)" if snapshot.metadata.get("commercial_revenue_present") else "pre-commercial")
+        )
+        net_cash = snapshot.cash - snapshot.debt
+        source = analysis.metadata.get("analysis_source", "unknown")
         embed = discord.Embed(
-            title=f"Tatetuck Analyst Tear Sheet: {analysis.snapshot.ticker}",
+            title=f"Tatetuck Analyst Tear Sheet: {snapshot.ticker}",
             description="Event-driven biopharma alpha profile",
             color=0x2ecc71 if analysis.signal.expected_return > 0 else 0xe74c3c,
         )
@@ -214,22 +260,78 @@ def build_bot() -> commands.Bot:
         embed.add_field(name="Catalyst Success", value=f"{analysis.signal.catalyst_success_prob * 100:.1f}%", inline=True)
         embed.add_field(name="Financing Risk", value=f"{analysis.signal.financing_risk:.2f}", inline=True)
 
+        if primary_event is not None:
+            timing_confidence = {
+                "calendar_estimate": "medium",
+                "estimated_from_revenue": "medium",
+                "phase_timing_estimate": "low",
+            }.get(primary_event.status, "medium")
+            embed.add_field(
+                name="Primary Event",
+                value=(
+                    f"{primary_event.title}\n"
+                    f"Type: `{primary_event.event_type}` | Date: `{primary_event.expected_date or 'TBD'}`\n"
+                    f"Horizon: `{primary_event.horizon_days}d` | Timing confidence: `{timing_confidence}`"
+                ),
+                inline=False,
+            )
+
         embed.add_field(
-            name="How To Read This",
-            value="Higher confidence + higher target weight usually means the bot sees a cleaner catalyst setup with less financing risk.",
+            name="Why Now",
+            value=analysis.metadata.get("why_now", "Why-now context is still loading."),
             inline=False,
         )
 
         rationale = "\n".join(f"• {line}" for line in analysis.signal.rationale[:4]) or "No rationale available."
         embed.add_field(name="Core Thesis", value=rationale, inline=False)
 
-        if analysis.snapshot.programs:
-            program_lines = []
-            for program in analysis.snapshot.programs[:3]:
-                catalyst = program.catalyst_events[0] if program.catalyst_events else None
-                horizon = catalyst.horizon_days if catalyst else 180
-                program_lines.append(f"**{program.name}** | {program.phase} | {horizon}d catalyst")
-            embed.add_field(name="Program Dashboard", value="\n".join(program_lines), inline=False)
+        if lead_program is not None:
+            lead_condition = lead_program.conditions[0] if lead_program.conditions else "unspecified indication"
+            lead_catalyst = lead_program.catalyst_events[0] if lead_program.catalyst_events else None
+            lead_date = lead_catalyst.expected_date if lead_catalyst else "TBD"
+            embed.add_field(
+                name="Lead Program",
+                value=(
+                    f"{lead_program.name} | {lead_program.phase} | {lead_condition}\n"
+                    f"Lead event: `{lead_catalyst.event_type if lead_catalyst else 'none'}` on `{lead_date}`"
+                ),
+                inline=False,
+            )
+
+        embed.add_field(
+            name="Balance Sheet",
+            value=(
+                f"Mkt Cap: {format_money(snapshot.market_cap)} | EV: {format_money(snapshot.enterprise_value)}\n"
+                f"Revenue: {format_money(snapshot.revenue)} | Cash: {format_money(snapshot.cash)} | Net Cash: {format_money(net_cash)}\n"
+                f"Runway: {runway_label(snapshot)}"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="Commercial Reality",
+            value=f"{commercial_truth}\nSource: `{source}` | As of: `{snapshot.as_of[:10]}`",
+            inline=False,
+        )
+
+        embed.add_field(
+            name="Market Setup",
+            value=analysis.metadata.get("expectations_summary", "Expectations context unavailable."),
+            inline=False,
+        )
+
+        valuation_summary = analysis.metadata.get("valuation_summary", "Valuation context unavailable.")
+        peer_tickers = analysis.metadata.get("peer_tickers") or []
+        if peer_tickers:
+            valuation_summary = f"{valuation_summary}\nClosest archived peers: {', '.join(peer_tickers)}"
+        embed.add_field(name="Valuation Lens", value=valuation_summary, inline=False)
+
+        kill_points = analysis.metadata.get("kill_points") or []
+        embed.add_field(
+            name="What Breaks The Thesis",
+            value="\n".join(f"• {item}" for item in kill_points[:3]),
+            inline=False,
+        )
 
         if analysis.portfolio.risk_flags:
             embed.add_field(name="Risk Flags", value=", ".join(analysis.portfolio.risk_flags), inline=False)
@@ -254,13 +356,20 @@ def build_bot() -> commands.Bot:
             color=0x3498DB,
         )
         for index, analysis in enumerate(top_picks, 1):
+            primary_event = primary_catalyst(analysis.snapshot, analysis.signal.primary_event_type)
+            event_line = (
+                f"**Event**: {primary_event.event_type} on {primary_event.expected_date}"
+                if primary_event is not None
+                else "**Event**: none"
+            )
             embed.add_field(
                 name=f"#{index} — {analysis.snapshot.ticker}",
                 value=(
                     f"**Confidence**: {analysis.signal.confidence * 100:.1f}% | "
                     f"**Target Weight**: {analysis.portfolio.target_weight:.1f}%\n"
                     f"**Expected Return**: {analysis.signal.expected_return * 100:+.1f}% | "
-                    f"**Scenario**: {analysis.portfolio.scenario}"
+                    f"**Scenario**: {analysis.portfolio.scenario}\n"
+                    f"{event_line}"
                 ),
                 inline=False,
             )

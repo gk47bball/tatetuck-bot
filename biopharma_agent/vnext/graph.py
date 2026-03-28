@@ -29,6 +29,41 @@ MODALITY_KEYWORDS = {
     "rna": ("rna", "sirna", "oligo", "as0", "antisense"),
 }
 
+LOW_SIGNAL_TRIAL_KEYWORDS = (
+    "non interventional",
+    "observational",
+    "long-term follow-up",
+    "long term follow-up",
+    "specimen collection",
+    "expanded access",
+    "registry",
+    "follow-up study",
+    "healthy volunteer",
+    "healthy volunteers",
+)
+
+APPROVED_PRODUCT_REGISTRY = {
+    "APLS": [
+        ("Syfovre", "geographic atrophy"),
+        ("Empaveli", "PNH / C3 glomerulopathy"),
+    ],
+    "CRSP": [
+        ("CASGEVY", "sickle cell disease / transfusion-dependent beta-thalassemia"),
+    ],
+    "IOVA": [
+        ("Amtagvi", "advanced melanoma"),
+    ],
+    "MDGL": [
+        ("Rezdiffra", "MASH / NASH"),
+    ],
+    "MRNA": [
+        ("Spikevax", "COVID-19"),
+    ],
+    "NVAX": [
+        ("Nuvaxovid", "COVID-19"),
+    ],
+}
+
 PHASE_HORIZONS = {
     "APPROVED": 45,
     "NDA_BLA": 120,
@@ -48,15 +83,83 @@ def infer_modality(text: str) -> str:
 
 
 def infer_runway_months(revenue: float, cash: float, debt: float, num_trials: int) -> float:
-    gross_burn = 25_000_000 + (num_trials * 6_000_000)
-    net_burn = max(10_000_000, gross_burn - max(revenue * 0.15, 0.0))
+    gross_burn = 18_000_000 + (num_trials * 8_000_000)
+    revenue_offset = min(max(revenue * 0.04, 0.0), gross_burn * 0.55)
+    net_burn = gross_burn - revenue_offset
+    if revenue > 500_000_000:
+        net_burn = max(net_burn, 120_000_000)
+    elif revenue > 100_000_000:
+        net_burn = max(net_burn, 75_000_000)
+    elif revenue > 25_000_000:
+        net_burn = max(net_burn, 40_000_000)
+    else:
+        net_burn = max(net_burn, 15_000_000)
     net_cash = cash - debt
     if net_cash <= 0:
         return 0.0
-    return (net_cash / net_burn) * 12.0
+    return min((net_cash / net_burn) * 12.0, 120.0)
 
 
-def _build_catalyst(program_id: str | None, event_type: str, title: str, horizon_days: int, probability: float, importance: float, crowdedness: float, as_of: datetime) -> CatalystEvent:
+def _trial_text(trial: Trial) -> str:
+    return " ".join(
+        item
+        for item in [
+            trial.title,
+            " ".join(trial.conditions),
+            " ".join(trial.interventions),
+        ]
+        if item
+    ).lower()
+
+
+def _is_low_signal_trial(trial: Trial) -> bool:
+    text = _trial_text(trial)
+    return any(keyword in text for keyword in LOW_SIGNAL_TRIAL_KEYWORDS)
+
+
+def _program_catalyst_title(program_name: str, phase: str, conditions: list[str]) -> str:
+    phase_labels = {
+        "APPROVED": "commercial update",
+        "NDA_BLA": "regulatory decision",
+        "PHASE3": "phase 3 readout",
+        "PHASE2": "phase 2 readout",
+        "PHASE1": "phase 1 update",
+        "EARLY_PHASE1": "early-phase update",
+    }
+    label = phase_labels.get(phase, "clinical update")
+    if conditions:
+        return f"{program_name} {label} in {conditions[0]}"
+    return f"{program_name} {label}"
+
+
+def _approved_products_for_company(ticker: str, revenue: float, growth_signal: float) -> list[ApprovedProduct]:
+    registered = APPROVED_PRODUCT_REGISTRY.get(ticker.upper(), [])
+    if not registered:
+        return []
+    revenue_per_product = (revenue / len(registered)) if registered and revenue > 0 else 0.0
+    return [
+        ApprovedProduct(
+            product_id=f"{ticker}:approved:{index}",
+            name=name,
+            indication=indication,
+            annual_revenue=revenue_per_product,
+            growth_signal=growth_signal,
+        )
+        for index, (name, indication) in enumerate(registered, start=1)
+    ]
+
+
+def _build_catalyst(
+    program_id: str | None,
+    event_type: str,
+    title: str,
+    horizon_days: int,
+    probability: float,
+    importance: float,
+    crowdedness: float,
+    as_of: datetime,
+    status: str = "anticipated",
+) -> CatalystEvent:
     expected_date = as_of + timedelta(days=horizon_days)
     event_id = f"{program_id or 'company'}:{event_type}:{horizon_days}"
     return CatalystEvent(
@@ -69,6 +172,7 @@ def _build_catalyst(program_id: str | None, event_type: str, title: str, horizon
         probability=probability,
         importance=importance,
         crowdedness=crowdedness,
+        status=status,
     )
 
 
@@ -104,6 +208,8 @@ def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -
             enrollment=int(trial.get("enrollment") or 0),
             primary_outcomes=list(trial.get("primary_outcomes", [])),
         )
+        if _is_low_signal_trial(trial_entity):
+            continue
         trials_by_program[program_name].append(trial_entity)
         conditions_by_program[program_name].update(trial_entity.conditions)
 
@@ -121,12 +227,13 @@ def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -
             _build_catalyst(
                 program_id=f"{raw.get('ticker')}:{idx}",
                 event_type=program_event_type_for_phase(phase),
-                title=f"{program_name} next milestone",
+                title=_program_catalyst_title(program_name, phase, conditions),
                 horizon_days=PHASE_HORIZONS.get(phase, 180),
                 probability=0.45 + min(pos_prior * 0.4, 0.35),
                 importance=0.55 + min(tam_estimate / 10_000_000_000, 0.35),
                 crowdedness=0.20 if modality in {"rare disease", "gene editing"} else 0.35,
                 as_of=as_of,
+                status="phase_timing_estimate",
             )
         ]
         company_catalysts.extend(program_catalysts)
@@ -146,27 +253,25 @@ def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -
         )
 
     revenue = float(finance.get("totalRevenue") or 0.0)
-    approved_products: list[ApprovedProduct] = []
+    growth_signal = float(finance.get("momentum_3mo") or 0.0)
+    approved_products = _approved_products_for_company(str(raw.get("ticker") or ""), revenue, growth_signal)
     if revenue > 10_000_000:
-        approved_products.append(
-            ApprovedProduct(
-                product_id=f"{raw.get('ticker')}:commercial",
-                name=f"{raw.get('ticker')} commercial franchise",
-                indication=(raw.get("conditions") or ["Commercial portfolio"])[0],
-                annual_revenue=revenue,
-                growth_signal=float(finance.get("momentum_3mo") or 0.0),
-            )
+        commercial_title = (
+            f"{approved_products[0].name} commercial update"
+            if approved_products
+            else f"{raw.get('ticker')} reported commercial update"
         )
         company_catalysts.append(
             _build_catalyst(
                 program_id=None,
-                event_type="earnings",
-                title=f"{raw.get('ticker')} quarterly commercial update",
+                event_type="commercial_update",
+                title=commercial_title,
                 horizon_days=45,
-                probability=0.95,
+                probability=0.78,
                 importance=0.60,
-                crowdedness=0.50,
+                crowdedness=0.45,
                 as_of=as_of,
+                status="estimated_from_revenue",
             )
         )
 
@@ -191,8 +296,11 @@ def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -
         "num_trials": raw.get("num_trials", 0),
         "num_papers": raw.get("num_papers", 0),
         "runway_months": runway_months,
+        "runway_months_capped": runway_months >= 120.0,
         "data_source": "prepare_compatibility_layer",
         "description": finance.get("description"),
+        "commercial_revenue_present": revenue > 10_000_000,
+        "approved_product_registry_hit": bool(approved_products),
     }
 
     return CompanySnapshot(

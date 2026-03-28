@@ -3,7 +3,15 @@ import unittest
 from unittest.mock import Mock
 
 from biopharma_agent.vnext.entities import CompanyAnalysis, CompanySnapshot, PortfolioRecommendation, SignalArtifact
-from biopharma_agent.vnext.execution import AlpacaPaperBroker, PMExecutionPlanner, execute_plan
+from biopharma_agent.vnext.execution import (
+    AlpacaPaperBroker,
+    DiscordTradeNotifier,
+    ExecutionInstruction,
+    ExecutionPlan,
+    OrderSubmission,
+    PMExecutionPlanner,
+    execute_plan,
+)
 from biopharma_agent.vnext.settings import VNextSettings
 from biopharma_agent.vnext.storage import LocalResearchStore
 
@@ -101,6 +109,9 @@ class TestVNextExecution(unittest.TestCase):
             store_dir=".tatetuck_store",
             eodhd_api_key="secret",
             sec_user_agent="TatetuckBot/1.0 ops@example.com",
+            discord_token="discord-token",
+            discord_channel_id="general-channel",
+            discord_trade_log_channel_id="trade-log-channel",
             alpaca_api_key_id="paper-key",
             alpaca_api_secret_key="paper-secret",
             alpaca_api_base_url="https://paper-api.alpaca.markets",
@@ -200,6 +211,115 @@ class TestVNextExecution(unittest.TestCase):
         self.assertEqual(account.account_id, "PA3ZUXE6OCWI")
         self.assertEqual(account.status, "SIMULATED")
         self.assertTrue(account.paper)
+
+    def test_discord_trade_notifier_posts_submitted_orders(self):
+        settings = self.make_settings()
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"id": "discord-message-1"}
+        session = Mock()
+        session.request.return_value = response
+        notifier = DiscordTradeNotifier(settings=settings, session=session)
+        plan = ExecutionPlan(
+            generated_at="2025-01-01T00:00:00+00:00",
+            account_id="PA3ZUXE6OCWI",
+            equity=100000.0,
+            buying_power=100000.0,
+            deployable_notional=18000.0,
+            selected_symbols=["CRSP"],
+            instructions=[],
+            blockers=[],
+            warnings=[],
+            readiness_status="production_ready",
+        )
+        submissions = [
+            OrderSubmission(
+                symbol="CRSP",
+                action="buy_notional",
+                status="submitted",
+                client_order_id="coid-1",
+                order_id="order-1",
+                submitted_notional=1500.0,
+                submitted_qty=None,
+                raw_status="accepted",
+            )
+        ]
+        instructions = [
+            ExecutionInstruction(
+                symbol="CRSP",
+                company_name="CRSP Therapeutics",
+                action="buy",
+                side="buy",
+                scenario="pre-catalyst long",
+                confidence=0.72,
+                target_weight=4.0,
+                scaled_target_weight=4.0,
+                target_notional=4000.0,
+                current_notional=0.0,
+                delta_notional=1500.0,
+                qty=None,
+                notional=1500.0,
+                rationale=[],
+            )
+        ]
+
+        result = notifier.post_trade_alert(plan=plan, submissions=submissions, instructions=instructions)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.channel_id, "trade-log-channel")
+        self.assertFalse(result.fallback_used)
+        call = session.request.call_args
+        self.assertIn("/channels/trade-log-channel/messages", call.args[1])
+        self.assertIn("TATETUCK PAPER TRADE ALERT", call.kwargs["json"]["content"])
+        self.assertIn("CRSP", call.kwargs["json"]["content"])
+
+    def test_discord_trade_notifier_falls_back_to_primary_channel(self):
+        settings = self.make_settings()
+        def request_side_effect(method, url, headers=None, json=None, timeout=None):
+            response = Mock()
+            if "trade-log-channel" in url:
+                error = requests.HTTPError("forbidden")
+                error.response = Mock(status_code=403)
+                raise error
+            response.raise_for_status.return_value = None
+            response.json.return_value = {"id": "discord-message-2"}
+            return response
+
+        import requests
+
+        session = Mock()
+        session.request.side_effect = request_side_effect
+        notifier = DiscordTradeNotifier(settings=settings, session=session)
+        plan = ExecutionPlan(
+            generated_at="2025-01-01T00:00:00+00:00",
+            account_id="PA3ZUXE6OCWI",
+            equity=100000.0,
+            buying_power=100000.0,
+            deployable_notional=18000.0,
+            selected_symbols=["CRSP"],
+            instructions=[],
+            blockers=[],
+            warnings=[],
+            readiness_status="production_ready",
+        )
+        submissions = [
+            OrderSubmission(
+                symbol="CRSP",
+                action="buy_notional",
+                status="submitted",
+                client_order_id="coid-1",
+                order_id="order-1",
+                submitted_notional=1500.0,
+                submitted_qty=None,
+                raw_status="accepted",
+            )
+        ]
+
+        result = notifier.post_trade_alert(plan=plan, submissions=submissions, instructions=[])
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.channel_id, "general-channel")
+        self.assertTrue(result.fallback_used)
 
 
 if __name__ == "__main__":

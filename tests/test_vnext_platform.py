@@ -69,7 +69,18 @@ class TestVNextPlatform(unittest.TestCase):
         self.assertTrue(snapshot.programs)
         self.assertEqual(snapshot.programs[0].phase, "PHASE3")
         self.assertTrue(snapshot.catalyst_events)
+        self.assertFalse(snapshot.approved_products)
+        self.assertTrue(snapshot.metadata["commercial_revenue_present"])
+        self.assertTrue(any(event.event_type == "commercial_update" for event in snapshot.catalyst_events))
+
+    def test_graph_builder_uses_registry_for_known_products(self):
+        raw = make_raw_company()
+        raw["ticker"] = "CRSP"
+        raw["company_name"] = "CRISPR Therapeutics"
+        raw["finance"]["totalRevenue"] = 3_500_000
+        snapshot = build_company_snapshot(raw)
         self.assertTrue(snapshot.approved_products)
+        self.assertEqual(snapshot.approved_products[0].name, "CASGEVY")
 
     def test_feature_engineer_outputs_non_leaky_vectors(self):
         snapshot = build_company_snapshot(make_raw_company())
@@ -141,7 +152,7 @@ class TestVNextPlatform(unittest.TestCase):
             store.write_snapshot(snapshot)
             catalysts = store.read_table("catalysts")
             self.assertIn("phase3_readout", catalysts["event_type"].tolist())
-            self.assertIn("earnings", catalysts["event_type"].tolist())
+            self.assertIn("commercial_update", catalysts["event_type"].tolist())
 
     def test_portfolio_constructor_flags_financing_overhang(self):
         snapshot = build_company_snapshot(make_raw_company())
@@ -321,6 +332,28 @@ class TestVNextPlatform(unittest.TestCase):
             self.assertEqual(analysis.snapshot.ticker, "TEST")
             self.assertEqual(analysis.metadata["analysis_source"], "archive_fallback")
             self.assertIn("live_ingestion_error", analysis.snapshot.metadata)
+
+    def test_facade_archive_read_only_does_not_persist(self):
+        snapshot = build_company_snapshot(make_raw_company())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.write_raw_payload("snapshots", "TEST_2025-01-01T00-00-00+00-00", asdict(snapshot))
+            platform = TatetuckPlatform(store=store)
+            before_rows = len(store.read_table("company_snapshots"))
+            analysis = platform.analyze_ticker(
+                "TEST",
+                "Test Therapeutics",
+                include_literature=False,
+                prefer_archive=True,
+                persist=False,
+            )
+            after_rows = len(store.read_table("company_snapshots"))
+            self.assertEqual(analysis.metadata["analysis_source"], "archive")
+            self.assertFalse(analysis.metadata["persisted"])
+            self.assertIn("why_now", analysis.metadata)
+            self.assertIn("valuation_summary", analysis.metadata)
+            self.assertIn("kill_points", analysis.metadata)
+            self.assertEqual(before_rows, after_rows)
 
     @patch("biopharma_agent.vnext.sources.fetch_legacy_snapshot")
     @patch("biopharma_agent.vnext.sources.CorporateCalendarClient.fetch_company_calendar")

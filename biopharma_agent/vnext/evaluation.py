@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 
 import numpy as np
 import pandas as pd
 
 from .entities import ModelPrediction, SignalArtifact
+from .features import FeatureEngineer
 from .labels import PointInTimeLabeler
 from .models import EventDrivenEnsemble
 from .portfolio import PortfolioConstructor, aggregate_signal
+from .replay import snapshot_from_dict
 from .settings import VNextSettings
 from .storage import LocalResearchStore
 from .taxonomy import event_type_bucket
@@ -49,11 +52,17 @@ class WalkForwardEvaluator:
         self.settings = settings or VNextSettings.from_env()
         self.labeler = PointInTimeLabeler(store=self.store)
         self.portfolio = PortfolioConstructor()
+        self.features = FeatureEngineer()
 
     def build_training_frame(self, refresh_labels: bool = False) -> pd.DataFrame:
-        features = self.store.read_table("feature_vectors")
         snapshots = self.store.read_table("company_snapshots")
-        if features.empty or snapshots.empty:
+        if snapshots.empty:
+            return pd.DataFrame()
+
+        features = self._feature_frame_from_archived_snapshots()
+        if features.empty:
+            features = self.store.read_table("feature_vectors")
+        if features.empty:
             return pd.DataFrame()
 
         labels = self.store.read_table("labels")
@@ -72,10 +81,44 @@ class WalkForwardEvaluator:
             keep="last",
         )
         if "meta_aggregate" in frame.columns:
-            non_aggregate = frame[~frame["meta_aggregate"].fillna(False).astype(bool)].copy()
+            aggregate_mask = frame["meta_aggregate"].fillna(False).astype(bool)
+            non_aggregate = frame[~aggregate_mask].copy()
+            aggregate = frame[aggregate_mask].copy()
             if not non_aggregate.empty:
-                frame = non_aggregate
+                keep_aggregate_keys = set(
+                    aggregate[["ticker", "as_of"]].apply(tuple, axis=1).tolist()
+                ) - set(non_aggregate[["ticker", "as_of"]].apply(tuple, axis=1).tolist())
+                if keep_aggregate_keys:
+                    aggregate = aggregate[
+                        aggregate[["ticker", "as_of"]].apply(tuple, axis=1).isin(keep_aggregate_keys)
+                    ].copy()
+                else:
+                    aggregate = aggregate.iloc[0:0].copy()
+                frame = pd.concat([non_aggregate, aggregate], ignore_index=True)
         return frame
+
+    def _feature_frame_from_archived_snapshots(self) -> pd.DataFrame:
+        rows: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for path in self.store.list_raw_payload_paths("snapshots"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            try:
+                snapshot = snapshot_from_dict(payload)
+            except Exception:
+                continue
+            for vector in self.features.build_all(snapshot):
+                dedupe_key = (vector.ticker, vector.entity_id, vector.as_of)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                rows.append(vector.to_row())
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows)
 
     def leakage_audit(self, frame: pd.DataFrame) -> bool:
         if frame.empty:

@@ -97,6 +97,14 @@ class OrderSubmission:
         return payload
 
 
+@dataclass(slots=True)
+class DiscordNotificationResult:
+    channel_id: str
+    message_id: str | None
+    order_count: int
+    fallback_used: bool = False
+
+
 class AlpacaPaperBroker:
     def __init__(
         self,
@@ -237,6 +245,121 @@ class AlpacaPaperBroker:
     def _client_order_id(symbol: str, side: str) -> str:
         suffix = uuid4().hex[:12]
         return f"tatetuck-{side}-{symbol.lower()}-{suffix}"[:48]
+
+
+class DiscordTradeNotifier:
+    def __init__(
+        self,
+        settings: VNextSettings,
+        session: requests.Session | None = None,
+    ):
+        self.settings = settings
+        self.session = session or requests.Session()
+        self.base_url = "https://discord.com/api/v10"
+
+    def is_configured(self) -> bool:
+        return bool(self.settings.discord_token and self._target_channels())
+
+    def post_trade_alert(
+        self,
+        plan: ExecutionPlan,
+        submissions: list[OrderSubmission],
+        instructions: list[ExecutionInstruction],
+    ) -> DiscordNotificationResult | None:
+        submitted = [item for item in submissions if item.status == "submitted"]
+        if not submitted or not self.is_configured():
+            return None
+
+        channel_ids = self._target_channels()
+        if not channel_ids:
+            return None
+
+        content = self._build_message(plan=plan, submissions=submitted, instructions=instructions)
+        first_channel = channel_ids[0]
+        last_exc: Exception | None = None
+        for channel_id in channel_ids:
+            try:
+                data = self._request(
+                    "POST",
+                    f"/channels/{channel_id}/messages",
+                    json={"content": content},
+                )
+                return DiscordNotificationResult(
+                    channel_id=channel_id,
+                    message_id=str(data.get("id") or "") or None,
+                    order_count=len(submitted),
+                    fallback_used=channel_id != first_channel,
+                )
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                if status_code not in {403, 404}:
+                    raise
+                last_exc = exc
+                continue
+
+        if last_exc is not None:
+            raise last_exc
+        return None
+
+    def _target_channels(self) -> list[str]:
+        channels: list[str] = []
+        for channel_id in (
+            self.settings.discord_trade_log_channel_id,
+            self.settings.discord_channel_id,
+        ):
+            if channel_id and channel_id not in channels:
+                channels.append(channel_id)
+        return channels
+
+    def _build_message(
+        self,
+        plan: ExecutionPlan,
+        submissions: list[OrderSubmission],
+        instructions: list[ExecutionInstruction],
+    ) -> str:
+        instructions_by_symbol = {item.symbol: item for item in instructions}
+        lines = [
+            "TATETUCK PAPER TRADE ALERT",
+            f"Account: {plan.account_id or 'unknown'}",
+            f"Readiness: {plan.readiness_status}",
+            f"Orders submitted: {len(submissions)}",
+            "",
+        ]
+        for submission in submissions[:8]:
+            instruction = instructions_by_symbol.get(submission.symbol)
+            side = submission.action.replace("_", " ").upper()
+            detail = f"{side} {submission.symbol}"
+            if submission.submitted_notional is not None:
+                detail += f" | notional ${submission.submitted_notional:,.2f}"
+            if submission.submitted_qty is not None:
+                detail += f" | qty {submission.submitted_qty:,.4f}"
+            if instruction is not None:
+                detail += f" | scenario {instruction.scenario}"
+                detail += f" | confidence {instruction.confidence * 100:.1f}%"
+            if submission.raw_status:
+                detail += f" | alpaca {submission.raw_status}"
+            lines.append(detail)
+        if len(submissions) > 8:
+            lines.append(f"... plus {len(submissions) - 8} more submitted orders")
+        message = "\n".join(lines)
+        return message[:1900]
+
+    def _request(self, method: str, path: str, json: dict[str, object]):
+        token = self.settings.discord_token
+        if not token:
+            raise RuntimeError("Discord trade alerts are not configured. Set DISCORD_TOKEN.")
+        response = self.session.request(
+            method,
+            f"{self.base_url}{path}",
+            headers={
+                "Authorization": f"Bot {token}",
+                "User-Agent": "TatetuckBot/1.0",
+            },
+            json=json,
+            timeout=20,
+        )
+        response.raise_for_status()
+        return response.json()
 
 
 class PMExecutionPlanner:

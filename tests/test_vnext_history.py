@@ -1,12 +1,14 @@
 import json
 import tempfile
 import unittest
+from dataclasses import asdict
 from unittest.mock import Mock, patch
 
 import pandas as pd
 
 from biopharma_agent.vnext.entities import ModelPrediction
 from biopharma_agent.vnext.evaluation import WalkForwardEvaluator
+from biopharma_agent.vnext.graph import build_company_snapshot
 from biopharma_agent.vnext.labels import EODHDHistoryProvider, PointInTimeLabeler
 from biopharma_agent.vnext.models import EventDrivenEnsemble
 from biopharma_agent.vnext.settings import VNextSettings
@@ -175,6 +177,62 @@ class TestVNextHistory(unittest.TestCase):
             labels = store.read_table("labels")
             self.assertEqual(summary.snapshot_label_rows, 1)
             self.assertAlmostEqual(labels.iloc[0]["target_return_30d"], (120.0 / 110.0) - 1.0)
+
+    def test_evaluator_rebuilds_feature_frame_from_archived_snapshots(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            snapshot = build_company_snapshot(
+                {
+                    "ticker": "TEST",
+                    "company_name": "Replay Therapeutics",
+                    "finance": {
+                        "marketCap": 1_000_000_000,
+                        "enterpriseValue": 900_000_000,
+                        "totalRevenue": 0.0,
+                        "cash": 300_000_000,
+                        "debt": 50_000_000,
+                        "momentum_3mo": 0.12,
+                        "trailing_6mo_return": 0.08,
+                        "volatility": 0.03,
+                        "description": "Rare disease company with a pivotal hematology asset.",
+                    },
+                    "trials": [
+                        {
+                            "nct_id": "NCT-1",
+                            "title": "RP-101 pivotal",
+                            "overall_status": "RECRUITING",
+                            "phase": ["Phase 3"],
+                            "conditions": ["Beta-Thalassemia"],
+                            "interventions": ["RP-101"],
+                            "primary_outcomes": ["hemoglobin response"],
+                            "enrollment": 250,
+                        }
+                    ],
+                    "num_trials": 1,
+                    "best_phase": "PHASE3",
+                    "pubmed_papers": [],
+                    "num_papers": 0,
+                }
+            )
+            store.write_raw_payload("snapshots", "TEST_2025-01-15T00-00-00+00-00", asdict(snapshot))
+            pd.DataFrame([{"ticker": "TEST", "as_of": snapshot.as_of}]).to_parquet(
+                store.tables_dir / "company_snapshots.parquet",
+                index=False,
+            )
+            pd.DataFrame(
+                [
+                    {
+                        "ticker": "TEST",
+                        "as_of": snapshot.as_of,
+                        "target_return_90d": 0.10,
+                        "target_catalyst_success": 1,
+                    }
+                ]
+            ).to_parquet(store.tables_dir / "labels.parquet", index=False)
+
+            frame = WalkForwardEvaluator(store=store).build_training_frame()
+            self.assertFalse(frame.empty)
+            self.assertIn("program_quality_pos_prior", frame.columns)
 
     def test_replay_engine_rebuilds_tables_from_archived_snapshots(self):
         snapshot_payload = {

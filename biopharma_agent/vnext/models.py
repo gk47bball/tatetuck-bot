@@ -8,7 +8,6 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.isotonic import IsotonicRegression
 
 from .entities import ExperimentRecord, FeatureVector, ModelPrediction
@@ -16,7 +15,11 @@ from .storage import LocalResearchStore
 
 
 def _sigmoid(value: float) -> float:
-    return 1.0 / (1.0 + math.exp(-value))
+    if value >= 0:
+        exp_term = math.exp(-min(value, 60.0))
+        return 1.0 / (1.0 + exp_term)
+    exp_term = math.exp(min(-value, 60.0))
+    return 1.0 / (1.0 + exp_term)
 
 
 def _feature_value(features: dict[str, float] | pd.Series, key: str, default: float) -> float:
@@ -34,14 +37,18 @@ def _feature_value(features: dict[str, float] | pd.Series, key: str, default: fl
 
 @dataclass(slots=True)
 class EnsembleBundle:
-    regressor: HistGradientBoostingRegressor | None = None
-    classifier: HistGradientBoostingClassifier | None = None
+    regressor_weights: np.ndarray | None = None
+    regressor_bias: float = 0.0
+    classifier_weights: np.ndarray | None = None
+    classifier_bias: float = 0.0
+    feature_mean: np.ndarray | None = None
+    feature_scale: np.ndarray | None = None
     calibrator: IsotonicRegression | None = None
     feature_columns: list[str] | None = None
 
 
 class EventDrivenEnsemble:
-    def __init__(self, store: LocalResearchStore | None = None, model_name: str = "event_driven_ensemble", model_version: str = "v1"):
+    def __init__(self, store: LocalResearchStore | None = None, model_name: str = "event_driven_ensemble", model_version: str = "v2"):
         self.store = store or LocalResearchStore()
         self.model_name = model_name
         self.model_version = model_version
@@ -62,6 +69,18 @@ class EventDrivenEnsemble:
             bundle.calibrator = None
         if not hasattr(bundle, "feature_columns"):
             bundle.feature_columns = None
+        if not all(
+            hasattr(bundle, attr)
+            for attr in (
+                "regressor_weights",
+                "regressor_bias",
+                "classifier_weights",
+                "classifier_bias",
+                "feature_mean",
+                "feature_scale",
+            )
+        ):
+            return EnsembleBundle()
         return bundle
 
     def _save(self) -> Path:
@@ -69,6 +88,31 @@ class EventDrivenEnsemble:
         with open(path, "wb") as f:
             pickle.dump(self.bundle, f)
         return path
+
+    @staticmethod
+    def _ridge_fit(X: np.ndarray, y: np.ndarray, alpha: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        feature_mean = np.mean(X, axis=0)
+        feature_scale = np.std(X, axis=0)
+        feature_scale = np.where(feature_scale < 1e-6, 1.0, feature_scale)
+        normalized = (X - feature_mean) / feature_scale
+        augmented = np.column_stack([normalized, np.ones(len(normalized))])
+        penalty = np.eye(augmented.shape[1], dtype=float) * alpha
+        penalty[-1, -1] = 0.0
+        weights = np.linalg.pinv(augmented.T @ augmented + penalty) @ augmented.T @ y
+        return feature_mean, feature_scale, weights[:-1], float(weights[-1])
+
+    @staticmethod
+    def _linear_predict(
+        X: np.ndarray,
+        feature_mean: np.ndarray | None,
+        feature_scale: np.ndarray | None,
+        weights: np.ndarray | None,
+        bias: float,
+    ) -> np.ndarray | None:
+        if feature_mean is None or feature_scale is None or weights is None:
+            return None
+        normalized = (X - feature_mean) / np.where(feature_scale < 1e-6, 1.0, feature_scale)
+        return normalized @ weights + bias
 
     def feature_columns(self, frame: pd.DataFrame) -> list[str]:
         return [
@@ -108,15 +152,25 @@ class EventDrivenEnsemble:
         y_reg = usable["target_return_90d"].to_numpy(dtype=float)
         y_clf = usable["target_catalyst_success"].to_numpy(dtype=int)
 
+        reg_mean, reg_scale, reg_weights, reg_bias = self._ridge_fit(X, y_reg, alpha=1.5)
+        clf_targets = np.where(y_clf > 0, 2.0, -2.0)
+        clf_mean, clf_scale, clf_weights, clf_bias = self._ridge_fit(X, clf_targets, alpha=2.0)
+
         self.bundle = EnsembleBundle(
-            regressor=HistGradientBoostingRegressor(max_depth=4, learning_rate=0.05, random_state=7),
-            classifier=HistGradientBoostingClassifier(max_depth=3, learning_rate=0.05, random_state=7),
+            regressor_weights=reg_weights,
+            regressor_bias=reg_bias,
+            classifier_weights=clf_weights,
+            classifier_bias=clf_bias,
+            feature_mean=reg_mean,
+            feature_scale=reg_scale,
             calibrator=None,
             feature_columns=feature_columns,
         )
-        self.bundle.regressor.fit(X, y_reg)
-        self.bundle.classifier.fit(X, y_clf)
-        clf_scores = self.bundle.classifier.predict_proba(X)[:, 1]
+        clf_linear = self._linear_predict(X, clf_mean, clf_scale, clf_weights, clf_bias)
+        if clf_linear is None:
+            clf_scores = np.zeros(len(X), dtype=float)
+        else:
+            clf_scores = np.asarray([_sigmoid(value) for value in clf_linear], dtype=float)
         rule_probs = np.asarray([self._rule_success_prob_from_row(row) for _, row in usable.iterrows()], dtype=float)
         blended_probs = (0.40 * rule_probs) + (0.60 * clf_scores)
         finite_mask = np.isfinite(blended_probs) & np.isfinite(y_clf)
@@ -174,23 +228,33 @@ class EventDrivenEnsemble:
             )
         return record
 
-    def score(self, feature_vectors: Iterable[FeatureVector]) -> list[ModelPrediction]:
+    def score(self, feature_vectors: Iterable[FeatureVector], persist: bool = True) -> list[ModelPrediction]:
         feature_vectors = list(feature_vectors)
         if not feature_vectors:
             return []
         frame = pd.DataFrame([vector.to_row() for vector in feature_vectors])
-        return self._predict_frame(frame, feature_vectors)
+        return self._predict_frame(frame, feature_vectors, persist=persist)
 
-    def _predict_frame(self, frame: pd.DataFrame, feature_vectors: list[FeatureVector]) -> list[ModelPrediction]:
+    def _predict_frame(self, frame: pd.DataFrame, feature_vectors: list[FeatureVector], persist: bool = True) -> list[ModelPrediction]:
         predictions: list[ModelPrediction] = []
         feature_columns = self.bundle.feature_columns or self.feature_columns(frame)
         X = frame.reindex(columns=feature_columns, fill_value=0.0).fillna(0.0).to_numpy(dtype=float)
 
-        reg_scores = None
-        clf_scores = None
-        if self.bundle.regressor is not None and self.bundle.classifier is not None and self.bundle.feature_columns:
-            reg_scores = self.bundle.regressor.predict(X)
-            clf_scores = self.bundle.classifier.predict_proba(X)[:, 1]
+        reg_scores = self._linear_predict(
+            X,
+            self.bundle.feature_mean,
+            self.bundle.feature_scale,
+            self.bundle.regressor_weights,
+            self.bundle.regressor_bias,
+        )
+        clf_linear = self._linear_predict(
+            X,
+            self.bundle.feature_mean,
+            self.bundle.feature_scale,
+            self.bundle.classifier_weights,
+            self.bundle.classifier_bias,
+        )
+        clf_scores = None if clf_linear is None else np.asarray([_sigmoid(value) for value in clf_linear], dtype=float)
 
         for index, vector in enumerate(feature_vectors):
             rule_expected_return, rule_success_prob = self._rule_score(vector)
@@ -236,7 +300,8 @@ class EventDrivenEnsemble:
                     metadata=vector.metadata.copy(),
                 )
             )
-        self.store.write_predictions(predictions)
+        if persist:
+            self.store.write_predictions(predictions)
         return predictions
 
     def _rule_score(self, vector: FeatureVector) -> tuple[float, float]:

@@ -7,7 +7,7 @@ from typing import Any
 import requests
 
 from .entities import CatalystEvent, CompanySnapshot, EvidenceSnippet, FinancingEvent
-from .graph import build_company_snapshot, fetch_legacy_snapshot
+from .graph import build_company_snapshot, fetch_legacy_snapshot, infer_runway_months
 from .storage import LocalResearchStore
 
 
@@ -303,6 +303,34 @@ def enrich_snapshot_with_external_data(
                 probability=0.80,
                 importance=0.45,
                 crowdedness=0.35,
+                status="calendar_estimate",
+            )
+        )
+
+    refreshed_runway = infer_runway_months(snapshot.revenue, snapshot.cash, snapshot.debt, len(snapshot.programs))
+    sec_operating_cashflow = parsed.get("operating_cashflow")
+    net_cash = snapshot.cash - snapshot.debt
+    if sec_operating_cashflow is not None and net_cash > 0:
+        cashflow = float(sec_operating_cashflow)
+        if cashflow < 0:
+            sec_runway = min((net_cash / abs(cashflow)) * 12.0, 120.0)
+            refreshed_runway = min(refreshed_runway, sec_runway)
+        elif snapshot.revenue > 100_000_000:
+            refreshed_runway = min(refreshed_runway, 120.0)
+    snapshot.metadata["runway_months"] = refreshed_runway
+    snapshot.metadata["runway_months_capped"] = refreshed_runway >= 120.0
+    snapshot.financing_events = [
+        event for event in snapshot.financing_events if event.event_type != "expected_financing"
+    ]
+    if refreshed_runway < 18:
+        snapshot.financing_events.append(
+            FinancingEvent(
+                event_id=f"{snapshot.ticker}:financing",
+                event_type="expected_financing",
+                probability=0.80 if refreshed_runway < 12 else 0.45,
+                horizon_days=90 if refreshed_runway < 12 else 180,
+                expected_dilution_pct=0.18 if refreshed_runway < 12 else 0.08,
+                summary=f"Estimated runway is {refreshed_runway:.1f} months.",
             )
         )
 
@@ -332,7 +360,13 @@ class IngestionService:
         self.sec_client = SECXBRLClient()
         self.calendar_client = CorporateCalendarClient()
 
-    def ingest_company(self, ticker: str, company_name: str | None = None, as_of: datetime | None = None) -> CompanySnapshot:
+    def ingest_company(
+        self,
+        ticker: str,
+        company_name: str | None = None,
+        as_of: datetime | None = None,
+        persist: bool = True,
+    ) -> CompanySnapshot:
         as_of = as_of or datetime.now(timezone.utc)
         fallback_sources: list[str] = []
 
@@ -366,9 +400,10 @@ class IngestionService:
         if fallback_sources:
             snapshot.metadata["fallback_sources"] = sorted(set(fallback_sources))
 
-        raw_key = f"{ticker}_{as_of.isoformat().replace(':', '-')}"
-        self.store.write_raw_payload("legacy_prepare", raw_key, raw)
-        self.store.write_raw_payload("sec_xbrl", raw_key, sec_payload)
-        self.store.write_raw_payload("corp_calendar", raw_key, calendar_payload)
-        self.store.write_snapshot(snapshot)
+        if persist:
+            raw_key = f"{ticker}_{as_of.isoformat().replace(':', '-')}"
+            self.store.write_raw_payload("legacy_prepare", raw_key, raw)
+            self.store.write_raw_payload("sec_xbrl", raw_key, sec_payload)
+            self.store.write_raw_payload("corp_calendar", raw_key, calendar_payload)
+            self.store.write_snapshot(snapshot)
         return snapshot

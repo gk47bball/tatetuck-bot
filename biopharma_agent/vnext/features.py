@@ -39,6 +39,7 @@ class FeatureEngineer:
         op_cf_margin = sec_operating_cashflow / max(sec_revenue_ttm, 1.0) if sec_revenue_ttm > 0 else 0.0
         top_event_type = top_catalyst.event_type if top_catalyst else None
         company_event_type = company_primary_event.event_type if company_primary_event else None
+        commercial_presence = bool(snapshot.approved_products) or bool(snapshot.metadata.get("commercial_revenue_present"))
 
         features = {
             "program_quality_pos_prior": program.pos_prior,
@@ -63,7 +64,7 @@ class FeatureEngineer:
             "catalyst_timing_company_event_earnings": 1.0 if company_event_type == "earnings" else 0.0,
             "commercial_execution_revenue_scale": math.log10(revenue + 1.0),
             "commercial_execution_revenue_to_cap": math.log10(max(revenue / market_cap, 1e-6)),
-            "commercial_execution_has_product": 1.0 if snapshot.approved_products else 0.0,
+            "commercial_execution_has_product": 1.0 if commercial_presence else 0.0,
             "commercial_execution_sec_revenue_scale": math.log10(sec_revenue_ttm + 1.0),
             "balance_sheet_cash_to_cap": snapshot.cash / market_cap,
             "balance_sheet_debt_to_cap": snapshot.debt / market_cap,
@@ -78,7 +79,9 @@ class FeatureEngineer:
         features["balance_sheet_runway_score"] = _clamp(runway_months / 24.0, 0.0, 2.0)
         features["program_quality_modality_risk"] = self._modality_risk(program.modality)
         features["commercial_execution_growth_signal"] = (
-            snapshot.approved_products[0].growth_signal if snapshot.approved_products else 0.0
+            snapshot.approved_products[0].growth_signal
+            if snapshot.approved_products
+            else float(snapshot.momentum_3mo or 0.0)
         )
         features.update(self._event_type_features(top_event_type, prefix="catalyst_timing_event"))
         features.update(self._event_type_features(company_event_type, prefix="catalyst_timing_company_event"))
@@ -114,6 +117,7 @@ class FeatureEngineer:
             "catalyst_timing_company_event_earnings": 1.0 if company_event_type == "earnings" else 0.0,
             "commercial_execution_revenue_scale": math.log10(snapshot.revenue + 1.0),
             "commercial_execution_sec_revenue_scale": math.log10(float(snapshot.metadata.get("sec_revenue_ttm", snapshot.revenue) or snapshot.revenue or 0.0) + 1.0),
+            "commercial_execution_has_product": 1.0 if (snapshot.approved_products or snapshot.metadata.get("commercial_revenue_present")) else 0.0,
             "balance_sheet_cash_to_cap": snapshot.cash / max(snapshot.market_cap, 1.0),
             "balance_sheet_debt_to_cap": snapshot.debt / max(snapshot.market_cap, 1.0),
             "balance_sheet_runway_months": float(snapshot.metadata.get("runway_months", 0.0) or 0.0),

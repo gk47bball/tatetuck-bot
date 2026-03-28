@@ -89,6 +89,7 @@ Discord setup requires:
 
 - `DISCORD_TOKEN`
 - `DISCORD_CHANNEL_ID`
+- `DISCORD_TRADE_LOG_CHANNEL_ID` (optional, for paper-trade alerts; falls back to `DISCORD_CHANNEL_ID`)
 
 Once online, the bot supports:
 
@@ -98,6 +99,16 @@ Once online, the bot supports:
 - `!setup`
 - `!channelid`
 - `!status`
+
+Paper trading:
+
+```bash
+python trade_vnext.py --submit
+```
+
+When paper orders are submitted to Alpaca, Tatetuck now posts a Discord trade
+alert to `DISCORD_TRADE_LOG_CHANNEL_ID` when available, and falls back to
+`DISCORD_CHANNEL_ID` if the trade-log channel is permission-blocked.
 
 ## Notes
 
