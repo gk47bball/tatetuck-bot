@@ -8,12 +8,11 @@ new walk-forward evaluator when enough historical snapshots exist.
 import argparse
 import time
 
-import prepare
-
 from biopharma_agent.vnext import TatetuckPlatform, VNextSettings, record_pipeline_run
 from biopharma_agent.vnext.evaluation import WalkForwardEvaluator
 from biopharma_agent.vnext.ops import utc_now_iso
 from biopharma_agent.vnext.storage import LocalResearchStore
+from biopharma_agent.vnext.universe import UniverseResolver
 
 
 def parse_args():
@@ -38,9 +37,10 @@ def main():
 
     try:
         platform = TatetuckPlatform(store=store)
+        universe = UniverseResolver(store=store).resolve_default_universe(prefer_archive=args.prefer_archive)
         print("\n[ingest] Building company-program-catalyst snapshots...")
         analyses = platform.analyze_universe(
-            prepare.BENCHMARK_TICKERS,
+            universe,
             include_literature=settings.include_literature,
             prefer_archive=args.prefer_archive,
             fallback_to_archive=True,
@@ -72,6 +72,8 @@ def main():
                 "exact_primary_event_rate": summary.exact_primary_event_rate,
                 "synthetic_primary_event_rate": summary.synthetic_primary_event_rate,
                 "institutional_blockers": summary.institutional_blockers,
+                "factor_attribution": summary.factor_attribution,
+                "momentum_ablation": summary.momentum_ablation,
                 "latest_window_top_trades": summary.latest_window_top_trades,
             },
         )
@@ -99,11 +101,14 @@ def main():
                 "synthetic_primary_event_rate": summary.synthetic_primary_event_rate,
                 "institutional_blockers": summary.institutional_blockers,
                 "event_type_scorecards": summary.event_type_scorecards,
+                "factor_attribution": summary.factor_attribution,
+                "momentum_ablation": summary.momentum_ablation,
             },
             config={
                 "store_dir": settings.store_dir,
                 "include_literature": settings.include_literature,
                 "prefer_archive": args.prefer_archive,
+                "universe_size": len(universe),
             },
         )
     except Exception as exc:
@@ -141,6 +146,9 @@ def main():
     print(f"pm_context_cov:   {summary.pm_context_coverage:.4f}")
     print(f"exact_event_rate: {summary.exact_primary_event_rate:.4f}")
     print(f"synthetic_rate:   {summary.synthetic_primary_event_rate:.4f}")
+    if summary.momentum_ablation:
+        print(f"momentum_only_ic: {summary.momentum_ablation.get('momentum_only_rank_ic', 0.0):.4f}")
+        print(f"no_momentum_ic:   {summary.momentum_ablation.get('no_momentum_rank_ic', 0.0):.4f}")
     if summary.message:
         print(f"message:          {summary.message}")
     print("\n[institutional_blockers]")
@@ -163,6 +171,19 @@ def main():
                 f"hit={metrics.get('hit_rate', 0.0):.3f} | "
                 f"spread={metrics.get('top_bottom_spread', 0.0):+.3f} | "
                 f"brier={metrics.get('calibrated_brier', 1.0):.3f}"
+            )
+    if summary.factor_attribution:
+        print("\n[factor_attribution]")
+        for family, metrics in sorted(
+            summary.factor_attribution.items(),
+            key=lambda item: item[1].get("rank_ic_delta", 0.0),
+            reverse=True,
+        ):
+            print(
+                f"{family:20} | "
+                f"ic_delta={metrics.get('rank_ic_delta', 0.0):+.3f} | "
+                f"spread_delta={metrics.get('spread_delta', 0.0):+.3f} | "
+                f"signal_corr={metrics.get('signal_correlation', 0.0):.3f}"
             )
     if summary.latest_window_top_trades:
         print("\n[latest_window_audit]")

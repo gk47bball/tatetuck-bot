@@ -165,6 +165,53 @@ class TestVNextHistory(unittest.TestCase):
             self.assertEqual(labels.iloc[0]["target_primary_event_type"], "earnings")
             self.assertEqual(event_labels.iloc[0]["event_id"], "TEST:exact:1")
 
+    def test_labeler_uses_exact_clinical_outcome_text_when_available(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            snapshots = pd.DataFrame([{"ticker": "TEST", "as_of": "2025-01-15T00:00:00"}])
+            catalysts = pd.DataFrame(
+                [
+                    {
+                        "ticker": "TEST",
+                        "as_of": "2025-01-15T00:00:00",
+                        "event_id": "TEST:phase3",
+                        "event_type": "phase3_readout",
+                        "title": "TEST-101 pivotal readout",
+                        "expected_date": "2025-02-01",
+                        "horizon_days": 17,
+                        "importance": 0.9,
+                        "crowdedness": 0.3,
+                        "status": "phase_timing_estimate",
+                    }
+                ]
+            )
+            event_tape = pd.DataFrame(
+                [
+                    {
+                        "ticker": "TEST",
+                        "as_of": "2025-02-03T00:00:00",
+                        "event_id": "TEST:actual",
+                        "event_type": "clinical_readout",
+                        "title": "TEST announces positive topline phase 3 data",
+                        "event_timestamp": "2025-02-03T08:00:00",
+                        "status": "exact_company_calendar",
+                    }
+                ]
+            )
+            labeler = PointInTimeLabeler(
+                store=store,
+                history_provider=StubHistoryProvider({"TEST": make_price_frame()}),
+            )
+            labels, event_labels = labeler.build_label_frames(
+                snapshots=snapshots,
+                catalysts=catalysts,
+                event_tape=event_tape,
+            )
+
+            self.assertEqual(int(labels.iloc[0]["target_catalyst_success"]), 1)
+            self.assertEqual(labels.iloc[0]["target_catalyst_success_source"], "exact_event_outcome_positive")
+            self.assertEqual(int(event_labels.iloc[0]["target_event_success"]), 1)
+
     def test_labeler_prioritizes_clinical_events_over_earnings_noise(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = LocalResearchStore(base_dir=tmpdir)

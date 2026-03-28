@@ -11,18 +11,18 @@ import argparse
 import time
 from dataclasses import replace
 
-import prepare
-
 from biopharma_agent.vnext import TatetuckPlatform, VNextSettings, build_readiness_report
 from biopharma_agent.vnext.execution import (
     AlpacaPaperBroker,
     DiscordTradeNotifier,
     PMExecutionPlanner,
     execute_plan,
+    materialize_execution_feedback,
     record_trade_run,
 )
 from biopharma_agent.vnext.ops import utc_now_iso
 from biopharma_agent.vnext.storage import LocalResearchStore
+from biopharma_agent.vnext.universe import UniverseResolver
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,14 +49,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_universe(args: argparse.Namespace) -> list[tuple[str, str]]:
+def resolve_universe(args: argparse.Namespace, store: LocalResearchStore) -> list[tuple[str, str]]:
     if args.ticker:
         ticker = args.ticker.upper()
         return [(ticker, args.company_name or ticker)]
-    universe = list(prepare.BENCHMARK_TICKERS)
-    if args.limit and args.limit > 0:
-        return universe[: args.limit]
-    return universe
+    resolver = UniverseResolver(store=store)
+    return resolver.resolve_default_universe(limit=args.limit, prefer_archive=not args.prefer_live)
 
 
 def main() -> None:
@@ -70,7 +68,7 @@ def main() -> None:
     start = time.time()
 
     analyses = platform.analyze_universe(
-        resolve_universe(args),
+        resolve_universe(args, store=store),
         include_literature=args.include_literature or settings.include_literature,
         prefer_archive=not args.prefer_live,
         fallback_to_archive=True,
@@ -134,6 +132,7 @@ def main() -> None:
             status="success",
             notes="paper trade run completed",
         )
+        feedback_summary = materialize_execution_feedback(store=store)
     except Exception as exc:
         if plan is None:
             from biopharma_agent.vnext.execution import ExecutionPlan
@@ -174,6 +173,7 @@ def main() -> None:
     print(f"deployable_notional:       {plan.deployable_notional:,.2f}")
     print(f"selected_symbols:          {', '.join(plan.selected_symbols) if plan.selected_symbols else 'none'}")
     print(f"submitted_orders:          {len([item for item in submissions if item.status == 'submitted'])}")
+    print(f"execution_feedback_rows:   {feedback_summary.feedback_rows if 'feedback_summary' in locals() else 0}")
     if notification is not None:
         print(
             "discord_trade_alert:       "

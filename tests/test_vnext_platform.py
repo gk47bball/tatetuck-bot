@@ -15,6 +15,7 @@ from biopharma_agent.vnext.market_profile import build_expectation_lens, classif
 from biopharma_agent.vnext.portfolio import PortfolioConstructor, aggregate_signal
 from biopharma_agent.vnext.sources import IngestionService, enrich_snapshot_with_external_data
 from biopharma_agent.vnext.storage import LocalResearchStore
+from biopharma_agent.vnext.universe import UniverseResolver
 
 
 def make_raw_company() -> dict:
@@ -343,6 +344,16 @@ class TestVNextPlatform(unittest.TestCase):
             frame.to_parquet(store.tables_dir / "feature_vectors.parquet", index=False)
             evaluator = WalkForwardEvaluator(store=store)
             self.assertFalse(evaluator.leakage_audit(frame))
+
+    def test_universe_resolver_prefers_archived_snapshots_over_legacy_benchmark(self):
+        snapshot = build_company_snapshot(make_raw_company())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.write_snapshot(snapshot)
+            resolver = UniverseResolver(store=store)
+            universe = resolver.resolve_default_universe(prefer_archive=True)
+
+            self.assertEqual(universe[0][0], "TEST")
 
     @patch("biopharma_agent.vnext.facade.AutoResearchAgent.generate_literature_review", return_value="Literature summary.")
     @patch("biopharma_agent.vnext.sources.fetch_legacy_snapshot")

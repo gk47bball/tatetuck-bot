@@ -2,6 +2,8 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
+import pandas as pd
+
 from biopharma_agent.vnext.entities import CompanyAnalysis, CompanySnapshot, PortfolioRecommendation, SignalArtifact
 from biopharma_agent.vnext.execution import (
     AlpacaPaperBroker,
@@ -11,6 +13,7 @@ from biopharma_agent.vnext.execution import (
     OrderSubmission,
     PMExecutionPlanner,
     execute_plan,
+    materialize_execution_feedback,
 )
 from biopharma_agent.vnext.settings import VNextSettings
 from biopharma_agent.vnext.storage import LocalResearchStore
@@ -114,6 +117,12 @@ class DummyReadiness:
     def __init__(self, blockers=None, status="needs_attention"):
         self.blockers = blockers or []
         self.status = status
+
+
+class StubHistoryProvider:
+    def load_history(self, ticker: str, start: str, end: str) -> pd.DataFrame:
+        dates = pd.to_datetime(["2025-01-01", "2025-01-11", "2025-01-31", "2025-04-01"])
+        return pd.DataFrame({"close": [100.0, 105.0, 115.0, 125.0]}, index=dates)
 
 
 class TestVNextExecution(unittest.TestCase):
@@ -293,6 +302,41 @@ class TestVNextExecution(unittest.TestCase):
 
         self.assertFalse(plan.selected_symbols)
         self.assertIn("No recommendations cleared the PM execution thresholds.", plan.blockers)
+
+    def test_execution_feedback_materializes_profile_scorecards(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.append_records(
+                "order_plans",
+                [
+                    {
+                        "symbol": "CRSP",
+                        "company_name": "CRSP Therapeutics",
+                        "action": "buy",
+                        "side": "buy",
+                        "scenario": "pre-catalyst long",
+                        "company_state": "pre_commercial",
+                        "setup_type": "hard_catalyst",
+                        "execution_profile": "hard_catalyst",
+                        "confidence": 0.72,
+                        "target_weight": 4.0,
+                        "scaled_target_weight": 4.0,
+                        "target_notional": 1_000.0,
+                        "current_notional": 0.0,
+                        "delta_notional": 1_000.0,
+                        "as_of": "2025-01-01T00:00:00",
+                        "planned_at": "2025-01-01T00:00:00",
+                    }
+                ],
+            )
+            summary = materialize_execution_feedback(store=store, history_provider=StubHistoryProvider())
+            feedback = store.read_table("execution_feedback")
+            scorecards = store.read_table("execution_profile_scorecards")
+
+            self.assertEqual(summary.feedback_rows, 1)
+            self.assertEqual(len(feedback), 1)
+            self.assertEqual(scorecards.iloc[0]["execution_profile"], "hard_catalyst")
+            self.assertGreater(float(scorecards.iloc[0]["avg_return_30d"]), 0.0)
 
     def test_alpaca_broker_uses_paper_headers(self):
         settings = self.make_settings()

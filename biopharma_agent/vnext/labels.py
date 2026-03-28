@@ -13,6 +13,47 @@ import yfinance as yf
 from .storage import LocalResearchStore
 from .taxonomy import event_timing_priority, event_type_bucket, event_type_priority
 
+POSITIVE_OUTCOME_KEYWORDS = (
+    "approved",
+    "approval",
+    "acceptance",
+    "accepted",
+    "positive topline",
+    "positive top-line",
+    "met the primary endpoint",
+    "met primary endpoint",
+    "met its primary endpoint",
+    "met endpoint",
+    "achieved primary endpoint",
+    "priority review",
+    "breakthrough therapy",
+)
+
+NEGATIVE_OUTCOME_KEYWORDS = (
+    "complete response",
+    "crl",
+    "clinical hold",
+    "terminated",
+    "terminate",
+    "discontinue",
+    "discontinued",
+    "failed",
+    "failure",
+    "missed the primary endpoint",
+    "did not meet",
+    "not approve",
+    "rejected",
+    "withdrawn",
+)
+
+MIXED_OUTCOME_KEYWORDS = (
+    "business update",
+    "corporate progress",
+    "operational highlights",
+    "quarterly results",
+    "financial results",
+)
+
 
 class PriceHistoryProvider(Protocol):
     def load_history(self, ticker: str, start: str, end: str) -> pd.DataFrame:
@@ -166,7 +207,11 @@ class PointInTimeLabeler:
         )
 
     def materialize_labels(self, snapshots: pd.DataFrame | None = None, catalysts: pd.DataFrame | None = None) -> LabelSummary:
-        snapshot_labels, event_labels = self.build_label_frames(snapshots=snapshots, catalysts=catalysts)
+        snapshot_labels, event_labels = self.build_label_frames(
+            snapshots=snapshots,
+            catalysts=catalysts,
+            event_tape=self.store.read_table("event_tape"),
+        )
         self.store.write_labels(snapshot_labels.to_dict(orient="records"))
         self.store.write_event_labels(event_labels.to_dict(orient="records"))
         matured_90d = int(snapshot_labels["target_return_90d"].notna().sum()) if not snapshot_labels.empty else 0
@@ -183,9 +228,11 @@ class PointInTimeLabeler:
         self,
         snapshots: pd.DataFrame | None = None,
         catalysts: pd.DataFrame | None = None,
+        event_tape: pd.DataFrame | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         snapshots = snapshots.copy() if snapshots is not None else self.store.read_table("company_snapshots").copy()
         catalysts = catalysts.copy() if catalysts is not None else self.store.read_table("catalysts").copy()
+        event_tape = event_tape.copy() if event_tape is not None else self.store.read_table("event_tape").copy()
         if snapshots.empty:
             return pd.DataFrame(), pd.DataFrame()
 
@@ -205,12 +252,22 @@ class PointInTimeLabeler:
             ).dt.tz_convert(None)
         else:
             catalysts = pd.DataFrame()
+        if not event_tape.empty and "event_timestamp" in event_tape.columns:
+            event_tape["event_timestamp_ts"] = pd.to_datetime(
+                event_tape["event_timestamp"],
+                errors="coerce",
+                utc=True,
+                format="mixed",
+            ).dt.tz_convert(None)
+        else:
+            event_tape = pd.DataFrame()
 
         snapshot_rows: list[dict[str, object]] = []
         event_rows: list[dict[str, object]] = []
         for ticker in sorted(snapshots["ticker"].dropna().unique().tolist()):
             ticker_snaps = snapshots[snapshots["ticker"] == ticker].copy()
             ticker_catalysts = catalysts[catalysts["ticker"] == ticker].copy() if not catalysts.empty else pd.DataFrame()
+            ticker_event_tape = event_tape[event_tape["ticker"] == ticker].copy() if not event_tape.empty else pd.DataFrame()
 
             start_ts = ticker_snaps["as_of_ts"].min() - timedelta(days=14)
             end_ts = ticker_snaps["as_of_ts"].max() + timedelta(days=220)
@@ -251,11 +308,28 @@ class PointInTimeLabeler:
                 )
                 if primary_event is not None:
                     event_return = self._event_window_return(close, pd.Timestamp(primary_event["expected_date_ts"]))
+                    reaction_success = int(pd.notna(event_return) and float(event_return) > 0.05)
+                    outcome_label = self._exact_outcome_label(
+                        ticker_event_tape=ticker_event_tape,
+                        primary_event=primary_event,
+                        as_of_ts=pd.Timestamp(snapshot.as_of_ts),
+                    )
                     row["target_event_return_10d"] = event_return
-                    row["target_event_success"] = int(pd.notna(event_return) and float(event_return) > 0.05)
+                    row["target_event_success_market"] = reaction_success
+                    row["target_event_success_outcome"] = (
+                        outcome_label["success"] if outcome_label is not None else np.nan
+                    )
                     row["target_primary_event_days"] = int(primary_event["horizon_days"])
                     row["target_primary_event_type"] = primary_event["event_type"]
                     row["target_primary_event_bucket"] = event_type_bucket(primary_event["event_type"])
+                    row["target_catalyst_success_source"] = (
+                        outcome_label["source"] if outcome_label is not None else "event_price_reaction"
+                    )
+                    row["target_event_success"] = (
+                        int(outcome_label["success"])
+                        if outcome_label is not None
+                        else reaction_success
+                    )
                     event_rows.append(
                         {
                             "ticker": ticker,
@@ -266,26 +340,114 @@ class PointInTimeLabeler:
                             "expected_date": primary_event["expected_date"],
                             "horizon_days": int(primary_event["horizon_days"]),
                             "target_event_return_10d": event_return,
-                            "target_event_success": int(pd.notna(event_return) and float(event_return) > 0.05),
+                            "target_event_success_market": reaction_success,
+                            "target_event_success_outcome": (
+                                outcome_label["success"] if outcome_label is not None else np.nan
+                            ),
+                            "target_event_success": (
+                                int(outcome_label["success"])
+                                if outcome_label is not None
+                                else reaction_success
+                            ),
+                            "target_event_success_source": (
+                                outcome_label["source"] if outcome_label is not None else "event_price_reaction"
+                            ),
                         }
                     )
-                    catalyst_anchor = event_return
-                    catalyst_threshold = 0.05
+                    catalyst_success = (
+                        int(outcome_label["success"])
+                        if outcome_label is not None
+                        else reaction_success
+                    )
                 else:
                     row["target_event_return_10d"] = np.nan
                     row["target_event_success"] = np.nan
+                    row["target_event_success_market"] = np.nan
+                    row["target_event_success_outcome"] = np.nan
                     row["target_primary_event_days"] = np.nan
                     row["target_primary_event_type"] = None
                     row["target_primary_event_bucket"] = "none"
-                    catalyst_anchor = row.get("target_return_90d")
-                    catalyst_threshold = 0.08
+                    row["target_catalyst_success_source"] = "return_90d_fallback"
+                    catalyst_success = int(
+                        pd.notna(row.get("target_return_90d"))
+                        and float(row["target_return_90d"]) > 0.08
+                    )
 
-                row["target_catalyst_success"] = int(
-                    pd.notna(catalyst_anchor) and float(catalyst_anchor) > catalyst_threshold
-                )
+                row["target_catalyst_success"] = catalyst_success
                 snapshot_rows.append(row)
 
         return pd.DataFrame(snapshot_rows), pd.DataFrame(event_rows)
+
+    @classmethod
+    def _exact_outcome_label(
+        cls,
+        ticker_event_tape: pd.DataFrame,
+        primary_event: pd.Series,
+        as_of_ts: pd.Timestamp,
+    ) -> dict[str, object] | None:
+        if ticker_event_tape.empty:
+            return None
+        expected_date_ts = primary_event.get("expected_date_ts")
+        if expected_date_ts is None or pd.isna(expected_date_ts):
+            return None
+        primary_bucket = event_type_bucket(primary_event.get("event_type"))
+        if primary_bucket not in {"clinical", "regulatory"}:
+            return None
+        candidates = ticker_event_tape.dropna(subset=["event_timestamp_ts"]).copy()
+        if candidates.empty:
+            return None
+        candidates = candidates[
+            (candidates["event_timestamp_ts"] >= as_of_ts)
+            & (candidates["event_timestamp_ts"] >= (expected_date_ts - timedelta(days=2)))
+            & (candidates["event_timestamp_ts"] <= (expected_date_ts + timedelta(days=21)))
+        ].copy()
+        if candidates.empty:
+            return None
+        candidates["event_bucket"] = candidates["event_type"].map(event_type_bucket)
+        candidates = candidates[candidates["event_bucket"] == primary_bucket].copy()
+        if candidates.empty:
+            return None
+        candidates["type_match"] = (
+            candidates["event_type"].astype(str) == str(primary_event.get("event_type") or "")
+        ).astype(float)
+        candidates["timing_priority"] = candidates.apply(
+            lambda row: event_timing_priority(row.get("status"), row.get("event_timestamp"), row.get("title")),
+            axis=1,
+        )
+        candidates["days_from_expected"] = (
+            (candidates["event_timestamp_ts"] - expected_date_ts).abs().dt.total_seconds() / 86400.0
+        )
+        candidates = candidates.sort_values(
+            ["type_match", "timing_priority", "days_from_expected"],
+            ascending=[False, False, True],
+        )
+        for _, row in candidates.iterrows():
+            inferred = cls._infer_outcome_from_text(
+                event_type=str(row.get("event_type") or ""),
+                title=str(row.get("title") or ""),
+                status=str(row.get("status") or ""),
+            )
+            if inferred is not None:
+                return inferred
+        return None
+
+    @staticmethod
+    def _infer_outcome_from_text(
+        event_type: str,
+        title: str,
+        status: str,
+    ) -> dict[str, object] | None:
+        bucket = event_type_bucket(event_type)
+        if bucket not in {"clinical", "regulatory"}:
+            return None
+        text = f"{title} {status}".lower()
+        if any(keyword in text for keyword in MIXED_OUTCOME_KEYWORDS):
+            return None
+        if any(keyword in text for keyword in NEGATIVE_OUTCOME_KEYWORDS):
+            return {"success": 0, "source": "exact_event_outcome_negative"}
+        if any(keyword in text for keyword in POSITIVE_OUTCOME_KEYWORDS):
+            return {"success": 1, "source": "exact_event_outcome_positive"}
+        return None
 
     @staticmethod
     def _select_primary_event(

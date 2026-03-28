@@ -94,7 +94,7 @@ class FeatureEngineer:
         features["commercial_execution_growth_signal"] = (
             snapshot.approved_products[0].growth_signal
             if snapshot.approved_products
-            else float(snapshot.momentum_3mo or 0.0)
+            else 0.0
         )
         features.update(self._event_type_features(top_event_type, prefix="catalyst_timing_event"))
         features.update(self._event_type_features(company_event_type, prefix="catalyst_timing_company_event"))

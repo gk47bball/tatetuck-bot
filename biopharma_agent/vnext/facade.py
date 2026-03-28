@@ -132,6 +132,11 @@ class TatetuckPlatform:
                 "market_view": expectation_lens["market_view"],
                 "asymmetry_summary": expectation_lens["asymmetry_summary"],
                 "asymmetry_label": expectation_lens["asymmetry_label"],
+                "peer_gap_pct": expectation_lens.get("peer_gap_pct"),
+                "peer_anchor_value": expectation_lens.get("peer_anchor_value"),
+                "risk_adjusted_sales": expectation_lens.get("risk_adjusted_sales"),
+                "cash_floor_value": expectation_lens.get("cash_floor_value"),
+                "value_method": expectation_lens.get("value_method"),
                 "internal_value": signal.internal_value,
                 "internal_price_target": signal.internal_price_target,
                 "internal_upside_pct": signal.internal_upside_pct,
@@ -321,7 +326,7 @@ class TatetuckPlatform:
         event_label = primary_event.event_type if primary_event is not None else "no clear dated catalyst"
         return (
             f"Shares look {price_setup}; crowding risk is {crowding} and financing pressure is {financing} "
-            f"heading into {event_label}. Internal upside screens at {(signal.internal_upside_pct or 0.0) * 100:+.1f}% "
+            f"heading into {event_label}. Peer-anchored value gap screens at {(signal.internal_upside_pct or 0.0) * 100:+.1f}% "
             f"with a floor support estimate of {(signal.floor_support_pct or 0.0) * 100:.1f}%."
         )
 

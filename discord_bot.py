@@ -330,14 +330,17 @@ def build_bot() -> commands.Bot:
         )
 
         internal_value_text = (
-            f"Internal value: {format_money(internal_value)}"
+            f"Peer-anchored value: {format_money(internal_value)}"
             if internal_value is not None
-            else "Internal value: unavailable"
+            else "Peer-anchored value: unavailable"
         )
         if internal_price_target is not None:
             internal_value_text += f" | PT: ${float(internal_price_target):.2f}"
         if internal_upside_pct is not None:
-            internal_value_text += f" | Upside: {float(internal_upside_pct) * 100:+.1f}%"
+            internal_value_text += f" | Gap: {float(internal_upside_pct) * 100:+.1f}%"
+        value_method = analysis.metadata.get("value_method")
+        if value_method:
+            internal_value_text += f"\nMethod: {value_method}"
         embed.add_field(name="Tatetuck Value View", value=internal_value_text, inline=False)
 
         valuation_summary = analysis.metadata.get("valuation_summary", "Valuation context unavailable.")

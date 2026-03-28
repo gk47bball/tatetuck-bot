@@ -258,6 +258,52 @@ def classify_setup_type(
     return "watchful"
 
 
+def _phase_share_cap(phase_rank: int) -> float:
+    return {
+        6: 0.16,
+        5: 0.12,
+        4: 0.08,
+        3: 0.05,
+        2: 0.03,
+        1: 0.02,
+        0: 0.015,
+    }.get(phase_rank, 0.02)
+
+
+def _risk_adjusted_program_sales(snapshot: CompanySnapshot, competition_intensity: float) -> float:
+    top_programs = sorted(snapshot.programs, key=lambda program: float(program.tam_estimate or 0.0), reverse=True)[:3]
+    competition_adjustment = _clamp(1.0 - (0.40 * competition_intensity), 0.35, 0.90)
+    risk_adjusted_sales = 0.0
+    for program in top_programs:
+        phase_rank = PHASE_RANK.get(program.phase, 0)
+        share_cap = _phase_share_cap(phase_rank)
+        risk_adjusted_sales += (
+            float(program.tam_estimate or 0.0)
+            * share_cap
+            * float(program.pos_prior or 0.0)
+            * competition_adjustment
+        )
+    return float(risk_adjusted_sales)
+
+
+def _peer_anchor_value(
+    snapshot: CompanySnapshot,
+    state: str,
+    peer_context: dict[str, Any],
+) -> float:
+    metric_label = str(peer_context.get("metric_label") or "")
+    median_multiple = float(peer_context.get("median_multiple") or 0.0)
+    if median_multiple <= 0.0:
+        return 0.0
+    if state == "pre_commercial" and metric_label == "market-cap/TAM":
+        top_tam = max((float(program.tam_estimate or 0.0) for program in snapshot.programs), default=0.0)
+        return float(top_tam * median_multiple)
+    revenue = float(snapshot.revenue or 0.0)
+    if revenue <= 0.0 or metric_label != "EV/revenue":
+        return 0.0
+    return float(revenue * median_multiple)
+
+
 def build_expectation_lens(
     snapshot: CompanySnapshot,
     signal: SignalArtifact,
@@ -270,43 +316,55 @@ def build_expectation_lens(
     net_cash = float(snapshot.cash or 0.0) - float(snapshot.debt or 0.0)
     market_cap = max(float(snapshot.market_cap or 0.0), 1.0)
     current_price = float(snapshot.metadata.get("price_now") or 0.0)
-    top_programs = sorted(snapshot.programs, key=lambda program: float(program.tam_estimate or 0.0), reverse=True)[:3]
-    competition_adjustment = max(0.45, 1.0 - (0.30 * competition_intensity))
-
-    program_optionality_value = 0.0
-    for program in top_programs:
-        phase_rank = PHASE_RANK.get(program.phase, 0)
-        phase_penetration = {
-            6: 0.18,
-            5: 0.15,
-            4: 0.12,
-            3: 0.08,
-            2: 0.05,
-            1: 0.03,
-            0: 0.02,
-        }.get(phase_rank, 0.03)
-        program_optionality_value += (
-            float(program.tam_estimate or 0.0)
-            * phase_penetration
-            * float(program.pos_prior or 0.0)
-            * competition_adjustment
-            * 1.4
-        )
-
-    launch_multiple = 4.0 + max(float(snapshot.momentum_3mo or 0.0), 0.0) * 6.0
-    mature_multiple = 3.0 + min(max(float(snapshot.metadata.get("capital_deployment_score", 0.0) or 0.0), 0.0), 1.0) * 2.0
+    peer_anchor_value = _peer_anchor_value(snapshot, state, peer_context)
+    risk_adjusted_sales = _risk_adjusted_program_sales(snapshot, competition_intensity)
+    cash_floor_value = max(net_cash, 0.0) + (0.15 * float(snapshot.revenue or 0.0))
+    launch_progress = float(profile.get("launch_progress_pct", 0.0) or 0.0)
+    lifecycle_score = float(profile.get("lifecycle_management_score", 0.0) or 0.0)
+    pipeline_optionality = float(profile.get("pipeline_optionality_score", 0.0) or 0.0)
+    capital_deployment = float(profile.get("capital_deployment_score", 0.0) or 0.0)
+    exact_event_bonus = 0.15 if primary_event is not None and primary_event.status.startswith("exact_") else 0.0
 
     if state == "pre_commercial":
-        internal_value = max(net_cash, 0.0) + program_optionality_value
+        empirical_value = risk_adjusted_sales * (2.1 + exact_event_bonus)
+        internal_value = (
+            (0.45 * peer_anchor_value if peer_anchor_value > 0 else 0.0)
+            + (0.55 * empirical_value)
+            + cash_floor_value
+        )
+        value_method = "stage peer market-cap/TAM blended with risk-adjusted lead-program opportunity"
     elif state == "commercial_launch":
-        internal_value = (float(snapshot.revenue or 0.0) * launch_multiple) + (0.70 * program_optionality_value) + max(net_cash, 0.0)
+        peer_multiple = float(peer_context.get("median_multiple") or 5.0)
+        commercial_anchor = float(snapshot.revenue or 0.0) * _clamp(peer_multiple * (0.80 + (0.30 * launch_progress)), 2.5, 9.0)
+        pipeline_anchor = risk_adjusted_sales * (1.9 + (0.2 * lifecycle_score))
+        internal_value = (
+            (0.55 * peer_anchor_value if peer_anchor_value > 0 else 0.0)
+            + (0.45 * commercial_anchor)
+            + (0.35 * pipeline_anchor)
+            + cash_floor_value
+        )
+        value_method = "peer EV/revenue anchored launch value with lifecycle and pipeline support"
     else:
-        internal_value = (float(snapshot.revenue or 0.0) * mature_multiple) + (0.60 * program_optionality_value) + max(net_cash, 0.0) * 0.80
+        peer_multiple = float(peer_context.get("median_multiple") or 4.0)
+        franchise_anchor = float(snapshot.revenue or 0.0) * _clamp(peer_multiple * (0.90 + (0.15 * capital_deployment)), 2.0, 8.0)
+        pipeline_anchor = risk_adjusted_sales * (1.4 + (0.25 * pipeline_optionality))
+        internal_value = (
+            (0.70 * peer_anchor_value if peer_anchor_value > 0 else 0.0)
+            + (0.30 * franchise_anchor)
+            + (0.25 * pipeline_anchor)
+            + (0.75 * max(net_cash, 0.0))
+        )
+        value_method = "franchise peer EV/revenue with pipeline and capital deployment optionality"
 
-    internal_upside_pct = (internal_value / market_cap) - 1.0
+    internal_upside_pct = _clamp((internal_value / market_cap) - 1.0, -0.85, 2.50)
     internal_price_target = current_price * (internal_value / market_cap) if current_price > 0 else None
     setup_type = classify_setup_type(snapshot, signal, primary_event, profile)
     valuation_posture = peer_context.get("valuation_posture", "neutral")
+    peer_gap_pct = (
+        ((peer_anchor_value / market_cap) - 1.0)
+        if peer_anchor_value > 0
+        else internal_upside_pct
+    )
     asymmetry_label = (
         "high positive asymmetry"
         if internal_upside_pct >= 0.35
@@ -329,8 +387,9 @@ def build_expectation_lens(
         market_view += " A meaningful event window still matters to closing the gap."
 
     asymmetry_summary = (
-        f"Tatetuck internal value is {internal_upside_pct * 100:+.1f}% versus current market cap; "
-        f"floor support screens at {float(profile['floor_support_pct']) * 100:.1f}% of market cap and peer posture looks {valuation_posture}."
+        f"Peer-anchored value view is {internal_upside_pct * 100:+.1f}% versus current market cap; "
+        f"peer gap screens at {peer_gap_pct * 100:+.1f}%, floor support at {float(profile['floor_support_pct']) * 100:.1f}%, "
+        f"and peer posture looks {valuation_posture}."
     )
     competitive_summary = (
         f"{profile['primary_indication']} sits in a {profile['market_style']} market led by "
@@ -343,6 +402,11 @@ def build_expectation_lens(
         "internal_value": float(internal_value),
         "internal_price_target": None if internal_price_target is None else float(internal_price_target),
         "internal_upside_pct": float(internal_upside_pct),
+        "peer_anchor_value": float(peer_anchor_value),
+        "peer_gap_pct": float(peer_gap_pct),
+        "risk_adjusted_sales": float(risk_adjusted_sales),
+        "cash_floor_value": float(cash_floor_value),
+        "value_method": value_method,
         "asymmetry_label": asymmetry_label,
         "market_view": market_view,
         "asymmetry_summary": asymmetry_summary,

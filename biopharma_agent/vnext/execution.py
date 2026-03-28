@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import os
 from typing import Iterable
 from uuid import uuid4
 
+import pandas as pd
 import requests
 
 from .entities import CompanyAnalysis, PortfolioRecommendation
+from .labels import CompositeHistoryProvider, EODHDHistoryProvider, PriceHistoryProvider, YFinanceHistoryProvider
 from .ops import ReadinessReport, record_pipeline_run, utc_now_iso
 from .settings import VNextSettings
 from .storage import LocalResearchStore
@@ -58,6 +61,7 @@ class ExecutionInstruction:
     target_notional: float
     current_notional: float
     delta_notional: float
+    as_of: str | None = None
     internal_upside_pct: float | None = None
     floor_support_pct: float | None = None
     qty: float | None = None
@@ -117,6 +121,14 @@ class DiscordNotificationResult:
     message_id: str | None
     order_count: int
     fallback_used: bool = False
+
+
+@dataclass(slots=True)
+class ExecutionFeedbackSummary:
+    feedback_rows: int
+    matured_30d_rows: int
+    matured_90d_rows: int
+    scorecard_rows: int
 
 
 class AlpacaPaperBroker:
@@ -483,6 +495,7 @@ class PMExecutionPlanner:
                 ExecutionInstruction(
                     symbol=ticker,
                     company_name=analysis.snapshot.company_name,
+                    as_of=analysis.snapshot.as_of,
                     action=action,
                     side=side,
                     scenario=rec.scenario,
@@ -517,6 +530,7 @@ class PMExecutionPlanner:
                     ExecutionInstruction(
                         symbol=symbol,
                         company_name=analysis.snapshot.company_name,
+                        as_of=analysis.snapshot.as_of,
                         action="hold",
                         side="none",
                         scenario=f"hold {analysis.portfolio.scenario}",
@@ -544,6 +558,7 @@ class PMExecutionPlanner:
                 ExecutionInstruction(
                     symbol=symbol,
                     company_name=symbol,
+                    as_of=analysis.snapshot.as_of if analysis is not None else None,
                     action="sell",
                     side="sell",
                     scenario="exit unmanaged",
@@ -671,8 +686,8 @@ class PMExecutionPlanner:
             return self._blocked_profile("financing_blocked", analysis, "Financing overhang is too high for deployment.")
         if rec.scenario == "watchlist only" and setup not in {"asymmetry_without_near_term_catalyst", "sentiment_floor"}:
             return self._blocked_profile("watchlist_only", analysis, "Watchlist-only setup is not eligible for PM deployment.")
-        if upside < -0.05:
-            return self._blocked_profile("negative_asymmetry", analysis, "Internal value view is below the market setup.")
+        if upside <= -0.12:
+            return self._blocked_profile("negative_asymmetry", analysis, "Peer-anchored value view is too far below the market setup.")
         if expected_return <= 0.0 and upside <= 0.0:
             return self._blocked_profile("no_edge", analysis, "Expected return and asymmetry do not justify deployment.")
         if target_weight < self.settings.execution_hold_weight_pct and not has_position:
@@ -688,7 +703,7 @@ class PMExecutionPlanner:
             if (
                 confidence >= min_confidence
                 and catalyst_success >= 0.50
-                and upside >= self.settings.execution_min_internal_upside_pct
+                and upside >= -0.02
                 and financing_risk <= 0.72
             ):
                 return self._auto_profile(
@@ -713,7 +728,7 @@ class PMExecutionPlanner:
             if (
                 confidence >= self.settings.execution_min_soft_catalyst_confidence
                 and catalyst_success >= 0.55
-                and upside >= self.settings.execution_min_internal_upside_pct + 0.02
+                and upside >= self.settings.execution_min_internal_upside_pct - 0.02
                 and floor >= min_floor
             ):
                 return self._auto_profile(
@@ -737,7 +752,7 @@ class PMExecutionPlanner:
                 state == "commercial_launch"
                 and confidence >= self.settings.execution_min_launch_confidence
                 and expected_return > 0.08
-                and upside >= self.settings.execution_min_internal_upside_pct
+                and upside >= self.settings.execution_min_internal_upside_pct - 0.02
                 and floor >= self.settings.execution_min_floor_support_pct
                 and financing_risk <= 0.68
             ):
@@ -762,7 +777,7 @@ class PMExecutionPlanner:
                 state in {"commercial_launch", "commercialized"}
                 and confidence >= self.settings.execution_min_franchise_confidence
                 and expected_return > 0.05
-                and upside >= self.settings.execution_min_internal_upside_pct - 0.02
+                and upside >= self.settings.execution_min_internal_upside_pct - 0.04
                 and floor >= self.settings.execution_min_floor_support_pct
             ):
                 return self._auto_profile(
@@ -786,7 +801,7 @@ class PMExecutionPlanner:
                 state in {"commercial_launch", "commercialized"}
                 and confidence >= self.settings.execution_min_franchise_confidence
                 and expected_return > 0.04
-                and upside >= self.settings.execution_min_internal_upside_pct - 0.03
+                and upside >= self.settings.execution_min_internal_upside_pct - 0.05
                 and floor >= self.settings.execution_min_floor_support_pct + 0.05
             ):
                 return self._auto_profile(
@@ -913,8 +928,8 @@ class PMExecutionPlanner:
             max(signal.expected_return, 0.0) * 4.0
             + (analysis.portfolio.confidence * 1.5)
             + (max(signal.catalyst_success_prob - 0.50, 0.0) * 1.2)
-            + (max(upside, 0.0) * 0.05)
-            + (max(floor, 0.0) * 0.03)
+            + (max(upside, 0.0) * 0.02)
+            + (max(floor, 0.0) * 0.05)
             - (signal.crowding_risk * 0.8)
             - (signal.financing_risk * 1.2)
             + score_bonus
@@ -960,6 +975,145 @@ def execute_plan(
     return submissions
 
 
+def materialize_execution_feedback(
+    store: LocalResearchStore,
+    history_provider: PriceHistoryProvider | None = None,
+) -> ExecutionFeedbackSummary:
+    plans = store.read_table("order_plans")
+    if plans.empty:
+        store.replace_table("execution_feedback", [])
+        store.replace_table("execution_profile_scorecards", [])
+        return ExecutionFeedbackSummary(
+            feedback_rows=0,
+            matured_30d_rows=0,
+            matured_90d_rows=0,
+            scorecard_rows=0,
+        )
+
+    eodhd_key = os.environ.get("EODHD_API_KEY")
+    provider = history_provider or CompositeHistoryProvider(
+        [
+            EODHDHistoryProvider(store=store),
+            YFinanceHistoryProvider(store=store, allow_live=not bool(eodhd_key)),
+        ]
+    )
+
+    actionable = plans[plans["action"].isin(["buy", "sell"])].copy()
+    if actionable.empty:
+        store.replace_table("execution_feedback", [])
+        store.replace_table("execution_profile_scorecards", [])
+        return ExecutionFeedbackSummary(
+            feedback_rows=0,
+            matured_30d_rows=0,
+            matured_90d_rows=0,
+            scorecard_rows=0,
+        )
+    for column in ("as_of", "planned_at", "company_state", "setup_type", "execution_profile", "scenario", "company_name"):
+        if column not in actionable.columns:
+            actionable[column] = None
+    entry_anchor = actionable["as_of"].fillna(actionable["planned_at"])
+    actionable["entry_ts"] = pd.to_datetime(
+        entry_anchor,
+        errors="coerce",
+        utc=True,
+        format="mixed",
+    ).dt.tz_convert(None)
+    actionable = actionable.dropna(subset=["entry_ts"])
+    if actionable.empty:
+        return ExecutionFeedbackSummary(
+            feedback_rows=0,
+            matured_30d_rows=0,
+            matured_90d_rows=0,
+            scorecard_rows=0,
+        )
+
+    feedback_rows: list[dict[str, object]] = []
+    for symbol in sorted(actionable["symbol"].dropna().unique().tolist()):
+        symbol_rows = actionable[actionable["symbol"] == symbol].copy()
+        start = (symbol_rows["entry_ts"].min() - pd.Timedelta(days=14)).date().isoformat()
+        end = (symbol_rows["entry_ts"].max() + pd.Timedelta(days=220)).date().isoformat()
+        history = provider.load_history(symbol, start=start, end=end)
+        if history.empty or "close" not in history.columns:
+            continue
+        close = history["close"].astype(float)
+        close.index = pd.to_datetime(close.index).astype("datetime64[ns]")
+        for row in symbol_rows.itertuples(index=False):
+            entry_ts = pd.Timestamp(row.entry_ts)
+            entry_price = _price_at_or_after(close, entry_ts)
+            if entry_price is None or entry_price <= 0:
+                continue
+            direction = 1.0 if row.action == "buy" else -1.0
+            record = {
+                "symbol": row.symbol,
+                "company_name": row.company_name,
+                "as_of": row.as_of,
+                "planned_at": row.planned_at,
+                "entry_ts": entry_ts.isoformat(),
+                "entry_price": float(entry_price),
+                "direction": direction,
+                "action": row.action,
+                "scenario": row.scenario,
+                "company_state": row.company_state,
+                "setup_type": row.setup_type,
+                "execution_profile": row.execution_profile,
+            }
+            latest_price = _price_at_or_before(close, close.index.max())
+            record["mark_to_market_return"] = (
+                float(direction * ((latest_price / entry_price) - 1.0))
+                if latest_price is not None
+                else None
+            )
+            for horizon in (10, 30, 90):
+                exit_price = _price_at_or_after(close, entry_ts + pd.Timedelta(days=horizon))
+                realized = None if exit_price is None else float(direction * ((exit_price / entry_price) - 1.0))
+                record[f"return_{horizon}d"] = realized
+                record[f"matured_{horizon}d"] = realized is not None
+            feedback_rows.append(record)
+
+    store.replace_table("execution_feedback", feedback_rows)
+
+    feedback = pd.DataFrame(feedback_rows)
+    if feedback.empty:
+        store.replace_table("execution_profile_scorecards", [])
+        return ExecutionFeedbackSummary(
+            feedback_rows=0,
+            matured_30d_rows=0,
+            matured_90d_rows=0,
+            scorecard_rows=0,
+        )
+
+    scorecards: list[dict[str, object]] = []
+    for profile, group in feedback.groupby("execution_profile", dropna=False):
+        row: dict[str, object] = {
+            "execution_profile": profile,
+            "trades": int(len(group)),
+            "company_states": ",".join(sorted(set(group["company_state"].dropna().astype(str).tolist()))),
+            "setup_types": ",".join(sorted(set(group["setup_type"].dropna().astype(str).tolist()))),
+        }
+        for horizon in (10, 30, 90):
+            matured = group[group[f"matured_{horizon}d"].fillna(False)].copy()
+            row[f"matured_{horizon}d_trades"] = int(len(matured))
+            row[f"hit_rate_{horizon}d"] = (
+                float((matured[f"return_{horizon}d"] > 0.0).mean())
+                if not matured.empty
+                else None
+            )
+            row[f"avg_return_{horizon}d"] = (
+                float(matured[f"return_{horizon}d"].mean())
+                if not matured.empty
+                else None
+            )
+        row["avg_mark_to_market_return"] = float(group["mark_to_market_return"].mean())
+        scorecards.append(row)
+    store.replace_table("execution_profile_scorecards", scorecards)
+    return ExecutionFeedbackSummary(
+        feedback_rows=len(feedback_rows),
+        matured_30d_rows=int(feedback["matured_30d"].fillna(False).sum()),
+        matured_90d_rows=int(feedback["matured_90d"].fillna(False).sum()),
+        scorecard_rows=len(scorecards),
+    )
+
+
 def record_trade_run(
     store: LocalResearchStore,
     settings: VNextSettings,
@@ -993,3 +1147,17 @@ def record_trade_run(
         },
         notes=notes,
     )
+
+
+def _price_at_or_after(close: pd.Series, timestamp: pd.Timestamp) -> float | None:
+    idx = close.index.values.searchsorted(timestamp.to_datetime64().astype("datetime64[ns]"), side="left")
+    if idx >= len(close):
+        return None
+    return float(close.iloc[idx])
+
+
+def _price_at_or_before(close: pd.Series, timestamp: pd.Timestamp) -> float | None:
+    idx = close.index.values.searchsorted(timestamp.to_datetime64().astype("datetime64[ns]"), side="right") - 1
+    if idx < 0:
+        return None
+    return float(close.iloc[idx])

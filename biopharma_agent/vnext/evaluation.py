@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .attribution import FACTOR_FAMILY_PREFIXES, ablate_feature_family, ablate_momentum
 from .entities import ModelPrediction, SignalArtifact
 from .features import FeatureEngineer
 from .labels import PointInTimeLabeler
@@ -54,6 +55,8 @@ class WalkForwardSummary:
     institutional_blockers: list[str] = field(default_factory=list)
     latest_window_top_trades: list[dict[str, object]] = field(default_factory=list)
     event_type_scorecards: dict[str, dict[str, float]] = field(default_factory=dict)
+    factor_attribution: dict[str, dict[str, float]] = field(default_factory=dict)
+    momentum_ablation: dict[str, float] = field(default_factory=dict)
 
 
 class WalkForwardEvaluator:
@@ -202,6 +205,11 @@ class WalkForwardEvaluator:
         previous_signals: dict[str, SignalArtifact] = {}
         num_windows = 0
         event_type_rows: dict[str, list[dict[str, float]]] = {}
+        factor_rows: dict[str, list[dict[str, float]]] = {}
+        momentum_baseline_ics: list[float] = []
+        momentum_only_ics: list[float] = []
+        momentum_ablated_ics: list[float] = []
+        signal_momentum_corrs: list[float] = []
         latest_window_top_trades: list[dict[str, object]] = []
 
         for split_idx in range(2, len(unique_dates)):
@@ -233,11 +241,13 @@ class WalkForwardEvaluator:
                 continue
 
             num_windows += 1
-            rank_ics.append(_spearman(company_frame["expected_return"], company_frame["target_return_90d"]))
+            baseline_rank_ic = _spearman(company_frame["expected_return"], company_frame["target_return_90d"])
+            rank_ics.append(baseline_rank_ic)
             hit_rates.append(float((np.sign(company_frame["expected_return"]) == np.sign(company_frame["target_return_90d"])).mean()))
             top = company_frame.nlargest(max(1, len(company_frame) // 5), "expected_return")
             bottom = company_frame.nsmallest(max(1, len(company_frame) // 5), "expected_return")
-            spreads.append(float(top["target_return_90d"].mean() - bottom["target_return_90d"].mean()))
+            baseline_spread = float(top["target_return_90d"].mean() - bottom["target_return_90d"].mean())
+            spreads.append(baseline_spread)
             exact_event_rates.append(float(company_frame["primary_event_exact"].fillna(False).mean()))
             synthetic_event_rates.append(float(company_frame["primary_event_synthetic"].fillna(False).mean()))
             pm_context_coverages.append(
@@ -261,9 +271,60 @@ class WalkForwardEvaluator:
                 strict_bottom = strict_frame.nsmallest(max(1, len(strict_frame) // 5), "expected_return")
                 strict_spreads.append(float(strict_top["target_return_90d"].mean() - strict_bottom["target_return_90d"].mean()))
             turnovers.append(1.0 if not previous_top else 1.0 - (len(current_top & previous_top) / max(len(current_top | previous_top), 1)))
-            previous_top = current_top
             briers.append(float(((company_frame["catalyst_success_prob"] - company_frame["target_catalyst_success"]) ** 2).mean()))
             cumulative_returns.append(float(top["target_return_90d"].mean()))
+
+            momentum_frame = self._company_momentum_frame(test=test, company_frame=company_frame)
+            momentum_only_ics.append(_spearman(momentum_frame["momentum_3mo"], momentum_frame["target_return_90d"]))
+            momentum_baseline_ics.append(baseline_rank_ic)
+            signal_momentum_corrs.append(_spearman(momentum_frame["momentum_3mo"], momentum_frame["expected_return"]))
+            no_momentum_frame = self._ablated_company_frame(
+                test=test,
+                ensemble=ensemble,
+                previous_recommendations=previous_recommendations,
+                previous_signals=previous_signals,
+                previous_top=previous_top,
+                ablation_kind="momentum",
+            )
+            if not no_momentum_frame.empty:
+                momentum_ablated_ics.append(
+                    _spearman(no_momentum_frame["expected_return"], no_momentum_frame["target_return_90d"])
+                )
+
+            for family in FACTOR_FAMILY_PREFIXES:
+                ablated_frame = self._ablated_company_frame(
+                    test=test,
+                    ensemble=ensemble,
+                    previous_recommendations=previous_recommendations,
+                    previous_signals=previous_signals,
+                    previous_top=previous_top,
+                    ablation_kind=family,
+                )
+                if ablated_frame.empty:
+                    continue
+                ablated_rank_ic = _spearman(ablated_frame["expected_return"], ablated_frame["target_return_90d"])
+                ablated_top = ablated_frame.nlargest(max(1, len(ablated_frame) // 5), "expected_return")
+                ablated_bottom = ablated_frame.nsmallest(max(1, len(ablated_frame) // 5), "expected_return")
+                ablated_spread = float(ablated_top["target_return_90d"].mean() - ablated_bottom["target_return_90d"].mean())
+                aligned = company_frame[["ticker", "expected_return"]].merge(
+                    ablated_frame[["ticker", "expected_return"]],
+                    on="ticker",
+                    suffixes=("_base", "_ablated"),
+                )
+                factor_rows.setdefault(family, []).append(
+                    {
+                        "rank_ic_delta": float(baseline_rank_ic - ablated_rank_ic),
+                        "spread_delta": float(baseline_spread - ablated_spread),
+                        "signal_correlation": _spearman(
+                            aligned["expected_return_base"],
+                            aligned["expected_return_ablated"],
+                        )
+                        if not aligned.empty
+                        else 0.0,
+                    }
+                )
+
+            previous_top = current_top
             previous_recommendations = current_recommendations
             previous_signals = current_signals
             latest_window_top_trades = (
@@ -329,6 +390,21 @@ class WalkForwardEvaluator:
             }
             for event_type, rows in event_type_rows.items()
         }
+        factor_attribution = {
+            family: {
+                "rank_ic_delta": _safe_mean([item["rank_ic_delta"] for item in rows]),
+                "spread_delta": _safe_mean([item["spread_delta"] for item in rows]),
+                "signal_correlation": _safe_mean([item["signal_correlation"] for item in rows]),
+                "windows": float(len(rows)),
+            }
+            for family, rows in factor_rows.items()
+        }
+        momentum_ablation = {
+            "baseline_rank_ic": _safe_mean(momentum_baseline_ics),
+            "momentum_only_rank_ic": _safe_mean(momentum_only_ics),
+            "no_momentum_rank_ic": _safe_mean(momentum_ablated_ics),
+            "signal_momentum_correlation": _safe_mean(signal_momentum_corrs),
+        }
         institutional_blockers: list[str] = []
         pm_context_coverage = _safe_mean(pm_context_coverages)
         exact_primary_event_rate = _safe_mean(exact_event_rates)
@@ -344,6 +420,12 @@ class WalkForwardEvaluator:
         if synthetic_primary_event_rate > 0.25:
             institutional_blockers.append(
                 f"{synthetic_primary_event_rate * 100:.1f}% of evaluated rows still rely on synthetic primary events."
+            )
+        if momentum_ablation["no_momentum_rank_ic"] > 0.0 and (
+            momentum_ablation["baseline_rank_ic"] - momentum_ablation["no_momentum_rank_ic"]
+        ) > 0.12:
+            institutional_blockers.append(
+                "Momentum ablation removes too much of the rank IC; factor mix still looks too tape-dependent."
             )
         universe_membership = self.store.read_table("universe_membership")
         if universe_membership.empty:
@@ -371,6 +453,8 @@ class WalkForwardEvaluator:
             institutional_blockers=institutional_blockers,
             latest_window_top_trades=latest_window_top_trades,
             event_type_scorecards=event_type_scorecards,
+            factor_attribution=factor_attribution,
+            momentum_ablation=momentum_ablation,
         )
 
     def _rebalance_dates(self, unique_dates: list[pd.Timestamp]) -> list[pd.Timestamp]:
@@ -397,6 +481,53 @@ class WalkForwardEvaluator:
         latest_as_of = eligible.groupby("ticker")["as_of"].transform("max")
         test = eligible[eligible["as_of"] == latest_as_of].copy()
         return test.sort_values(["ticker", "entity_id"])
+
+    def _ablated_company_frame(
+        self,
+        test: pd.DataFrame,
+        ensemble: EventDrivenEnsemble,
+        previous_recommendations: dict[str, object],
+        previous_signals: dict[str, SignalArtifact],
+        previous_top: set[str],
+        ablation_kind: str,
+    ) -> pd.DataFrame:
+        vectors = []
+        for _, row in test.iterrows():
+            vector = self._row_to_feature_vector(row)
+            if ablation_kind == "momentum":
+                vector.feature_family = ablate_momentum(vector.feature_family)
+            else:
+                vector.feature_family = ablate_feature_family(vector.feature_family, ablation_kind)
+            vectors.append(vector)
+        try:
+            predictions = ensemble.score(vectors, persist=False)
+        except TypeError:
+            predictions = ensemble.score(vectors)
+        company_frame, _, _, _ = self._company_test_frame(
+            test=test,
+            predictions=predictions,
+            previous_recommendations=previous_recommendations,
+            previous_signals=previous_signals,
+            previous_top=previous_top,
+        )
+        if company_frame.empty:
+            return company_frame
+        return company_frame.dropna(subset=["target_return_90d"])
+
+    @staticmethod
+    def _company_momentum_frame(test: pd.DataFrame, company_frame: pd.DataFrame) -> pd.DataFrame:
+        if "market_flow_momentum_3mo" not in test.columns:
+            merged = company_frame.copy()
+            merged["momentum_3mo"] = 0.0
+            return merged
+        company_momentum = (
+            test.groupby("ticker", dropna=True)["market_flow_momentum_3mo"]
+            .mean()
+            .reset_index(name="momentum_3mo")
+        )
+        merged = company_frame.merge(company_momentum, on="ticker", how="left")
+        merged["momentum_3mo"] = pd.to_numeric(merged["momentum_3mo"], errors="coerce").fillna(0.0)
+        return merged
 
     def _company_test_frame(
         self,
