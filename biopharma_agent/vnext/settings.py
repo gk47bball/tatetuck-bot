@@ -50,6 +50,17 @@ class VNextSettings:
     execution_hold_weight_pct: float = 0.75
     execution_hold_confidence: float = 0.50
     execution_rebalance_band_pct: float = 0.75
+    execution_min_hard_catalyst_confidence: float = 0.62
+    execution_min_soft_catalyst_confidence: float = 0.68
+    execution_min_launch_confidence: float = 0.58
+    execution_min_franchise_confidence: float = 0.56
+    execution_min_internal_upside_pct: float = 0.08
+    execution_min_floor_support_pct: float = 0.10
+    execution_max_hard_catalyst_weight_pct: float = 4.0
+    execution_max_soft_catalyst_weight_pct: float = 2.5
+    execution_max_launch_weight_pct: float = 3.0
+    execution_max_franchise_weight_pct: float = 3.0
+    execution_max_floor_weight_pct: float = 1.5
     evaluation_rebalance_spacing_days: int = 21
     evaluation_min_names_per_window: int = 3
     evaluation_turnover_book_weight_floor: float = 1.0
@@ -86,6 +97,39 @@ class VNextSettings:
             execution_hold_weight_pct=float(os.environ.get("TATETUCK_EXECUTION_HOLD_WEIGHT_PCT", "0.75")),
             execution_hold_confidence=float(os.environ.get("TATETUCK_EXECUTION_HOLD_CONFIDENCE", "0.50")),
             execution_rebalance_band_pct=float(os.environ.get("TATETUCK_EXECUTION_REBALANCE_BAND_PCT", "0.75")),
+            execution_min_hard_catalyst_confidence=float(
+                os.environ.get("TATETUCK_EXECUTION_MIN_HARD_CATALYST_CONFIDENCE", "0.62")
+            ),
+            execution_min_soft_catalyst_confidence=float(
+                os.environ.get("TATETUCK_EXECUTION_MIN_SOFT_CATALYST_CONFIDENCE", "0.68")
+            ),
+            execution_min_launch_confidence=float(
+                os.environ.get("TATETUCK_EXECUTION_MIN_LAUNCH_CONFIDENCE", "0.58")
+            ),
+            execution_min_franchise_confidence=float(
+                os.environ.get("TATETUCK_EXECUTION_MIN_FRANCHISE_CONFIDENCE", "0.56")
+            ),
+            execution_min_internal_upside_pct=float(
+                os.environ.get("TATETUCK_EXECUTION_MIN_INTERNAL_UPSIDE_PCT", "0.08")
+            ),
+            execution_min_floor_support_pct=float(
+                os.environ.get("TATETUCK_EXECUTION_MIN_FLOOR_SUPPORT_PCT", "0.10")
+            ),
+            execution_max_hard_catalyst_weight_pct=float(
+                os.environ.get("TATETUCK_EXECUTION_MAX_HARD_CATALYST_WEIGHT_PCT", "4.0")
+            ),
+            execution_max_soft_catalyst_weight_pct=float(
+                os.environ.get("TATETUCK_EXECUTION_MAX_SOFT_CATALYST_WEIGHT_PCT", "2.5")
+            ),
+            execution_max_launch_weight_pct=float(
+                os.environ.get("TATETUCK_EXECUTION_MAX_LAUNCH_WEIGHT_PCT", "3.0")
+            ),
+            execution_max_franchise_weight_pct=float(
+                os.environ.get("TATETUCK_EXECUTION_MAX_FRANCHISE_WEIGHT_PCT", "3.0")
+            ),
+            execution_max_floor_weight_pct=float(
+                os.environ.get("TATETUCK_EXECUTION_MAX_FLOOR_WEIGHT_PCT", "1.5")
+            ),
             evaluation_rebalance_spacing_days=_env_int("TATETUCK_EVAL_REBALANCE_SPACING_DAYS", 21),
             evaluation_min_names_per_window=_env_int("TATETUCK_EVAL_MIN_NAMES_PER_WINDOW", 3),
             evaluation_turnover_book_weight_floor=float(os.environ.get("TATETUCK_EVAL_TURNOVER_BOOK_WEIGHT_FLOOR", "1.0")),

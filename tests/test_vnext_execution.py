@@ -22,6 +22,13 @@ def make_analysis(
     target_weight: float,
     confidence: float,
     expected_return: float = 0.2,
+    company_state: str = "pre_commercial",
+    setup_type: str = "hard_catalyst",
+    internal_upside_pct: float = 0.25,
+    floor_support_pct: float = 0.14,
+    catalyst_success_prob: float = 0.7,
+    primary_event_type: str = "phase3_readout",
+    primary_event_bucket: str = "clinical",
 ) -> CompanyAnalysis:
     snapshot = CompanySnapshot(
         ticker=ticker,
@@ -44,13 +51,17 @@ def make_analysis(
         ticker=ticker,
         as_of=snapshot.as_of,
         expected_return=expected_return,
-        catalyst_success_prob=0.7,
+        catalyst_success_prob=catalyst_success_prob,
         confidence=confidence,
         crowding_risk=0.2,
         financing_risk=0.2,
         thesis_horizon="90d",
-        primary_event_type="phase3_readout",
-        primary_event_bucket="clinical",
+        primary_event_type=primary_event_type,
+        primary_event_bucket=primary_event_bucket,
+        company_state=company_state,
+        setup_type=setup_type,
+        internal_upside_pct=internal_upside_pct,
+        floor_support_pct=floor_support_pct,
         rationale=[],
         supporting_evidence=[],
     )
@@ -63,7 +74,9 @@ def make_analysis(
         confidence=confidence,
         scenario=scenario,
         thesis_horizon="90d",
-        primary_event_type="phase3_readout",
+        primary_event_type=primary_event_type,
+        company_state=company_state,
+        setup_type=setup_type,
         risk_flags=[],
     )
     return CompanyAnalysis(
@@ -166,10 +179,33 @@ class TestVNextExecution(unittest.TestCase):
             self.assertTrue(submissions)
             self.assertEqual(submissions[0].status, "planned")
 
+    def test_store_recovers_from_corrupt_predictions_table(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            corrupt_path = store.tables_dir / "predictions.parquet"
+            corrupt_path.write_bytes(b"not-a-parquet-file")
+
+            store.append_records("predictions", [{"ticker": "CRSP", "expected_return": 0.12}])
+
+            recovered = store.read_table("predictions")
+            self.assertEqual(len(recovered), 1)
+            self.assertTrue((store.tables_dir / "predictions.corrupt.parquet").exists())
+
     def test_planner_keeps_existing_position_as_holdover(self):
         settings = self.make_settings()
         planner = PMExecutionPlanner(settings)
-        analyses = [make_analysis("CRSP", "pairs candidate", 1.2, 0.56, expected_return=0.09)]
+        analyses = [
+            make_analysis(
+                "CRSP",
+                "pairs candidate",
+                1.2,
+                0.56,
+                expected_return=0.09,
+                setup_type="asymmetry_without_near_term_catalyst",
+                internal_upside_pct=0.18,
+                floor_support_pct=0.22,
+            )
+        ]
         account = DummyAccount()
         positions = [DummyPosition("CRSP", qty=40.0, market_value=1200.0, current_price=30.0)]
         plan = planner.build_plan(analyses, account, positions, DummyReadiness(blockers=[]))
@@ -177,6 +213,7 @@ class TestVNextExecution(unittest.TestCase):
         instruction = next(item for item in plan.instructions if item.symbol == "CRSP")
         self.assertEqual(instruction.action, "hold")
         self.assertIn("CRSP", plan.selected_symbols)
+        self.assertEqual(instruction.execution_profile, "precommercial_asymmetry_hold")
 
     def test_planner_uses_rebalance_band_for_small_deltas(self):
         settings = self.make_settings()
@@ -188,6 +225,74 @@ class TestVNextExecution(unittest.TestCase):
 
         instruction = next(item for item in plan.instructions if item.symbol == "CRSP")
         self.assertEqual(instruction.action, "hold")
+
+    def test_precommercial_asymmetry_without_catalyst_is_not_auto_deployed(self):
+        settings = self.make_settings()
+        planner = PMExecutionPlanner(settings)
+        analyses = [
+            make_analysis(
+                "VKTX",
+                "watchlist only",
+                1.0,
+                0.66,
+                expected_return=0.14,
+                setup_type="asymmetry_without_near_term_catalyst",
+                internal_upside_pct=0.20,
+                floor_support_pct=0.18,
+                primary_event_type="thematic_repricing",
+                primary_event_bucket="commercial",
+            )
+        ]
+
+        plan = planner.build_plan(analyses, DummyAccount(), [], DummyReadiness(blockers=[]))
+
+        self.assertFalse(plan.selected_symbols)
+        self.assertIn("No recommendations cleared the PM execution thresholds.", plan.blockers)
+
+    def test_commercialized_capital_allocation_is_size_capped(self):
+        settings = self.make_settings()
+        planner = PMExecutionPlanner(settings)
+        analyses = [
+            make_analysis(
+                "REGN",
+                "commercial compounder",
+                5.0,
+                0.63,
+                expected_return=0.12,
+                company_state="commercialized",
+                setup_type="capital_allocation",
+                internal_upside_pct=0.14,
+                floor_support_pct=0.18,
+                primary_event_type="capital_allocation",
+                primary_event_bucket="commercial",
+            )
+        ]
+
+        plan = planner.build_plan(analyses, DummyAccount(), [], DummyReadiness(blockers=[]))
+
+        instruction = next(item for item in plan.instructions if item.symbol == "REGN")
+        self.assertEqual(instruction.action, "buy")
+        self.assertEqual(instruction.execution_profile, "capital_allocation")
+        self.assertLessEqual(instruction.scaled_target_weight, settings.execution_max_franchise_weight_pct)
+
+    def test_negative_internal_upside_blocks_entry(self):
+        settings = self.make_settings()
+        planner = PMExecutionPlanner(settings)
+        analyses = [
+            make_analysis(
+                "BEAM",
+                "pre-catalyst long",
+                3.0,
+                0.71,
+                expected_return=0.11,
+                internal_upside_pct=-0.12,
+            )
+        ]
+
+        plan = planner.build_plan(analyses, DummyAccount(), [], DummyReadiness(blockers=[]))
+
+        self.assertFalse(plan.selected_symbols)
+        self.assertIn("No recommendations cleared the PM execution thresholds.", plan.blockers)
 
     def test_alpaca_broker_uses_paper_headers(self):
         settings = self.make_settings()
@@ -251,12 +356,17 @@ class TestVNextExecution(unittest.TestCase):
                 action="buy",
                 side="buy",
                 scenario="pre-catalyst long",
+                company_state="pre_commercial",
+                setup_type="hard_catalyst",
+                execution_profile="hard_catalyst",
                 confidence=0.72,
                 target_weight=4.0,
                 scaled_target_weight=4.0,
                 target_notional=4000.0,
                 current_notional=0.0,
                 delta_notional=1500.0,
+                internal_upside_pct=0.25,
+                floor_support_pct=0.14,
                 qty=None,
                 notional=1500.0,
                 rationale=[],

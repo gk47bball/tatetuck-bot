@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .entities import CatalystEvent, CompanySnapshot, SignalArtifact
-from .taxonomy import event_type_bucket, event_type_priority
+from .taxonomy import event_type_bucket, event_type_priority, is_synthetic_event
 
 PHASE_RANK = {
     "EARLY_PHASE1": 1,
@@ -227,7 +227,7 @@ def classify_setup_type(
         event_bucket in {"clinical", "regulatory"}
         and primary_event is not None
         and primary_event.horizon_days <= 180
-        and event_status not in {"phase_timing_estimate"}
+        and not is_synthetic_event(event_status, primary_event.title)
     ):
         return "hard_catalyst"
     if (
@@ -235,7 +235,7 @@ def classify_setup_type(
         and event_bucket in {"clinical", "regulatory"}
         and primary_event is not None
         and primary_event.horizon_days <= 180
-        and event_status == "phase_timing_estimate"
+        and is_synthetic_event(event_status, primary_event.title if primary_event is not None else None)
         and competition_intensity >= 0.80
     ):
         return "asymmetry_without_near_term_catalyst"

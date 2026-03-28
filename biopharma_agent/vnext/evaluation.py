@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -9,12 +10,13 @@ import pandas as pd
 from .entities import ModelPrediction, SignalArtifact
 from .features import FeatureEngineer
 from .labels import PointInTimeLabeler
+from .market_profile import build_expectation_lens, classify_company_state
 from .models import EventDrivenEnsemble
 from .portfolio import PortfolioConstructor, aggregate_signal
 from .replay import snapshot_from_dict
 from .settings import VNextSettings
 from .storage import LocalResearchStore
-from .taxonomy import event_type_bucket
+from .taxonomy import event_timing_priority, event_type_bucket, event_type_priority, is_exact_timing_event, is_synthetic_event
 
 
 def _spearman(a: pd.Series, b: pd.Series) -> float:
@@ -43,6 +45,14 @@ class WalkForwardSummary:
     calibrated_brier: float
     leakage_passed: bool
     message: str = ""
+    strict_rank_ic: float = 0.0
+    strict_hit_rate: float = 0.0
+    strict_top_bottom_spread: float = 0.0
+    pm_context_coverage: float = 0.0
+    exact_primary_event_rate: float = 0.0
+    synthetic_primary_event_rate: float = 0.0
+    institutional_blockers: list[str] = field(default_factory=list)
+    latest_window_top_trades: list[dict[str, object]] = field(default_factory=list)
     event_type_scorecards: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
@@ -53,6 +63,7 @@ class WalkForwardEvaluator:
         self.labeler = PointInTimeLabeler(store=self.store)
         self.portfolio = PortfolioConstructor()
         self.features = FeatureEngineer()
+        self._snapshot_cache: dict[tuple[str, str], object] = {}
 
     def build_training_frame(self, refresh_labels: bool = False) -> pd.DataFrame:
         snapshots = self.store.read_table("company_snapshots")
@@ -177,14 +188,21 @@ class WalkForwardEvaluator:
         rank_ics: list[float] = []
         hit_rates: list[float] = []
         spreads: list[float] = []
+        strict_rank_ics: list[float] = []
+        strict_hit_rates: list[float] = []
+        strict_spreads: list[float] = []
         turnovers: list[float] = []
         briers: list[float] = []
         cumulative_returns: list[float] = []
+        exact_event_rates: list[float] = []
+        synthetic_event_rates: list[float] = []
+        pm_context_coverages: list[float] = []
         previous_top: set[str] = set()
         previous_recommendations: dict[str, object] = {}
         previous_signals: dict[str, SignalArtifact] = {}
         num_windows = 0
         event_type_rows: dict[str, list[dict[str, float]]] = {}
+        latest_window_top_trades: list[dict[str, object]] = []
 
         for split_idx in range(2, len(unique_dates)):
             test_date = unique_dates[split_idx]
@@ -194,12 +212,11 @@ class WalkForwardEvaluator:
                 continue
 
             ensemble.fit(train, persist_artifact=False, register_experiment=False)
-            predictions = ensemble.score(
-                [
-                    self._row_to_feature_vector(row)
-                    for _, row in test.iterrows()
-                ]
-            )
+            test_vectors = [self._row_to_feature_vector(row) for _, row in test.iterrows()]
+            try:
+                predictions = ensemble.score(test_vectors, persist=False)
+            except TypeError:
+                predictions = ensemble.score(test_vectors)
             company_frame, current_top, current_recommendations, current_signals = self._company_test_frame(
                 test=test,
                 predictions=predictions,
@@ -221,12 +238,46 @@ class WalkForwardEvaluator:
             top = company_frame.nlargest(max(1, len(company_frame) // 5), "expected_return")
             bottom = company_frame.nsmallest(max(1, len(company_frame) // 5), "expected_return")
             spreads.append(float(top["target_return_90d"].mean() - bottom["target_return_90d"].mean()))
+            exact_event_rates.append(float(company_frame["primary_event_exact"].fillna(False).mean()))
+            synthetic_event_rates.append(float(company_frame["primary_event_synthetic"].fillna(False).mean()))
+            pm_context_coverages.append(
+                float(
+                    company_frame[
+                        ["company_state", "setup_type", "internal_upside_pct", "floor_support_pct"]
+                    ].notna().all(axis=1).mean()
+                )
+            )
+            strict_frame = company_frame[
+                company_frame["primary_event_exact"].fillna(False)
+                & ~company_frame["primary_event_synthetic"].fillna(False)
+            ].copy()
+            strict_frame = strict_frame.dropna(subset=["target_return_90d"])
+            if len(strict_frame) >= max(2, self.settings.evaluation_min_names_per_window):
+                strict_rank_ics.append(_spearman(strict_frame["expected_return"], strict_frame["target_return_90d"]))
+                strict_hit_rates.append(
+                    float((np.sign(strict_frame["expected_return"]) == np.sign(strict_frame["target_return_90d"])).mean())
+                )
+                strict_top = strict_frame.nlargest(max(1, len(strict_frame) // 5), "expected_return")
+                strict_bottom = strict_frame.nsmallest(max(1, len(strict_frame) // 5), "expected_return")
+                strict_spreads.append(float(strict_top["target_return_90d"].mean() - strict_bottom["target_return_90d"].mean()))
             turnovers.append(1.0 if not previous_top else 1.0 - (len(current_top & previous_top) / max(len(current_top | previous_top), 1)))
             previous_top = current_top
             briers.append(float(((company_frame["catalyst_success_prob"] - company_frame["target_catalyst_success"]) ** 2).mean()))
             cumulative_returns.append(float(top["target_return_90d"].mean()))
             previous_recommendations = current_recommendations
             previous_signals = current_signals
+            latest_window_top_trades = (
+                company_frame.sort_values(["target_weight", "confidence", "expected_return"], ascending=False)
+                .head(10)
+                .to_dict(orient="records")
+            )
+            latest_window_top_trades = [
+                {
+                    key: (value.isoformat() if isinstance(value, pd.Timestamp) else value)
+                    for key, value in row.items()
+                }
+                for row in latest_window_top_trades
+            ]
 
             for event_type, group in company_frame.groupby("target_primary_event_type", dropna=False):
                 event_name = "none" if pd.isna(event_type) or event_type is None else str(event_type)
@@ -278,6 +329,27 @@ class WalkForwardEvaluator:
             }
             for event_type, rows in event_type_rows.items()
         }
+        institutional_blockers: list[str] = []
+        pm_context_coverage = _safe_mean(pm_context_coverages)
+        exact_primary_event_rate = _safe_mean(exact_event_rates)
+        synthetic_primary_event_rate = _safe_mean(synthetic_event_rates)
+        if pm_context_coverage < 0.95:
+            institutional_blockers.append(
+                f"Only {pm_context_coverage * 100:.1f}% of evaluated rows carry full PM context fields."
+            )
+        if exact_primary_event_rate < 0.60:
+            institutional_blockers.append(
+                f"Only {exact_primary_event_rate * 100:.1f}% of evaluated rows have exact primary event timing."
+            )
+        if synthetic_primary_event_rate > 0.25:
+            institutional_blockers.append(
+                f"{synthetic_primary_event_rate * 100:.1f}% of evaluated rows still rely on synthetic primary events."
+            )
+        universe_membership = self.store.read_table("universe_membership")
+        if universe_membership.empty:
+            institutional_blockers.append("Historical universe membership is missing, so survivorship bias is not controlled.")
+        elif "is_delisted" not in universe_membership.columns or not universe_membership["is_delisted"].fillna(False).astype(bool).any():
+            institutional_blockers.append("Historical universe membership still has no delisted names, so survivorship bias is only partially controlled.")
         return WalkForwardSummary(
             num_rows=len(frame),
             num_windows=num_windows,
@@ -290,6 +362,14 @@ class WalkForwardEvaluator:
             calibrated_brier=_safe_mean(briers),
             leakage_passed=self.leakage_audit(frame),
             message="ok",
+            strict_rank_ic=_safe_mean(strict_rank_ics),
+            strict_hit_rate=_safe_mean(strict_hit_rates),
+            strict_top_bottom_spread=_safe_mean(strict_spreads),
+            pm_context_coverage=pm_context_coverage,
+            exact_primary_event_rate=exact_primary_event_rate,
+            synthetic_primary_event_rate=synthetic_primary_event_rate,
+            institutional_blockers=institutional_blockers,
+            latest_window_top_trades=latest_window_top_trades,
             event_type_scorecards=event_type_scorecards,
         )
 
@@ -346,6 +426,7 @@ class WalkForwardEvaluator:
             if not program_predictions:
                 continue
             label = group.sort_values("entity_id").iloc[0]
+            snapshot = self._load_snapshot_at(ticker, as_of)
             signal = aggregate_signal(
                 ticker=ticker,
                 as_of=as_of.isoformat(),
@@ -353,6 +434,9 @@ class WalkForwardEvaluator:
                 evidence_rationale=[],
                 evidence=[],
             )
+            primary_event = None
+            if snapshot is not None:
+                signal, primary_event = self._enrich_signal_context(snapshot, signal, as_of)
             recommendation = self.portfolio.recommend(
                 signal,
                 previous_recommendation=previous_recommendations.get(ticker),
@@ -360,6 +444,7 @@ class WalkForwardEvaluator:
             )
             current_recommendations[ticker] = recommendation
             current_signals[ticker] = signal
+            primary_event_quality = self._primary_event_quality(primary_event)
             records.append(
                 {
                     "ticker": ticker,
@@ -370,6 +455,15 @@ class WalkForwardEvaluator:
                     "target_weight": recommendation.target_weight,
                     "scenario": recommendation.scenario,
                     "primary_event_type": signal.primary_event_type,
+                    "company_state": signal.company_state,
+                    "setup_type": signal.setup_type,
+                    "internal_upside_pct": signal.internal_upside_pct,
+                    "floor_support_pct": signal.floor_support_pct,
+                    "primary_event_title": None if primary_event is None else primary_event.title,
+                    "primary_event_date": None if primary_event is None else primary_event.expected_date,
+                    "primary_event_status": None if primary_event is None else primary_event.status,
+                    "primary_event_exact": primary_event_quality["exact"],
+                    "primary_event_synthetic": primary_event_quality["synthetic"],
                     "target_return_90d": float(label["target_return_90d"]) if pd.notna(label["target_return_90d"]) else np.nan,
                     "target_catalyst_success": float(label["target_catalyst_success"]) if pd.notna(label["target_catalyst_success"]) else np.nan,
                     "target_primary_event_type": label.get("target_primary_event_type"),
@@ -398,6 +492,221 @@ class WalkForwardEvaluator:
         )
         current_top |= sticky_holds
         return company_frame, current_top, current_recommendations, current_signals
+
+    def _load_snapshot_at(self, ticker: str, as_of: pd.Timestamp):
+        key = (ticker, as_of.isoformat())
+        if key in self._snapshot_cache:
+            return self._snapshot_cache[key]
+        for path in self.store.list_raw_payload_paths("snapshots", f"{ticker}_"):
+            snapshot = self._load_snapshot_payload(path)
+            if snapshot is None:
+                continue
+            snapshot_ts = pd.to_datetime(snapshot.as_of, errors="coerce", utc=True, format="mixed")
+            if pd.isna(snapshot_ts):
+                continue
+            snapshot_ts = snapshot_ts.tz_convert(None)
+            if snapshot_ts == as_of:
+                self._snapshot_cache[key] = snapshot
+                return snapshot
+        self._snapshot_cache[key] = None
+        return None
+
+    @staticmethod
+    def _load_snapshot_payload(path: Path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        try:
+            return snapshot_from_dict(payload)
+        except Exception:
+            return None
+
+    def _enrich_signal_context(self, snapshot, signal: SignalArtifact, as_of: pd.Timestamp) -> tuple[SignalArtifact, object]:
+        company_state = classify_company_state(snapshot)
+        signal.company_state = company_state
+        primary_event = self._primary_event(snapshot, preferred_event_type=signal.primary_event_type)
+        peer_context = self._historical_peer_context(snapshot, as_of)
+        expectation_lens = build_expectation_lens(snapshot, signal, primary_event, peer_context)
+        signal.setup_type = str(expectation_lens["setup_type"])
+        signal.internal_value = float(expectation_lens["internal_value"])
+        signal.internal_price_target = (
+            None if expectation_lens["internal_price_target"] is None else float(expectation_lens["internal_price_target"])
+        )
+        signal.internal_upside_pct = float(expectation_lens["internal_upside_pct"])
+        signal.floor_support_pct = float(expectation_lens["floor_support_pct"])
+        return signal, primary_event
+
+    @staticmethod
+    def _primary_event(snapshot, preferred_event_type: str | None = None):
+        if not snapshot.catalyst_events:
+            return None
+        candidates = snapshot.catalyst_events
+        best_overall = min(
+            candidates,
+            key=lambda item: (
+                -event_timing_priority(item.status, item.expected_date, item.title),
+                -event_type_priority(item.event_type),
+                item.horizon_days,
+                -item.importance,
+            ),
+        )
+        if preferred_event_type:
+            typed_candidates = [item for item in snapshot.catalyst_events if item.event_type == preferred_event_type]
+            if typed_candidates:
+                best_typed = min(
+                    typed_candidates,
+                    key=lambda item: (
+                        -event_timing_priority(item.status, item.expected_date, item.title),
+                        -event_type_priority(item.event_type),
+                        item.horizon_days,
+                        -item.importance,
+                    ),
+                )
+                if event_timing_priority(best_typed.status, best_typed.expected_date, best_typed.title) >= event_timing_priority(
+                    best_overall.status,
+                    best_overall.expected_date,
+                    best_overall.title,
+                ):
+                    return best_typed
+        return best_overall
+
+    def _historical_peer_context(self, snapshot, as_of: pd.Timestamp) -> dict[str, object]:
+        companies = self.store.read_table("company_snapshots")
+        programs = self.store.read_table("programs")
+        if companies.empty or programs.empty:
+            return {
+                "summary": "Peer context unavailable until more archived snapshots are loaded.",
+                "peer_tickers": [],
+                "peer_stage": "unknown",
+                "valuation_posture": "unknown",
+                "current_multiple": None,
+                "median_multiple": None,
+                "metric_label": "value",
+            }
+        companies = companies.copy()
+        programs = programs.copy()
+        companies["as_of_ts"] = pd.to_datetime(companies["as_of"], errors="coerce", utc=True, format="mixed").dt.tz_convert(None)
+        programs["as_of_ts"] = pd.to_datetime(programs["as_of"], errors="coerce", utc=True, format="mixed").dt.tz_convert(None)
+        companies = companies[companies["as_of_ts"] <= as_of].sort_values("as_of_ts")
+        programs = programs[programs["as_of_ts"] <= as_of].sort_values("as_of_ts")
+        if companies.empty or programs.empty:
+            return {
+                "summary": "Peer context unavailable until more archived snapshots are loaded.",
+                "peer_tickers": [],
+                "peer_stage": "unknown",
+                "valuation_posture": "unknown",
+                "current_multiple": None,
+                "median_multiple": None,
+                "metric_label": "value",
+            }
+        latest_companies = companies.drop_duplicates(subset=["ticker"], keep="last").copy()
+        latest_programs = programs.drop_duplicates(subset=["ticker", "program_id"], keep="last").copy()
+        phase_rank_map = {
+            "EARLY_PHASE1": 1,
+            "PHASE1": 2,
+            "PHASE2": 3,
+            "PHASE3": 4,
+            "NDA_BLA": 5,
+            "APPROVED": 6,
+        }
+        latest_programs["phase_rank"] = latest_programs["phase"].map(phase_rank_map).fillna(0.0)
+        top_programs = (
+            latest_programs.sort_values(["ticker", "phase_rank", "tam_estimate"], ascending=[True, False, False])
+            .drop_duplicates(subset=["ticker"], keep="first")
+            [["ticker", "phase", "phase_rank", "tam_estimate", "name"]]
+        )
+        latest_companies = latest_companies.merge(top_programs, on="ticker", how="left")
+        latest_companies = latest_companies[latest_companies["ticker"] != snapshot.ticker].copy()
+        if latest_companies.empty:
+            return {
+                "summary": "Peer context unavailable until more archived snapshots are loaded.",
+                "peer_tickers": [],
+                "peer_stage": "unknown",
+                "valuation_posture": "unknown",
+                "current_multiple": None,
+                "median_multiple": None,
+                "metric_label": "value",
+            }
+        company_state = classify_company_state(snapshot)
+        stage = (
+            "commercial"
+            if company_state in {"commercial_launch", "commercialized"}
+            else "late_stage"
+            if any(phase_rank_map.get(program.phase, 0) >= 4 for program in snapshot.programs)
+            else "clinical"
+        )
+        if stage == "commercial":
+            peers = latest_companies[latest_companies["revenue"].fillna(0.0) > 10_000_000].copy()
+            current_multiple = snapshot.enterprise_value / max(snapshot.revenue, 1.0)
+            if not peers.empty:
+                peers["comparison_metric"] = peers["enterprise_value"].fillna(0.0) / peers["revenue"].clip(lower=1.0)
+            metric_label = "EV/revenue"
+        else:
+            peers = latest_companies[latest_companies["revenue"].fillna(0.0) <= 10_000_000].copy()
+            if stage == "late_stage":
+                peers = peers[peers["phase_rank"].fillna(0.0) >= 4]
+            else:
+                peers = peers[peers["phase_rank"].fillna(0.0) < 4]
+            top_tam = max((program.tam_estimate for program in snapshot.programs), default=0.0)
+            current_multiple = snapshot.market_cap / max(top_tam, 1.0)
+            if not peers.empty:
+                peers["comparison_metric"] = peers["market_cap"].fillna(0.0) / peers["tam_estimate"].clip(lower=1.0)
+            metric_label = "market-cap/TAM"
+        if "comparison_metric" not in peers.columns:
+            return {
+                "summary": "Peer context is still sparse for this stage bucket.",
+                "peer_tickers": [],
+                "peer_stage": stage,
+                "valuation_posture": "unknown",
+                "current_multiple": current_multiple,
+                "median_multiple": None,
+                "metric_label": metric_label,
+            }
+        peers = peers.replace([pd.NA, float("inf"), float("-inf")], pd.NA).dropna(subset=["comparison_metric"])
+        if peers.empty:
+            return {
+                "summary": "Peer context is still sparse for this stage bucket.",
+                "peer_tickers": [],
+                "peer_stage": stage,
+                "valuation_posture": "unknown",
+                "current_multiple": current_multiple,
+                "median_multiple": None,
+                "metric_label": metric_label,
+            }
+        median_multiple = float(peers["comparison_metric"].median())
+        percentile = float((peers["comparison_metric"] <= current_multiple).mean() * 100.0)
+        peers["distance"] = (peers["comparison_metric"] - current_multiple).abs()
+        peer_tickers = peers.nsmallest(3, "distance")["ticker"].astype(str).tolist()
+        valuation_posture = (
+            "rich"
+            if current_multiple > (median_multiple * 1.15)
+            else "discounted"
+            if current_multiple < (median_multiple * 0.85)
+            else "near peer median"
+        )
+        summary = (
+            f"{stage.replace('_', ' ')} peers trade around {median_multiple:.2f}x {metric_label}; "
+            f"{snapshot.ticker} screens at {current_multiple:.2f}x ({valuation_posture}, {percentile:.0f}th percentile)."
+        )
+        return {
+            "summary": summary,
+            "peer_tickers": peer_tickers,
+            "peer_stage": stage,
+            "valuation_posture": valuation_posture,
+            "current_multiple": current_multiple,
+            "median_multiple": median_multiple,
+            "metric_label": metric_label,
+        }
+
+    @staticmethod
+    def _primary_event_quality(primary_event) -> dict[str, bool]:
+        if primary_event is None:
+            return {"exact": False, "synthetic": True}
+        synthetic = is_synthetic_event(primary_event.status, primary_event.title)
+        exact = is_exact_timing_event(primary_event.status, primary_event.expected_date, primary_event.title)
+        return {"exact": exact, "synthetic": synthetic}
 
     @staticmethod
     def _row_to_feature_vector(row: pd.Series):

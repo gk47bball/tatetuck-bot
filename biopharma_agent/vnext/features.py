@@ -6,7 +6,7 @@ import pandas as pd
 
 from .entities import CompanySnapshot, FeatureVector, Program
 from .market_profile import build_snapshot_profile
-from .taxonomy import event_type_bucket, event_type_priority, is_clinical_event_type
+from .taxonomy import event_timing_priority, event_type_bucket, event_type_priority, is_clinical_event_type
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -111,7 +111,11 @@ class FeatureEngineer:
                 "modality": program.modality,
                 "event_type": top_event_type,
                 "event_bucket": event_type_bucket(top_event_type),
+                "event_status": top_catalyst.status if top_catalyst else None,
+                "event_expected_date": top_catalyst.expected_date if top_catalyst else None,
                 "company_primary_event_type": company_event_type,
+                "company_primary_event_status": company_primary_event.status if company_primary_event else None,
+                "company_primary_event_expected_date": company_primary_event.expected_date if company_primary_event else None,
                 "company_state": profile["company_state"],
                 "primary_indication": profile["primary_indication"],
             },
@@ -162,6 +166,8 @@ class FeatureEngineer:
                 "aggregate": True,
                 "event_type": company_event_type,
                 "event_bucket": event_type_bucket(company_event_type),
+                "event_status": company_primary_event.status if company_primary_event else None,
+                "event_expected_date": company_primary_event.expected_date if company_primary_event else None,
                 "company_state": profile["company_state"],
                 "primary_indication": profile["primary_indication"],
             },
@@ -242,5 +248,11 @@ class FeatureEngineer:
             return None
         return min(
             snapshot.catalyst_events,
-            key=lambda event: (-event_type_priority(event.event_type), event.horizon_days, -event.importance, event.crowdedness),
+            key=lambda event: (
+                -event_timing_priority(event.status, event.expected_date, event.title),
+                -event_type_priority(event.event_type),
+                event.horizon_days,
+                -event.importance,
+                event.crowdedness,
+            ),
         )

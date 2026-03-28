@@ -2,6 +2,7 @@
 
 from .archive import ArchiveSummary, archive_universe
 from .audit import ResearchAudit, ResearchAuditBuilder
+from .eodhd import EODHDEventTapeClient, EODHDUniverseClient, UniverseSyncSummary
 from .execution import AlpacaPaperBroker, ExecutionPlan, ExecutionInstruction, OrderSubmission, PMExecutionPlanner
 from .facade import TatetuckPlatform
 from .history import HistoricalSnapshotBootstrapper, HistoryBootstrapSummary
@@ -18,6 +19,8 @@ __all__ = [
     "ResearchAuditBuilder",
     "ExecutionInstruction",
     "ExecutionPlan",
+    "EODHDEventTapeClient",
+    "EODHDUniverseClient",
     "HistoricalReplayEngine",
     "HistoricalSnapshotBootstrapper",
     "HistoryBootstrapSummary",
@@ -30,6 +33,7 @@ __all__ = [
     "ReadinessReport",
     "ReplaySummary",
     "TatetuckPlatform",
+    "UniverseSyncSummary",
     "VNextSettings",
     "archive_universe",
     "build_readiness_report",

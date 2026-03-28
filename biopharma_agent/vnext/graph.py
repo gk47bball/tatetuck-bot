@@ -258,9 +258,9 @@ def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -
     approved_products = _approved_products_for_company(str(raw.get("ticker") or ""), revenue, growth_signal)
     if revenue > 10_000_000:
         commercial_title = (
-            f"{approved_products[0].name} commercial update"
+            f"{approved_products[0].name} estimated commercial update"
             if approved_products
-            else f"{raw.get('ticker')} reported commercial update"
+            else f"{raw.get('ticker')} estimated commercial update"
         )
         company_catalysts.append(
             _build_catalyst(

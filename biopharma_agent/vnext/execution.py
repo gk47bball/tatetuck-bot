@@ -49,12 +49,17 @@ class ExecutionInstruction:
     action: str
     side: str
     scenario: str
+    company_state: str | None
+    setup_type: str | None
+    execution_profile: str
     confidence: float
     target_weight: float
     scaled_target_weight: float
     target_notional: float
     current_notional: float
     delta_notional: float
+    internal_upside_pct: float | None = None
+    floor_support_pct: float | None = None
     qty: float | None = None
     notional: float | None = None
     rationale: list[str] = field(default_factory=list)
@@ -63,6 +68,15 @@ class ExecutionInstruction:
         payload = asdict(self)
         payload["planned_at"] = datetime.now(timezone.utc).isoformat()
         return payload
+
+
+@dataclass(slots=True)
+class ExecutionProfile:
+    name: str
+    mode: str
+    weight_cap_pct: float
+    score: float
+    rationale: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -335,6 +349,15 @@ class DiscordTradeNotifier:
                 detail += f" | qty {submission.submitted_qty:,.4f}"
             if instruction is not None:
                 detail += f" | scenario {instruction.scenario}"
+                if instruction.company_state or instruction.setup_type:
+                    detail += " | "
+                    detail += "/".join(
+                        [
+                            value
+                            for value in (instruction.company_state, instruction.setup_type)
+                            if value
+                        ]
+                    )
                 detail += f" | confidence {instruction.confidence * 100:.1f}%"
             if submission.raw_status:
                 detail += f" | alpaca {submission.raw_status}"
@@ -363,8 +386,6 @@ class DiscordTradeNotifier:
 
 
 class PMExecutionPlanner:
-    AUTO_SCENARIOS = {"pre-catalyst long", "commercial compounder"}
-
     def __init__(self, settings: VNextSettings):
         self.settings = settings
 
@@ -377,9 +398,16 @@ class PMExecutionPlanner:
     ) -> ExecutionPlan:
         analyses = list(analyses)
         positions_by_symbol = {position.symbol: position for position in positions}
+        profiles = {
+            analysis.snapshot.ticker: self._execution_profile(
+                analysis,
+                has_position=analysis.snapshot.ticker in positions_by_symbol,
+            )
+            for analysis in analyses
+        }
         blockers: list[str] = []
         warnings: list[str] = list(readiness.blockers)
-        selected = self._select_recommendations(analyses, positions_by_symbol)
+        selected = self._select_recommendations(analyses, positions_by_symbol, profiles)
         deployable_notional = min(
             account.equity * (self.settings.max_gross_exposure_pct / 100.0),
             account.buying_power,
@@ -395,7 +423,11 @@ class PMExecutionPlanner:
             blockers.append("No recommendations cleared the PM execution thresholds.")
 
         capped_weights = {
-            analysis.snapshot.ticker: min(analysis.portfolio.target_weight, self.settings.max_single_position_pct)
+            analysis.snapshot.ticker: min(
+                analysis.portfolio.target_weight,
+                self.settings.max_single_position_pct,
+                profiles[analysis.snapshot.ticker].weight_cap_pct,
+            )
             for analysis in selected
         }
         total_weight = sum(capped_weights.values())
@@ -406,7 +438,9 @@ class PMExecutionPlanner:
         selected_symbols: list[str] = []
         for analysis in selected:
             rec = analysis.portfolio
+            signal = analysis.signal
             ticker = analysis.snapshot.ticker
+            profile = profiles[ticker]
             selected_symbols.append(ticker)
             scaled_target_weight = capped_weights[ticker] * scale
             target_notional = deployable_notional * (scaled_target_weight / max(gross_cap, 1e-9))
@@ -420,11 +454,14 @@ class PMExecutionPlanner:
             qty = None
             notional = None
             rationale = [
+                f"execution_profile={profile.name}",
+                f"execution_mode={profile.mode}",
                 f"scenario={rec.scenario}",
                 f"confidence={rec.confidence:.3f}",
                 f"target_weight={rec.target_weight:.2f}%",
                 f"scaled_target_weight={scaled_target_weight:.2f}%",
             ]
+            rationale.extend(profile.rationale)
             if position and weight_gap_pct < self.settings.execution_rebalance_band_pct:
                 rationale.append(
                     f"inside_rebalance_band={self.settings.execution_rebalance_band_pct:.2f}%"
@@ -449,12 +486,17 @@ class PMExecutionPlanner:
                     action=action,
                     side=side,
                     scenario=rec.scenario,
+                    company_state=signal.company_state or rec.company_state,
+                    setup_type=signal.setup_type or rec.setup_type,
+                    execution_profile=profile.name,
                     confidence=rec.confidence,
                     target_weight=rec.target_weight,
                     scaled_target_weight=round(scaled_target_weight, 2),
                     target_notional=round(target_notional, 2),
                     current_notional=round(current_notional, 2),
                     delta_notional=round(delta_notional, 2),
+                    internal_upside_pct=signal.internal_upside_pct,
+                    floor_support_pct=signal.floor_support_pct,
                     qty=round(qty, 6) if qty is not None else None,
                     notional=notional,
                     rationale=rationale,
@@ -469,7 +511,8 @@ class PMExecutionPlanner:
             if position.market_value < self.settings.min_order_notional:
                 continue
             analysis = analyses_by_symbol.get(symbol)
-            if analysis is not None and self._qualifies_hold(analysis):
+            profile = profiles.get(symbol)
+            if analysis is not None and self._qualifies_hold(analysis, profile):
                 instructions.append(
                     ExecutionInstruction(
                         symbol=symbol,
@@ -477,15 +520,23 @@ class PMExecutionPlanner:
                         action="hold",
                         side="none",
                         scenario=f"hold {analysis.portfolio.scenario}",
+                        company_state=analysis.signal.company_state or analysis.portfolio.company_state,
+                        setup_type=analysis.signal.setup_type or analysis.portfolio.setup_type,
+                        execution_profile=profile.name if profile is not None else "holdover",
                         confidence=analysis.portfolio.confidence,
                         target_weight=analysis.portfolio.target_weight,
                         scaled_target_weight=analysis.portfolio.target_weight,
                         target_notional=round(position.market_value, 2),
                         current_notional=round(position.market_value, 2),
                         delta_notional=0.0,
+                        internal_upside_pct=analysis.signal.internal_upside_pct,
+                        floor_support_pct=analysis.signal.floor_support_pct,
                         qty=None,
                         notional=None,
-                        rationale=["Existing position retained under PM holdover thresholds."],
+                        rationale=[
+                            "Existing position retained under PM holdover thresholds."
+                        ]
+                        + ([] if profile is None else [f"execution_profile={profile.name}"] + profile.rationale),
                     )
                 )
                 continue
@@ -496,12 +547,17 @@ class PMExecutionPlanner:
                     action="sell",
                     side="sell",
                     scenario="exit unmanaged",
+                    company_state=analysis.signal.company_state if analysis is not None else None,
+                    setup_type=analysis.signal.setup_type if analysis is not None else None,
+                    execution_profile="exit_unmanaged",
                     confidence=0.0,
                     target_weight=0.0,
                     scaled_target_weight=0.0,
                     target_notional=0.0,
                     current_notional=round(position.market_value, 2),
                     delta_notional=round(-position.market_value, 2),
+                    internal_upside_pct=analysis.signal.internal_upside_pct if analysis is not None else None,
+                    floor_support_pct=analysis.signal.floor_support_pct if analysis is not None else None,
                     qty=round(position.qty, 6),
                     notional=None,
                     rationale=["Position is in managed universe but no longer selected for PM deployment."],
@@ -525,15 +581,17 @@ class PMExecutionPlanner:
         self,
         analyses: list[CompanyAnalysis],
         positions_by_symbol: dict[str, BrokerPosition],
+        profiles: dict[str, ExecutionProfile],
     ) -> list[CompanyAnalysis]:
         auto_eligible = [
             analysis
             for analysis in analyses
-            if self._qualifies_auto(analysis)
+            if self._qualifies_auto(analysis, profiles.get(analysis.snapshot.ticker))
         ]
         auto_eligible = sorted(
             auto_eligible,
             key=lambda analysis: (
+                profiles[analysis.snapshot.ticker].score,
                 analysis.portfolio.target_weight * analysis.portfolio.confidence,
                 analysis.signal.expected_return,
             ),
@@ -562,11 +620,12 @@ class PMExecutionPlanner:
             for analysis in analyses
             if analysis.snapshot.ticker in positions_by_symbol
             and analysis.snapshot.ticker not in selected_symbols
-            and self._qualifies_hold(analysis)
+            and self._qualifies_hold(analysis, profiles.get(analysis.snapshot.ticker))
         ]
         holdovers = sorted(
             holdovers,
             key=lambda analysis: (
+                profiles[analysis.snapshot.ticker].score,
                 analysis.portfolio.target_weight,
                 analysis.portfolio.confidence,
                 analysis.signal.expected_return,
@@ -576,22 +635,289 @@ class PMExecutionPlanner:
         selected.extend(holdovers)
         return selected
 
-    def _qualifies_auto(self, analysis: CompanyAnalysis) -> bool:
+    @staticmethod
+    def _qualifies_auto(analysis: CompanyAnalysis, profile: ExecutionProfile | None) -> bool:
+        return analysis.portfolio.stance == "long" and profile is not None and profile.mode == "auto"
+
+    @staticmethod
+    def _qualifies_hold(analysis: CompanyAnalysis, profile: ExecutionProfile | None) -> bool:
         return (
-            analysis.portfolio.scenario in self.AUTO_SCENARIOS
-            and analysis.portfolio.target_weight >= self.settings.min_execution_weight_pct
-            and analysis.portfolio.confidence >= self.settings.min_execution_confidence
-            and analysis.portfolio.stance == "long"
+            analysis.portfolio.stance == "long"
+            and profile is not None
+            and profile.mode in {"auto", "hold"}
         )
 
-    def _qualifies_hold(self, analysis: CompanyAnalysis) -> bool:
-        if analysis.portfolio.stance != "long":
-            return False
-        if analysis.portfolio.scenario == "avoid due to financing":
-            return False
+    def _execution_profile(
+        self,
+        analysis: CompanyAnalysis,
+        has_position: bool,
+    ) -> ExecutionProfile:
+        rec = analysis.portfolio
+        signal = analysis.signal
+        state = signal.company_state or rec.company_state or "pre_commercial"
+        setup = signal.setup_type or rec.setup_type or "watchful"
+        expected_return = signal.expected_return
+        catalyst_success = signal.catalyst_success_prob
+        confidence = rec.confidence
+        target_weight = rec.target_weight
+        financing_risk = signal.financing_risk
+        crowding_risk = signal.crowding_risk
+        upside = signal.internal_upside_pct if signal.internal_upside_pct is not None else 0.0
+        floor = signal.floor_support_pct if signal.floor_support_pct is not None else 0.0
+
+        if rec.stance != "long":
+            return self._blocked_profile("not_long", analysis, "Recommendation stance is not long.")
+        if rec.scenario == "avoid due to financing" or financing_risk > 0.82:
+            return self._blocked_profile("financing_blocked", analysis, "Financing overhang is too high for deployment.")
+        if rec.scenario == "watchlist only" and setup not in {"asymmetry_without_near_term_catalyst", "sentiment_floor"}:
+            return self._blocked_profile("watchlist_only", analysis, "Watchlist-only setup is not eligible for PM deployment.")
+        if upside < -0.05:
+            return self._blocked_profile("negative_asymmetry", analysis, "Internal value view is below the market setup.")
+        if expected_return <= 0.0 and upside <= 0.0:
+            return self._blocked_profile("no_edge", analysis, "Expected return and asymmetry do not justify deployment.")
+        if target_weight < self.settings.execution_hold_weight_pct and not has_position:
+            return self._blocked_profile("subscale", analysis, "Research target weight is below the minimum entry size.")
+        if confidence < self.settings.execution_hold_confidence and not has_position:
+            return self._blocked_profile("low_confidence", analysis, "Confidence is below the minimum hold threshold.")
+
+        if setup == "hard_catalyst":
+            min_confidence = max(
+                self.settings.execution_min_hard_catalyst_confidence,
+                self.settings.min_execution_confidence,
+            )
+            if (
+                confidence >= min_confidence
+                and catalyst_success >= 0.50
+                and upside >= self.settings.execution_min_internal_upside_pct
+                and financing_risk <= 0.72
+            ):
+                return self._auto_profile(
+                    "hard_catalyst",
+                    analysis,
+                    self.settings.execution_max_hard_catalyst_weight_pct,
+                    "High-conviction hard catalyst cleared the execution bar.",
+                    score_bonus=0.45,
+                )
+            if has_position and confidence >= self.settings.execution_hold_confidence and catalyst_success >= 0.45:
+                return self._hold_profile(
+                    "hard_catalyst_hold",
+                    analysis,
+                    self.settings.execution_max_soft_catalyst_weight_pct,
+                    "Hold existing exposure while the hard-catalyst setup matures.",
+                    score_bonus=0.15,
+                )
+            return self._blocked_profile("hard_catalyst_blocked", analysis, "Hard catalyst exists, but the execution bar was not met.")
+
+        if setup == "soft_catalyst":
+            min_floor = max(self.settings.execution_min_floor_support_pct - 0.02, 0.0)
+            if (
+                confidence >= self.settings.execution_min_soft_catalyst_confidence
+                and catalyst_success >= 0.55
+                and upside >= self.settings.execution_min_internal_upside_pct + 0.02
+                and floor >= min_floor
+            ):
+                return self._auto_profile(
+                    "soft_catalyst",
+                    analysis,
+                    self.settings.execution_max_soft_catalyst_weight_pct,
+                    "Soft catalyst has enough support and asymmetry for a measured entry.",
+                    score_bonus=0.20,
+                )
+            if has_position and confidence >= self.settings.execution_hold_confidence and upside >= self.settings.execution_min_internal_upside_pct:
+                return self._hold_profile(
+                    "soft_catalyst_hold",
+                    analysis,
+                    self.settings.execution_max_soft_catalyst_weight_pct,
+                    "Keep exposure on, but do not add until the setup firms up.",
+                )
+            return self._blocked_profile("soft_catalyst_blocked", analysis, "Soft catalyst lacks enough support or upside for auto deployment.")
+
+        if setup == "launch_asymmetry":
+            if (
+                state == "commercial_launch"
+                and confidence >= self.settings.execution_min_launch_confidence
+                and expected_return > 0.08
+                and upside >= self.settings.execution_min_internal_upside_pct
+                and floor >= self.settings.execution_min_floor_support_pct
+                and financing_risk <= 0.68
+            ):
+                return self._auto_profile(
+                    "launch_asymmetry",
+                    analysis,
+                    self.settings.execution_max_launch_weight_pct,
+                    "Launch setup offers enough asymmetry and balance-sheet support for deployment.",
+                    score_bonus=0.30,
+                )
+            if has_position and confidence >= self.settings.execution_hold_confidence and floor >= self.settings.execution_min_floor_support_pct:
+                return self._hold_profile(
+                    "launch_hold",
+                    analysis,
+                    self.settings.execution_max_launch_weight_pct,
+                    "Retain launch exposure while waiting for cleaner commercial confirmation.",
+                )
+            return self._blocked_profile("launch_blocked", analysis, "Launch asymmetry is not yet strong enough for fresh capital.")
+
+        if setup in {"pipeline_optionality", "capital_allocation"}:
+            if (
+                state in {"commercial_launch", "commercialized"}
+                and confidence >= self.settings.execution_min_franchise_confidence
+                and expected_return > 0.05
+                and upside >= self.settings.execution_min_internal_upside_pct - 0.02
+                and floor >= self.settings.execution_min_floor_support_pct
+            ):
+                return self._auto_profile(
+                    setup,
+                    analysis,
+                    self.settings.execution_max_franchise_weight_pct,
+                    "Franchise optionality is strong enough for a measured PM deployment.",
+                    score_bonus=0.18,
+                )
+            if has_position and confidence >= self.settings.execution_hold_confidence and floor >= self.settings.execution_min_floor_support_pct:
+                return self._hold_profile(
+                    f"{setup}_hold",
+                    analysis,
+                    self.settings.execution_max_franchise_weight_pct,
+                    "Keep franchise exposure on, but wait for more concrete validation before adding.",
+                )
+            return self._blocked_profile(f"{setup}_blocked", analysis, "Franchise setup does not yet clear the execution thresholds.")
+
+        if setup == "sentiment_floor":
+            if (
+                state in {"commercial_launch", "commercialized"}
+                and confidence >= self.settings.execution_min_franchise_confidence
+                and expected_return > 0.04
+                and upside >= self.settings.execution_min_internal_upside_pct - 0.03
+                and floor >= self.settings.execution_min_floor_support_pct + 0.05
+            ):
+                return self._auto_profile(
+                    "sentiment_floor",
+                    analysis,
+                    self.settings.execution_max_floor_weight_pct,
+                    "Sentiment/floor setup is investable, but only at a smaller size cap.",
+                    score_bonus=0.08,
+                )
+            if has_position and confidence >= self.settings.execution_hold_confidence and floor >= self.settings.execution_min_floor_support_pct:
+                return self._hold_profile(
+                    "sentiment_floor_hold",
+                    analysis,
+                    self.settings.execution_max_floor_weight_pct,
+                    "Floor support justifies holding existing exposure without adding.",
+                )
+            return self._blocked_profile("sentiment_floor_blocked", analysis, "Floor setup is not strong enough for fresh capital.")
+
+        if setup == "asymmetry_without_near_term_catalyst":
+            if (
+                state == "pre_commercial"
+                and has_position
+                and confidence >= max(self.settings.execution_hold_confidence, 0.56)
+                and upside >= self.settings.execution_min_internal_upside_pct
+                and floor >= self.settings.execution_min_floor_support_pct + 0.06
+                and financing_risk <= 0.60
+            ):
+                return self._hold_profile(
+                    "precommercial_asymmetry_hold",
+                    analysis,
+                    self.settings.execution_max_floor_weight_pct,
+                    "Interesting pre-commercial asymmetry, but without a clean catalyst it stays hold-only.",
+                    score_bonus=0.05,
+                )
+            if (
+                state in {"commercial_launch", "commercialized"}
+                and confidence >= self.settings.execution_min_franchise_confidence
+                and expected_return > 0.07
+                and upside >= self.settings.execution_min_internal_upside_pct
+                and floor >= self.settings.execution_min_floor_support_pct + 0.02
+            ):
+                return self._auto_profile(
+                    "franchise_asymmetry",
+                    analysis,
+                    self.settings.execution_max_floor_weight_pct,
+                    "Asymmetry without a dated catalyst is only deployable at a smaller size.",
+                )
+            return self._blocked_profile(
+                "no_near_term_catalyst",
+                analysis,
+                "No hard catalyst yet, so the setup stays on the watchlist until the asymmetry firms up.",
+            )
+
+        if crowding_risk > 0.88 and not has_position:
+            return self._blocked_profile("crowded_setup", analysis, "Crowding is too elevated for a fresh entry.")
+        if has_position and confidence >= self.settings.execution_hold_confidence and upside > 0.0 and floor >= self.settings.execution_min_floor_support_pct:
+            return self._hold_profile(
+                "default_hold",
+                analysis,
+                self.settings.execution_max_floor_weight_pct,
+                "Setup remains constructive enough to keep the position on.",
+            )
+        return self._blocked_profile("watchful", analysis, "Setup is interesting, but not yet deployable under PM rules.")
+
+    def _auto_profile(
+        self,
+        name: str,
+        analysis: CompanyAnalysis,
+        weight_cap_pct: float,
+        rationale: str,
+        score_bonus: float = 0.0,
+    ) -> ExecutionProfile:
+        score = self._execution_score(analysis, score_bonus=score_bonus)
+        if analysis.signal.crowding_risk > 0.80 and name != "hard_catalyst":
+            weight_cap_pct = min(weight_cap_pct, self.settings.execution_max_floor_weight_pct)
+            rationale += " Crowding trims the live size cap."
+        return ExecutionProfile(
+            name=name,
+            mode="auto",
+            weight_cap_pct=weight_cap_pct,
+            score=score,
+            rationale=[rationale],
+        )
+
+    def _hold_profile(
+        self,
+        name: str,
+        analysis: CompanyAnalysis,
+        weight_cap_pct: float,
+        rationale: str,
+        score_bonus: float = 0.0,
+    ) -> ExecutionProfile:
+        return ExecutionProfile(
+            name=name,
+            mode="hold",
+            weight_cap_pct=weight_cap_pct,
+            score=self._execution_score(analysis, score_bonus=score_bonus - 0.25),
+            rationale=[rationale],
+        )
+
+    def _blocked_profile(
+        self,
+        name: str,
+        analysis: CompanyAnalysis,
+        rationale: str,
+    ) -> ExecutionProfile:
+        return ExecutionProfile(
+            name=name,
+            mode="block",
+            weight_cap_pct=0.0,
+            score=self._execution_score(analysis, score_bonus=-2.0),
+            rationale=[rationale],
+        )
+
+    @staticmethod
+    def _execution_score(
+        analysis: CompanyAnalysis,
+        score_bonus: float = 0.0,
+    ) -> float:
+        signal = analysis.signal
+        upside = signal.internal_upside_pct if signal.internal_upside_pct is not None else 0.0
+        floor = signal.floor_support_pct if signal.floor_support_pct is not None else 0.0
         return (
-            analysis.portfolio.target_weight >= self.settings.execution_hold_weight_pct
-            and analysis.portfolio.confidence >= self.settings.execution_hold_confidence
+            max(signal.expected_return, 0.0) * 4.0
+            + (analysis.portfolio.confidence * 1.5)
+            + (max(signal.catalyst_success_prob - 0.50, 0.0) * 1.2)
+            + (max(upside, 0.0) * 0.05)
+            + (max(floor, 0.0) * 0.03)
+            - (signal.crowding_risk * 0.8)
+            - (signal.financing_risk * 1.2)
+            + score_bonus
         )
 
 

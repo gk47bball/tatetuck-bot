@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from dataclasses import asdict
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pandas as pd
@@ -121,7 +122,10 @@ class TestVNextPlatform(unittest.TestCase):
         self.assertGreaterEqual(program_vector.feature_family["catalyst_timing_filing_freshness_days"], 0.0)
 
     def test_external_enrichment_adds_sec_evidence_calendar_and_financing(self):
-        snapshot = build_company_snapshot(make_raw_company())
+        snapshot = build_company_snapshot(
+            make_raw_company(),
+            as_of=datetime(2025, 2, 1, tzinfo=timezone.utc),
+        )
         sec_payload = {
             "cik": "0000000123",
             "parsed": {
@@ -133,8 +137,10 @@ class TestVNextPlatform(unittest.TestCase):
                     {
                         "form": "10-Q",
                         "filing_date": "2025-02-01",
+                        "acceptance_datetime": "2025-02-01T21:05:00Z",
                         "accession_number": "0001",
                         "primary_document": "q1.htm",
+                        "primary_doc_description": "Quarterly financial results and business update",
                         "url": "https://example.com/10q",
                     }
                 ],
@@ -161,6 +167,7 @@ class TestVNextPlatform(unittest.TestCase):
         self.assertEqual(enriched.metadata["recent_offering_signal"], 1.0)
         self.assertTrue(any(item.source == "sec" for item in enriched.evidence))
         self.assertTrue(any(event.event_type == "earnings" for event in enriched.catalyst_events))
+        self.assertTrue(any(event.status == "exact_sec_filing" for event in enriched.catalyst_events))
         self.assertTrue(any(event.event_type == "recent_offering_filing" for event in enriched.financing_events))
 
     def test_store_persists_company_level_catalysts(self):
@@ -169,8 +176,12 @@ class TestVNextPlatform(unittest.TestCase):
             store = LocalResearchStore(base_dir=tmpdir)
             store.write_snapshot(snapshot)
             catalysts = store.read_table("catalysts")
+            event_tape = store.read_table("event_tape")
+            membership = store.read_table("universe_membership")
             self.assertIn("phase3_readout", catalysts["event_type"].tolist())
             self.assertIn("commercial_update", catalysts["event_type"].tolist())
+            self.assertFalse(event_tape.empty)
+            self.assertEqual(membership.iloc[0]["ticker"], "TEST")
 
     def test_portfolio_constructor_flags_financing_overhang(self):
         snapshot = build_company_snapshot(make_raw_company())

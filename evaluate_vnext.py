@@ -59,6 +59,22 @@ def main():
 
         evaluator = WalkForwardEvaluator(store=platform.store, settings=settings)
         summary = evaluator.evaluate()
+        store.write_raw_payload(
+            "validation_audits",
+            "latest_walkforward_audit",
+            {
+                "generated_at": utc_now_iso(),
+                "rows": summary.num_rows,
+                "windows": summary.num_windows,
+                "rank_ic": summary.rank_ic,
+                "strict_rank_ic": summary.strict_rank_ic,
+                "pm_context_coverage": summary.pm_context_coverage,
+                "exact_primary_event_rate": summary.exact_primary_event_rate,
+                "synthetic_primary_event_rate": summary.synthetic_primary_event_rate,
+                "institutional_blockers": summary.institutional_blockers,
+                "latest_window_top_trades": summary.latest_window_top_trades,
+            },
+        )
         finished_at = utc_now_iso()
         record_pipeline_run(
             store=store,
@@ -70,11 +86,18 @@ def main():
                 "rows": summary.num_rows,
                 "windows": summary.num_windows,
                 "rank_ic": summary.rank_ic,
+                "strict_rank_ic": summary.strict_rank_ic,
                 "hit_rate": summary.hit_rate,
+                "strict_hit_rate": summary.strict_hit_rate,
                 "top_bottom_spread": summary.top_bottom_spread,
+                "strict_top_bottom_spread": summary.strict_top_bottom_spread,
                 "turnover": summary.turnover,
                 "brier": summary.calibrated_brier,
                 "leakage_passed": summary.leakage_passed,
+                "pm_context_coverage": summary.pm_context_coverage,
+                "exact_primary_event_rate": summary.exact_primary_event_rate,
+                "synthetic_primary_event_rate": summary.synthetic_primary_event_rate,
+                "institutional_blockers": summary.institutional_blockers,
                 "event_type_scorecards": summary.event_type_scorecards,
             },
             config={
@@ -112,8 +135,20 @@ def main():
     print(f"beta_adj_return:  {summary.beta_adjusted_return:.4f}")
     print(f"brier:            {summary.calibrated_brier:.4f}")
     print(f"leakage_passed:   {summary.leakage_passed}")
+    print(f"strict_rank_ic:   {summary.strict_rank_ic:.4f}")
+    print(f"strict_hit_rate:  {summary.strict_hit_rate:.4f}")
+    print(f"strict_spread:    {summary.strict_top_bottom_spread:.4f}")
+    print(f"pm_context_cov:   {summary.pm_context_coverage:.4f}")
+    print(f"exact_event_rate: {summary.exact_primary_event_rate:.4f}")
+    print(f"synthetic_rate:   {summary.synthetic_primary_event_rate:.4f}")
     if summary.message:
         print(f"message:          {summary.message}")
+    print("\n[institutional_blockers]")
+    if summary.institutional_blockers:
+        for blocker in summary.institutional_blockers:
+            print(f"- {blocker}")
+    else:
+        print("- none")
     if summary.event_type_scorecards:
         print("\n[event_scorecards]")
         for event_type, metrics in sorted(
@@ -128,6 +163,21 @@ def main():
                 f"hit={metrics.get('hit_rate', 0.0):.3f} | "
                 f"spread={metrics.get('top_bottom_spread', 0.0):+.3f} | "
                 f"brier={metrics.get('calibrated_brier', 1.0):.3f}"
+            )
+    if summary.latest_window_top_trades:
+        print("\n[latest_window_audit]")
+        for row in summary.latest_window_top_trades[:10]:
+            event_date = row.get("primary_event_date") or "TBD"
+            event_status = row.get("primary_event_status") or "unknown"
+            print(
+                f"{str(row.get('ticker')):5} | "
+                f"wt={float(row.get('target_weight', 0.0)):>4.1f}% | "
+                f"state={row.get('company_state') or 'na'} | "
+                f"setup={row.get('setup_type') or 'na'} | "
+                f"event={row.get('primary_event_type') or 'none'} | "
+                f"date={event_date} | "
+                f"status={event_status} | "
+                f"synthetic={bool(row.get('primary_event_synthetic', False))}"
             )
 
     print(f"\n[summary] elapsed_seconds={time.time() - start:.1f}")

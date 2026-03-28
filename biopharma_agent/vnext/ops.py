@@ -159,6 +159,7 @@ def build_readiness_report(
         )
     if not evaluation.leakage_passed:
         blockers.append("Leakage audit is not passing.")
+    blockers.extend(evaluation.institutional_blockers)
 
     if latest_snapshot_age_hours is not None and latest_snapshot_age_hours > settings.max_snapshot_age_hours:
         warnings.append(

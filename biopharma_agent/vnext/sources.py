@@ -4,12 +4,15 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import pandas as pd
 import requests
 
+from .eodhd import EODHDEventTapeClient
 from .entities import CatalystEvent, CompanySnapshot, EvidenceSnippet, FinancingEvent
 from .graph import build_company_snapshot, fetch_legacy_snapshot, infer_runway_months
 from .market_profile import update_snapshot_profile
 from .storage import LocalResearchStore
+from .taxonomy import event_timing_priority
 
 
 def _has_finance_data(payload: dict[str, Any]) -> bool:
@@ -92,6 +95,130 @@ def _recover_calendar_payload(primary: dict[str, Any], fallback: dict[str, Any] 
     return primary, False
 
 
+SEC_EXACT_EVENT_FORMS = {"8-K", "10-Q", "10-K", "20-F", "6-K", "S-3", "424B5", "424B3", "F-3", "S-1"}
+SEC_FINANCING_FORMS = {"S-3", "424B5", "424B3", "F-3", "S-1"}
+SEC_EARNINGS_FORMS = {"10-Q", "10-K", "20-F"}
+SEC_RESULTS_KEYWORDS = ("financial results", "earnings", "quarterly results", "annual results", "business updates")
+SEC_CLINICAL_KEYWORDS = ("topline", "top-line", "data", "readout", "phase 1", "phase 2", "phase 3", "trial")
+SEC_REGULATORY_KEYWORDS = ("approval", "pdufa", "adcom", "complete response", "bla", "nda")
+SEC_COMMERCIAL_KEYWORDS = ("launch", "uptake", "commercial", "label expansion", "sales")
+EXACT_EVENT_LOOKBACK_DAYS = 7
+
+
+def _filing_timestamp(filing: dict[str, Any]) -> pd.Timestamp | None:
+    accepted = filing.get("acceptance_datetime")
+    filing_date = filing.get("filing_date")
+    if accepted:
+        ts = pd.to_datetime(accepted, errors="coerce", utc=True, format="mixed")
+        if not pd.isna(ts):
+            return ts.tz_convert(None)
+    if filing_date:
+        ts = pd.to_datetime(filing_date, errors="coerce", utc=True, format="mixed")
+        if not pd.isna(ts):
+            return ts.tz_convert(None)
+    return None
+
+
+def _classify_sec_filing_event(ticker: str, filing: dict[str, Any]) -> dict[str, Any] | None:
+    form = str(filing.get("form") or "").upper()
+    if form not in SEC_EXACT_EVENT_FORMS:
+        return None
+    filing_ts = _filing_timestamp(filing)
+    if filing_ts is None:
+        return None
+    filing_text = " ".join(
+        str(filing.get(key) or "")
+        for key in ("primary_doc_description", "items", "primary_document", "report_date")
+    ).lower()
+
+    if form in SEC_FINANCING_FORMS or any(keyword in filing_text for keyword in ("offering", "prospectus", "atm", "shelf")):
+        event_type = "recent_offering_filing"
+        importance = 0.55
+        crowdedness = 0.20
+        title = f"{ticker} filed {form} financing update"
+    elif form in SEC_EARNINGS_FORMS or any(keyword in filing_text for keyword in SEC_RESULTS_KEYWORDS):
+        event_type = "earnings"
+        importance = 0.55
+        crowdedness = 0.35
+        title = f"{ticker} filed {form} financial update"
+    elif any(keyword in filing_text for keyword in SEC_REGULATORY_KEYWORDS):
+        event_type = "pdufa"
+        importance = 0.85
+        crowdedness = 0.40
+        title = f"{ticker} regulatory filing update"
+    elif any(keyword in filing_text for keyword in SEC_CLINICAL_KEYWORDS):
+        event_type = "clinical_readout"
+        importance = 0.80
+        crowdedness = 0.35
+        title = f"{ticker} clinical filing update"
+    elif any(keyword in filing_text for keyword in SEC_COMMERCIAL_KEYWORDS):
+        event_type = "commercial_update"
+        importance = 0.60
+        crowdedness = 0.45
+        title = f"{ticker} commercial filing update"
+    elif form in {"8-K", "6-K"}:
+        event_type = "commercial_update"
+        importance = 0.45
+        crowdedness = 0.35
+        title = f"{ticker} corporate filing update"
+    else:
+        return None
+
+    return {
+        "event_id": f"{ticker}:sec:{form}:{filing_ts.isoformat()}",
+        "event_type": event_type,
+        "title": title,
+        "expected_date": filing_ts.isoformat(),
+        "timestamp": filing_ts,
+        "importance": importance,
+        "crowdedness": crowdedness,
+        "status": "exact_sec_filing",
+        "source": "sec",
+        "url": filing.get("url"),
+        "form": form,
+    }
+
+
+def _exact_sec_events_for_snapshot(snapshot: CompanySnapshot, sec_payload: dict[str, Any]) -> list[CatalystEvent]:
+    parsed = sec_payload.get("parsed", {})
+    as_of_ts = pd.to_datetime(snapshot.as_of, errors="coerce", utc=True, format="mixed")
+    if pd.isna(as_of_ts):
+        return []
+    as_of_ts = as_of_ts.tz_convert(None)
+    exact_events: list[CatalystEvent] = []
+    for filing in parsed.get("recent_filings", []):
+        classified = _classify_sec_filing_event(snapshot.ticker, filing)
+        if classified is None:
+            continue
+        filing_ts = classified["timestamp"]
+        days_old = (as_of_ts.normalize() - filing_ts.normalize()).days
+        if days_old < 0 or days_old > EXACT_EVENT_LOOKBACK_DAYS:
+            continue
+        horizon_days = max((filing_ts.normalize() - as_of_ts.normalize()).days, 0)
+        exact_events.append(
+            CatalystEvent(
+                event_id=str(classified["event_id"]),
+                program_id=None,
+                event_type=str(classified["event_type"]),
+                title=str(classified["title"]),
+                expected_date=str(classified["expected_date"]),
+                horizon_days=horizon_days,
+                probability=0.95,
+                importance=float(classified["importance"]),
+                crowdedness=float(classified["crowdedness"]),
+                status=str(classified["status"]),
+            )
+        )
+    exact_events.sort(
+        key=lambda item: (
+            -event_timing_priority(item.status, item.expected_date, item.title),
+            -item.importance,
+            item.crowdedness,
+        )
+    )
+    return exact_events
+
+
 class SECXBRLClient:
     """Placeholder for future SEC/XBRL enrichment.
 
@@ -162,17 +289,34 @@ class SECXBRLClient:
         filing_dates = recent.get("filingDate", [])
         accession_numbers = recent.get("accessionNumber", [])
         primary_docs = recent.get("primaryDocument", [])
+        acceptance_datetimes = recent.get("acceptanceDateTime", [])
+        primary_doc_descriptions = recent.get("primaryDocDescription", [])
+        items = recent.get("items", [])
+        report_dates = recent.get("reportDate", [])
 
         recent_filings: list[dict[str, Any]] = []
-        for form, filing_date, accession, primary_doc in zip(forms[:25], filing_dates[:25], accession_numbers[:25], primary_docs[:25]):
+        for form, filing_date, accession, primary_doc, acceptance_datetime, primary_doc_description, item_list, report_date in zip(
+            forms[:25],
+            filing_dates[:25],
+            accession_numbers[:25],
+            primary_docs[:25],
+            acceptance_datetimes[:25],
+            primary_doc_descriptions[:25],
+            items[:25],
+            report_dates[:25],
+        ):
             accession_clean = str(accession).replace("-", "")
             filing_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_clean}/{primary_doc}" if accession and primary_doc else None
             recent_filings.append(
                 {
                     "form": form,
                     "filing_date": filing_date,
+                    "acceptance_datetime": acceptance_datetime,
                     "accession_number": accession,
                     "primary_document": primary_doc,
+                    "primary_doc_description": primary_doc_description,
+                    "items": item_list,
+                    "report_date": report_date,
                     "url": filing_url,
                 }
             )
@@ -256,6 +400,7 @@ def enrich_snapshot_with_external_data(
     snapshot: CompanySnapshot,
     sec_payload: dict[str, Any],
     calendar_payload: dict[str, Any],
+    event_payload: dict[str, Any] | None = None,
 ) -> CompanySnapshot:
     parsed = sec_payload.get("parsed", {})
     if sec_payload.get("cik"):
@@ -285,6 +430,10 @@ def enrich_snapshot_with_external_data(
             )
         )
 
+    exact_sec_events = _exact_sec_events_for_snapshot(snapshot, sec_payload)
+    if exact_sec_events:
+        snapshot.catalyst_events.extend(exact_sec_events)
+
     for event in calendar_payload.get("events", []):
         expected_date = event.get("expected_date")
         if not expected_date:
@@ -304,8 +453,74 @@ def enrich_snapshot_with_external_data(
                 probability=0.80,
                 importance=0.45,
                 crowdedness=0.35,
-                status="calendar_estimate",
+                status=(
+                    "exact_company_calendar"
+                    if "estimated" not in str(event.get("title") or "").lower()
+                    and str(calendar_payload.get("source") or "") != "calendar_from_sec"
+                    else "calendar_estimate"
+                ),
             )
+        )
+
+    for event in (event_payload or {}).get("events", []):
+        expected_date = event.get("expected_date")
+        if not expected_date:
+            continue
+        expected_ts = pd.to_datetime(expected_date, errors="coerce", utc=True, format="mixed")
+        if pd.isna(expected_ts):
+            continue
+        expected_ts = expected_ts.tz_convert(None)
+        as_of_ts = pd.to_datetime(snapshot.as_of, errors="coerce", utc=True, format="mixed")
+        if pd.isna(as_of_ts):
+            continue
+        as_of_ts = as_of_ts.tz_convert(None)
+        horizon_days = max((expected_ts.normalize() - as_of_ts.normalize()).days, 0)
+        snapshot.catalyst_events.append(
+            CatalystEvent(
+                event_id=str(event["event_id"]),
+                program_id=None,
+                event_type=str(event["event_type"]),
+                title=str(event["title"]),
+                expected_date=str(expected_date),
+                horizon_days=horizon_days,
+                probability=0.90 if str(event.get("status") or "").startswith("exact") else 0.75,
+                importance=float(event.get("importance", 0.55) or 0.55),
+                crowdedness=float(event.get("crowdedness", 0.35) or 0.35),
+                status=str(event.get("status") or "exact_press_release"),
+            )
+        )
+        if event.get("url"):
+            snapshot.evidence.append(
+                EvidenceSnippet(
+                    source=str(event.get("source") or "external_event"),
+                    source_id=str(event["event_id"]),
+                    title=str(event["title"]),
+                    excerpt=f"External event tape captured {event.get('event_type')} for {snapshot.ticker}.",
+                    url=str(event["url"]),
+                    as_of=str(expected_date),
+                    confidence=0.72,
+                )
+            )
+
+    if snapshot.catalyst_events:
+        deduped_events: dict[tuple[str, str | None, str], CatalystEvent] = {}
+        for event in snapshot.catalyst_events:
+            key = (event.event_id, event.expected_date, event.status)
+            existing = deduped_events.get(key)
+            if existing is None or event_timing_priority(event.status, event.expected_date, event.title) > event_timing_priority(
+                existing.status,
+                existing.expected_date,
+                existing.title,
+            ):
+                deduped_events[key] = event
+        snapshot.catalyst_events = sorted(
+            deduped_events.values(),
+            key=lambda event: (
+                -event_timing_priority(event.status, event.expected_date, event.title),
+                -event.importance,
+                event.horizon_days,
+                event.crowdedness,
+            ),
         )
 
     refreshed_runway = infer_runway_months(snapshot.revenue, snapshot.cash, snapshot.debt, len(snapshot.programs))
@@ -360,6 +575,7 @@ class IngestionService:
         self.store = store or LocalResearchStore()
         self.sec_client = SECXBRLClient()
         self.calendar_client = CorporateCalendarClient()
+        self.eodhd_events = EODHDEventTapeClient(store=self.store)
 
     def ingest_company(
         self,
@@ -397,7 +613,12 @@ class IngestionService:
         if used_cached_calendar:
             fallback_sources.append("corp_calendar")
 
-        snapshot = enrich_snapshot_with_external_data(snapshot, sec_payload, calendar_payload)
+        event_payload = self.eodhd_events.fetch_event_payload(ticker, as_of=as_of)
+        if not event_payload.get("events"):
+            cached_events = self.store.read_latest_raw_payload("eodhd_event_tape", f"{ticker}_")
+            if isinstance(cached_events, dict):
+                event_payload = cached_events
+        snapshot = enrich_snapshot_with_external_data(snapshot, sec_payload, calendar_payload, event_payload=event_payload)
         if fallback_sources:
             snapshot.metadata["fallback_sources"] = sorted(set(fallback_sources))
 
@@ -406,5 +627,6 @@ class IngestionService:
             self.store.write_raw_payload("legacy_prepare", raw_key, raw)
             self.store.write_raw_payload("sec_xbrl", raw_key, sec_payload)
             self.store.write_raw_payload("corp_calendar", raw_key, calendar_payload)
+            self.store.write_raw_payload("eodhd_event_tape", raw_key, event_payload)
             self.store.write_snapshot(snapshot)
         return snapshot

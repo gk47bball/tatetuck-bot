@@ -8,6 +8,7 @@ from typing import Any, Iterable
 import pandas as pd
 
 from .entities import CompanySnapshot
+from .eodhd import EODHDEventTapeClient, EODHDUniverseClient
 from .graph import build_company_snapshot
 from .labels import CompositeHistoryProvider, EODHDHistoryProvider, PriceHistoryProvider, YFinanceHistoryProvider
 from .replay import snapshot_from_dict
@@ -73,6 +74,8 @@ class HistoricalSnapshotBootstrapper:
             ]
         )
         self.calendar_client = CorporateCalendarClient()
+        self.event_client = EODHDEventTapeClient(store=self.store)
+        self.universe_client = EODHDUniverseClient(store=self.store)
 
     def materialize(
         self,
@@ -81,6 +84,7 @@ class HistoricalSnapshotBootstrapper:
         max_anchors_per_ticker: int = 8,
         min_anchor_spacing_days: int = 45,
     ) -> HistoryBootstrapSummary:
+        self.universe_client.sync_universe_membership()
         tickers = self._discover_tickers(ticker=ticker, ticker_limit=ticker_limit)
         generated_snapshots = 0
         tickers_with_history = 0
@@ -270,7 +274,8 @@ class HistoricalSnapshotBootstrapper:
 
         snapshot = build_company_snapshot(raw, as_of=as_of_ts.to_pydatetime())
         calendar_payload = self.calendar_client.fetch_company_calendar(ticker, sec_as_of)
-        snapshot = enrich_snapshot_with_external_data(snapshot, sec_as_of, calendar_payload)
+        event_payload = self.event_client.fetch_event_payload(ticker, as_of=as_of_ts.to_pydatetime())
+        snapshot = enrich_snapshot_with_external_data(snapshot, sec_as_of, calendar_payload, event_payload=event_payload)
         snapshot.metadata.update(
             {
                 "history_reconstruction": True,
@@ -317,8 +322,12 @@ class HistoricalSnapshotBootstrapper:
         return {
             "form": row.get("form"),
             "filing_date": row.get("filingDate"),
+            "acceptance_datetime": row.get("acceptanceDateTime"),
             "accession_number": accession,
             "primary_document": primary_doc,
+            "primary_doc_description": row.get("primaryDocDescription"),
+            "items": row.get("items"),
+            "report_date": row.get("reportDate"),
             "url": url,
         }
 

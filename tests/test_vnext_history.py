@@ -124,6 +124,47 @@ class TestVNextHistory(unittest.TestCase):
             self.assertTrue(labels["target_return_90d"].notna().all())
             self.assertTrue(event_labels["target_event_return_10d"].notna().all())
 
+    def test_labeler_prefers_exact_events_over_synthetic_placeholders(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            snapshots = pd.DataFrame([{"ticker": "TEST", "as_of": "2025-02-01T00:00:00"}])
+            catalysts = pd.DataFrame(
+                [
+                    {
+                        "ticker": "TEST",
+                        "as_of": "2025-02-01T00:00:00",
+                        "event_id": "TEST:synthetic:1",
+                        "event_type": "phase3_readout",
+                        "title": "TEST-101 next milestone",
+                        "expected_date": "2025-05-01",
+                        "horizon_days": 89,
+                        "importance": 0.9,
+                        "crowdedness": 0.2,
+                        "status": "phase_timing_estimate",
+                    },
+                    {
+                        "ticker": "TEST",
+                        "as_of": "2025-02-01T00:00:00",
+                        "event_id": "TEST:exact:1",
+                        "event_type": "earnings",
+                        "title": "TEST filed 10-Q financial update",
+                        "expected_date": "2025-02-01T21:05:00",
+                        "horizon_days": 0,
+                        "importance": 0.55,
+                        "crowdedness": 0.35,
+                        "status": "exact_sec_filing",
+                    },
+                ]
+            )
+            labeler = PointInTimeLabeler(
+                store=store,
+                history_provider=StubHistoryProvider({"TEST": make_price_frame()}),
+            )
+            labels, event_labels = labeler.build_label_frames(snapshots=snapshots, catalysts=catalysts)
+
+            self.assertEqual(labels.iloc[0]["target_primary_event_type"], "earnings")
+            self.assertEqual(event_labels.iloc[0]["event_id"], "TEST:exact:1")
+
     def test_labeler_prioritizes_clinical_events_over_earnings_noise(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = LocalResearchStore(base_dir=tmpdir)
@@ -517,6 +558,139 @@ class TestVNextHistory(unittest.TestCase):
             )
             test = evaluator._latest_test_frame(frame, pd.Timestamp("2025-01-20"))
             self.assertEqual(sorted(test["ticker"].tolist()), ["AAA", "BBB"])
+
+    def test_evaluator_reports_pm_context_and_synthetic_event_usage(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            dates = ["2025-01-01T00:00:00+00:00", "2025-01-08T00:00:00+00:00", "2025-01-15T00:00:00+00:00"]
+            snapshot_rows = []
+            feature_rows = []
+            label_rows = []
+            for idx, as_of in enumerate(dates):
+                snapshot_rows.append({"ticker": "AAA", "as_of": as_of})
+                store.write_raw_payload(
+                    "snapshots",
+                    f"AAA_{as_of.replace(':', '-')}",
+                    {
+                        "ticker": "AAA",
+                        "company_name": "AAA Bio",
+                        "as_of": as_of,
+                        "market_cap": 1_000_000_000,
+                        "enterprise_value": 900_000_000,
+                        "revenue": 0.0,
+                        "cash": 250_000_000,
+                        "debt": 0.0,
+                        "momentum_3mo": 0.05,
+                        "trailing_6mo_return": 0.0,
+                        "volatility": 0.10,
+                        "programs": [
+                            {
+                                "program_id": "AAA:1",
+                                "name": "AAA-101",
+                                "modality": "small molecule",
+                                "phase": "PHASE3",
+                                "conditions": ["oncology"],
+                                "trials": [],
+                                "pos_prior": 0.55,
+                                "tam_estimate": 3_000_000_000,
+                                "catalyst_events": [
+                                    {
+                                        "event_id": "AAA:1:phase3:120",
+                                        "program_id": "AAA:1",
+                                        "event_type": "phase3_readout",
+                                        "title": "AAA-101 next milestone",
+                                        "expected_date": "2025-05-01",
+                                        "horizon_days": 120,
+                                        "probability": 0.7,
+                                        "importance": 0.8,
+                                        "crowdedness": 0.2,
+                                        "status": "phase_timing_estimate",
+                                    }
+                                ],
+                                "evidence": [],
+                            }
+                        ],
+                        "approved_products": [],
+                        "catalyst_events": [
+                            {
+                                "event_id": "AAA:1:phase3:120",
+                                "program_id": "AAA:1",
+                                "event_type": "phase3_readout",
+                                "title": "AAA-101 next milestone",
+                                "expected_date": "2025-05-01",
+                                "horizon_days": 120,
+                                "probability": 0.7,
+                                "importance": 0.8,
+                                "crowdedness": 0.2,
+                                "status": "phase_timing_estimate",
+                            }
+                        ],
+                        "financing_events": [],
+                        "evidence": [],
+                        "metadata": {"price_now": 10.0},
+                    },
+                )
+                feature_rows.append(
+                    {
+                        "entity_id": "AAA:1",
+                        "ticker": "AAA",
+                        "as_of": as_of,
+                        "thesis_horizon": "90d",
+                        "program_quality_pos_prior": 0.55,
+                        "program_quality_phase_score": 0.75,
+                        "program_quality_endpoint_score": 0.50,
+                        "program_quality_tam_to_cap": 0.40,
+                        "program_quality_modality_risk": 0.25,
+                        "program_quality_trial_count": 1.0,
+                        "catalyst_timing_probability": 0.70,
+                        "catalyst_timing_expected_value": 0.45,
+                        "catalyst_timing_crowdedness": 0.20,
+                        "catalyst_timing_company_event_earnings": 0.0,
+                        "commercial_execution_revenue_to_cap": -2.0,
+                        "balance_sheet_cash_to_cap": 0.25,
+                        "balance_sheet_financing_pressure": 0.0,
+                        "market_flow_momentum_3mo": 0.05,
+                        "market_flow_volatility": 0.10,
+                        "state_profile_pre_commercial": 1.0,
+                        "state_profile_commercial_launch": 0.0,
+                        "state_profile_commercialized": 0.0,
+                        "state_profile_competition_intensity": 0.82,
+                        "state_profile_floor_support_pct": 0.25,
+                        "state_profile_launch_progress_pct": 0.0,
+                        "state_profile_lifecycle_management_score": 0.1,
+                        "state_profile_pipeline_optionality_score": 0.2,
+                        "state_profile_capital_deployment_score": 0.1,
+                        "state_profile_hard_catalyst_presence": 1.0,
+                        "state_profile_precommercial_value_gap": 0.40,
+                        "meta_event_type": "phase3_readout",
+                        "meta_event_status": "phase_timing_estimate",
+                        "meta_company_state": "pre_commercial",
+                    }
+                )
+                label_rows.append(
+                    {
+                        "ticker": "AAA",
+                        "as_of": as_of,
+                        "target_return_90d": 0.10 + (idx * 0.02),
+                        "target_catalyst_success": 1,
+                    }
+                )
+
+            pd.DataFrame(feature_rows).to_parquet(store.tables_dir / "feature_vectors.parquet", index=False)
+            pd.DataFrame(label_rows).to_parquet(store.tables_dir / "labels.parquet", index=False)
+            pd.DataFrame(snapshot_rows).to_parquet(store.tables_dir / "company_snapshots.parquet", index=False)
+
+            settings = VNextSettings(
+                evaluation_min_names_per_window=1,
+                evaluation_rebalance_spacing_days=1,
+                evaluation_max_snapshot_staleness_days=30,
+                evaluation_turnover_book_weight_floor=1.0,
+            )
+            summary = WalkForwardEvaluator(store=store, settings=settings).evaluate(min_train_rows=2)
+            self.assertGreaterEqual(summary.pm_context_coverage, 1.0)
+            self.assertGreater(summary.synthetic_primary_event_rate, 0.0)
+            self.assertTrue(summary.latest_window_top_trades)
+            self.assertTrue(summary.institutional_blockers)
 
 
 if __name__ == "__main__":

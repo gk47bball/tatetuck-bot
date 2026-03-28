@@ -15,7 +15,7 @@ from .portfolio import PortfolioConstructor, aggregate_signal
 from .replay import snapshot_from_dict
 from .sources import IngestionService
 from .storage import LocalResearchStore
-from .taxonomy import event_type_priority
+from .taxonomy import event_timing_priority, event_type_priority
 
 PHASE_RANK = {
     "EARLY_PHASE1": 1,
@@ -176,14 +176,34 @@ class TatetuckPlatform:
         if not snapshot.catalyst_events:
             return None
         candidates = snapshot.catalyst_events
+        best_overall = min(
+            candidates,
+            key=lambda item: (
+                -event_timing_priority(item.status, item.expected_date, item.title),
+                -event_type_priority(item.event_type),
+                item.horizon_days,
+                -item.importance,
+            ),
+        )
         if preferred_event_type:
             typed_candidates = [item for item in snapshot.catalyst_events if item.event_type == preferred_event_type]
             if typed_candidates:
-                candidates = typed_candidates
-        return min(
-            candidates,
-            key=lambda item: (-event_type_priority(item.event_type), item.horizon_days, -item.importance),
-        )
+                best_typed = min(
+                    typed_candidates,
+                    key=lambda item: (
+                        -event_timing_priority(item.status, item.expected_date, item.title),
+                        -event_type_priority(item.event_type),
+                        item.horizon_days,
+                        -item.importance,
+                    ),
+                )
+                if event_timing_priority(best_typed.status, best_typed.expected_date, best_typed.title) >= event_timing_priority(
+                    best_overall.status,
+                    best_overall.expected_date,
+                    best_overall.title,
+                ):
+                    return best_typed
+        return best_overall
 
     def _peer_context(self, snapshot: CompanySnapshot) -> dict[str, object]:
         companies = self.store.read_table("company_snapshots")

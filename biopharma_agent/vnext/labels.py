@@ -11,7 +11,7 @@ import requests
 import yfinance as yf
 
 from .storage import LocalResearchStore
-from .taxonomy import event_type_bucket, event_type_priority
+from .taxonomy import event_timing_priority, event_type_bucket, event_type_priority
 
 
 class PriceHistoryProvider(Protocol):
@@ -308,10 +308,18 @@ class PointInTimeLabeler:
             exact["importance"] = 0.0
         if "crowdedness" not in exact.columns:
             exact["crowdedness"] = 0.50
+        if "status" not in exact.columns:
+            exact["status"] = None
+        if "title" not in exact.columns:
+            exact["title"] = None
         exact["event_priority"] = exact["event_type"].map(event_type_priority).fillna(0)
+        exact["timing_priority"] = exact.apply(
+            lambda row: event_timing_priority(row.get("status"), row.get("expected_date"), row.get("title")),
+            axis=1,
+        )
         exact = exact.sort_values(
-            ["event_priority", "importance", "expected_date_ts", "crowdedness"],
-            ascending=[False, False, True, True],
+            ["timing_priority", "event_priority", "importance", "expected_date_ts", "crowdedness"],
+            ascending=[False, False, False, True, True],
         )
         return exact.iloc[0]
 

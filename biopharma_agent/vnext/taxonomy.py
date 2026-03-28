@@ -41,6 +41,18 @@ CLINICAL_EVENT_TYPES = {
     "clinical_readout",
 }
 
+SYNTHETIC_EVENT_STATUSES = {
+    "phase_timing_estimate",
+    "calendar_estimate",
+    "estimated_from_revenue",
+}
+
+EXACT_EVENT_STATUSES = {
+    "exact_sec_filing",
+    "exact_company_calendar",
+    "exact_press_release",
+}
+
 
 def program_event_type_for_phase(phase: str) -> str:
     return PROGRAM_PHASE_EVENT_TYPE.get(phase, "clinical_readout")
@@ -60,3 +72,34 @@ def event_type_bucket(event_type: str | None) -> str:
 
 def is_clinical_event_type(event_type: str | None) -> bool:
     return bool(event_type in CLINICAL_EVENT_TYPES)
+
+
+def is_synthetic_event(status: str | None, title: str | None = None) -> bool:
+    status_lc = str(status or "").lower()
+    title_lc = str(title or "").lower()
+    if status_lc in SYNTHETIC_EVENT_STATUSES:
+        return True
+    return any(
+        marker in title_lc
+        for marker in (
+            "next milestone",
+            "estimated quarterly update",
+            "quarterly commercial update",
+            "reported commercial update",
+        )
+    )
+
+
+def is_exact_timing_event(status: str | None, expected_date: str | None, title: str | None = None) -> bool:
+    status_lc = str(status or "").lower()
+    if status_lc in EXACT_EVENT_STATUSES:
+        return bool(expected_date)
+    return bool(expected_date) and not is_synthetic_event(status, title)
+
+
+def event_timing_priority(status: str | None, expected_date: str | None, title: str | None = None) -> int:
+    if is_exact_timing_event(status, expected_date, title):
+        return 2
+    if expected_date:
+        return 1 if not is_synthetic_event(status, title) else 0
+    return -1

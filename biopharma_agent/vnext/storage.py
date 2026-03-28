@@ -9,6 +9,7 @@ from typing import Any, Iterable
 import pandas as pd
 
 from .entities import CompanySnapshot, ExperimentRecord, FeatureVector, ModelPrediction, PortfolioRecommendation, SignalArtifact
+from .taxonomy import is_exact_timing_event, is_synthetic_event
 
 try:
     import duckdb
@@ -71,31 +72,31 @@ class LocalResearchStore:
         path = self.tables_dir / f"{table_name}.parquet"
         if not rows:
             if not path.exists():
-                pd.DataFrame().to_parquet(path, index=False)
+                self._write_parquet(path, pd.DataFrame())
             return path
         frame = self._normalize_frame(pd.DataFrame(rows))
         if path.exists():
-            existing = self._normalize_frame(pd.read_parquet(path))
+            existing = self._normalize_frame(self._read_parquet_table(path))
             frame = pd.concat([existing, frame], ignore_index=True)
             frame = frame.drop_duplicates()
-        frame.to_parquet(path, index=False)
+        self._write_parquet(path, frame)
         return path
 
     def read_table(self, table_name: str) -> pd.DataFrame:
         path = self.tables_dir / f"{table_name}.parquet"
         if not path.exists():
             return pd.DataFrame()
-        return pd.read_parquet(path)
+        return self._read_parquet_table(path)
 
     def replace_table(self, table_name: str, rows: Iterable[dict[str, Any]]) -> Path:
         rows = list(rows)
         path = self.tables_dir / f"{table_name}.parquet"
         if not rows:
-            pd.DataFrame().to_parquet(path, index=False)
+            self._write_parquet(path, pd.DataFrame())
             return path
         frame = self._normalize_frame(pd.DataFrame(rows))
         frame = frame.drop_duplicates()
-        frame.to_parquet(path, index=False)
+        self._write_parquet(path, frame)
         return path
 
     def write_snapshot(self, snapshot: CompanySnapshot) -> None:
@@ -106,6 +107,7 @@ class LocalResearchStore:
         program_rows: list[dict[str, Any]] = []
         trial_rows: list[dict[str, Any]] = []
         catalyst_rows: list[dict[str, Any]] = []
+        event_tape_rows: list[dict[str, Any]] = []
         financing_rows: list[dict[str, Any]] = []
 
         for program in snapshot.programs:
@@ -175,6 +177,19 @@ class LocalResearchStore:
                     "status": catalyst.status,
                 }
             )
+            event_tape_rows.append(
+                {
+                    "ticker": snapshot.ticker,
+                    "as_of": snapshot.as_of,
+                    "event_id": catalyst.event_id,
+                    "event_type": catalyst.event_type,
+                    "title": catalyst.title,
+                    "event_timestamp": catalyst.expected_date,
+                    "status": catalyst.status,
+                    "timing_exact": is_exact_timing_event(catalyst.status, catalyst.expected_date, catalyst.title),
+                    "timing_synthetic": is_synthetic_event(catalyst.status, catalyst.title),
+                }
+            )
 
         for financing in snapshot.financing_events:
             financing_rows.append(
@@ -193,7 +208,26 @@ class LocalResearchStore:
         self.append_records("programs", program_rows)
         self.append_records("trials", trial_rows)
         self.append_records("catalysts", catalyst_rows)
+        self.append_records("event_tape", event_tape_rows)
         self.append_records("financing_events", financing_rows)
+        self.append_records(
+            "universe_membership",
+            [
+                {
+                    "ticker": snapshot.ticker,
+                    "company_name": snapshot.company_name,
+                    "as_of": snapshot.as_of,
+                    "membership_source": snapshot.metadata.get("history_source")
+                    or snapshot.metadata.get("data_source")
+                    or "snapshot_archive",
+                    "is_delisted": bool(snapshot.metadata.get("is_delisted", False)),
+                    "has_exact_event": any(
+                        is_exact_timing_event(event.status, event.expected_date, event.title)
+                        for event in snapshot.catalyst_events
+                    ),
+                }
+            ],
+        )
 
     def write_feature_vectors(self, feature_vectors: list[FeatureVector]) -> None:
         self.append_records("feature_vectors", [item.to_row() for item in feature_vectors])
@@ -245,6 +279,34 @@ class LocalResearchStore:
                     else value
                 )
         return frame
+
+    def _read_parquet_table(self, path: Path) -> pd.DataFrame:
+        try:
+            return pd.read_parquet(path)
+        except Exception:
+            self._quarantine_corrupt_table(path)
+            return pd.DataFrame()
+
+    @staticmethod
+    def _write_parquet(path: Path, frame: pd.DataFrame) -> None:
+        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+        try:
+            frame.to_parquet(tmp_path, index=False)
+            os.replace(tmp_path, path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+    @staticmethod
+    def _quarantine_corrupt_table(path: Path) -> None:
+        if not path.exists():
+            return
+        candidate = path.with_name(f"{path.stem}.corrupt{path.suffix}")
+        counter = 1
+        while candidate.exists():
+            candidate = path.with_name(f"{path.stem}.corrupt{counter}{path.suffix}")
+            counter += 1
+        path.replace(candidate)
 
     def duckdb_connection(self):
         if duckdb is None:
