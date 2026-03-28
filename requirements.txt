@@ -3,3 +3,4 @@ google-genai
 yfinance
 pydantic
 python-dotenv
+discord.py>=2.3.2
