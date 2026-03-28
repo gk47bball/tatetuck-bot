@@ -125,6 +125,21 @@ def build_guide_embed() -> discord.Embed:
     return embed
 
 
+async def send_and_optionally_pin_guide(channel: discord.abc.Messageable) -> tuple[discord.Message | None, str]:
+    guide_embed = build_guide_embed()
+    message = await channel.send(embed=guide_embed)
+    pin_status = "posted"
+    try:
+        if isinstance(message.channel, discord.TextChannel):
+            await message.pin(reason="Pinned Tatetuck Bot guide")
+            pin_status = "posted and pinned"
+    except discord.Forbidden:
+        pin_status = "posted but not pinned (missing Manage Messages permission)"
+    except discord.HTTPException:
+        pin_status = "posted but pinning failed"
+    return message, pin_status
+
+
 def build_bot() -> commands.Bot:
     token = get_discord_token()
     if not token:
@@ -299,6 +314,27 @@ def build_bot() -> commands.Bot:
     async def guide(ctx):
         await ctx.send(embed=build_guide_embed())
 
+    @bot.command(name="channelid")
+    async def channelid(ctx):
+        await ctx.send(f"Current channel ID: `{ctx.channel.id}`")
+
+    @bot.command(name="setup")
+    async def setup(ctx):
+        status_msg = await ctx.send("Setting up the Tatetuck channel guide...")
+        try:
+            _message, pin_status = await send_and_optionally_pin_guide(ctx.channel)
+        except Exception as exc:
+            await status_msg.edit(content=f"❌ Setup failed: {type(exc).__name__}: {exc}")
+            return
+
+        await status_msg.edit(
+            content=(
+                f"✅ Tatetuck setup {pin_status} in <#{ctx.channel.id}>.\n"
+                f"Channel ID: `{ctx.channel.id}`\n"
+                "If you want automated morning posts here, set `DISCORD_CHANNEL_ID` to that value."
+            )
+        )
+
     @bot.command(name="status")
     async def status(ctx):
         loop = asyncio.get_running_loop()
@@ -336,6 +372,8 @@ def build_bot() -> commands.Bot:
         embed.add_field(name="`!analyze TICKER`", value="Build a tear sheet for one biotech name.", inline=False)
         embed.add_field(name="`!top5`", value="Show the current top benchmark ideas.", inline=False)
         embed.add_field(name="`!guide`", value="Show the layman bot guide and how to read the outputs.", inline=False)
+        embed.add_field(name="`!setup`", value="Post the guide in the current channel, try to pin it, and show the channel ID.", inline=False)
+        embed.add_field(name="`!channelid`", value="Show the current Discord channel ID.", inline=False)
         embed.add_field(name="`!status`", value="Show research-engine health and readiness.", inline=False)
         await ctx.send(embed=embed)
 

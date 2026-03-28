@@ -67,5 +67,12 @@ strongest biotech setups and explain why they rank where they do.
 - `!guide`
   Show the plain-English version of how the bot works.
 
+- `!setup`
+  Post the guide in the current Discord channel, try to pin it, and show the
+  channel ID for configuration.
+
+- `!channelid`
+  Show the current Discord channel ID.
+
 - `!status`
   Show research-engine readiness and health.

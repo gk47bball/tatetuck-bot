@@ -95,6 +95,8 @@ Once online, the bot supports:
 - `!analyze TICKER`
 - `!top5`
 - `!guide`
+- `!setup`
+- `!channelid`
 - `!status`
 
 ## Notes
