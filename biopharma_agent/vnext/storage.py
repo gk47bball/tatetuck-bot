@@ -17,13 +17,14 @@ except Exception:  # pragma: no cover - optional dependency at runtime
 
 
 DEFAULT_STORE_DIR = ".tatetuck_store"
+DEFAULT_STORE_DIR_ENV = "TATETUCK_STORE_DIR"
 
 
 class LocalResearchStore:
     """Local-first research store using Parquet tables and raw JSON payloads."""
 
     def __init__(self, base_dir: str | os.PathLike[str] | None = None):
-        self.base_dir = Path(base_dir or DEFAULT_STORE_DIR)
+        self.base_dir = Path(base_dir or os.environ.get(DEFAULT_STORE_DIR_ENV, DEFAULT_STORE_DIR))
         self.raw_dir = self.base_dir / "raw"
         self.tables_dir = self.base_dir / "tables"
         self.models_dir = self.base_dir / "models"
@@ -200,6 +201,9 @@ class LocalResearchStore:
 
     def write_event_labels(self, rows: Iterable[dict[str, Any]]) -> Path:
         return self.replace_table("event_labels", rows)
+
+    def write_pipeline_run(self, row: dict[str, Any]) -> Path:
+        return self.append_records("pipeline_runs", [row])
 
     def latest_snapshot_for(self, ticker: str) -> dict[str, Any] | None:
         table = self.read_table("company_snapshots")

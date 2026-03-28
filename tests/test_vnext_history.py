@@ -119,6 +119,25 @@ class TestVNextHistory(unittest.TestCase):
             self.assertTrue(labels["target_return_90d"].notna().all())
             self.assertTrue(event_labels["target_event_return_10d"].notna().all())
 
+    def test_labeler_anchors_base_price_on_prior_trading_day(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            snapshots = pd.DataFrame(
+                [
+                    {"ticker": "TEST", "as_of": "2025-01-04T00:00:00"},  # Saturday
+                ]
+            )
+            dates = pd.to_datetime(["2025-01-02", "2025-01-03", "2025-02-03", "2025-04-04", "2025-07-03"])
+            frame = pd.DataFrame({"close": [100.0, 110.0, 120.0, 130.0, 140.0]}, index=dates)
+            labeler = PointInTimeLabeler(
+                store=store,
+                history_provider=StubHistoryProvider({"TEST": frame}),
+            )
+            summary = labeler.materialize_labels(snapshots=snapshots, catalysts=pd.DataFrame())
+            labels = store.read_table("labels")
+            self.assertEqual(summary.snapshot_label_rows, 1)
+            self.assertAlmostEqual(labels.iloc[0]["target_return_30d"], (120.0 / 110.0) - 1.0)
+
     def test_replay_engine_rebuilds_tables_from_archived_snapshots(self):
         snapshot_payload = {
             "ticker": "TEST",

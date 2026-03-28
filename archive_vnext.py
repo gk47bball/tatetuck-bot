@@ -12,7 +12,9 @@ import time
 
 import prepare
 
-from biopharma_agent.vnext import TatetuckPlatform, archive_universe
+from biopharma_agent.vnext import TatetuckPlatform, VNextSettings, archive_universe, record_pipeline_run
+from biopharma_agent.vnext.ops import utc_now_iso
+from biopharma_agent.vnext.storage import LocalResearchStore
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,14 +43,52 @@ def resolve_universe(args: argparse.Namespace) -> list[tuple[str, str]]:
 def main() -> None:
     args = parse_args()
     universe = resolve_universe(args)
+    settings = VNextSettings.from_env()
+    store = LocalResearchStore(settings.store_dir)
+    platform = TatetuckPlatform(store=store)
+    started_at = utc_now_iso()
     start = time.time()
 
-    platform = TatetuckPlatform()
-    _, summary = archive_universe(
-        platform,
-        universe,
-        include_literature=args.include_literature,
-    )
+    try:
+        _, summary = archive_universe(
+            platform,
+            universe,
+            include_literature=args.include_literature or settings.include_literature,
+        )
+        finished_at = utc_now_iso()
+        record_pipeline_run(
+            store=store,
+            job_name="archive_vnext",
+            status="success",
+            started_at=started_at,
+            finished_at=finished_at,
+            metrics={
+                "archived_companies": summary.archived_companies,
+                "sec_enriched_companies": summary.sec_enriched_companies,
+                "snapshot_rows": summary.snapshot_rows,
+                "feature_rows": summary.feature_rows,
+                "prediction_rows": summary.prediction_rows,
+            },
+            config={
+                "ticker": args.ticker,
+                "limit": args.limit,
+                "include_literature": args.include_literature or settings.include_literature,
+                "store_dir": settings.store_dir,
+            },
+        )
+    except Exception as exc:
+        finished_at = utc_now_iso()
+        record_pipeline_run(
+            store=store,
+            job_name="archive_vnext",
+            status="failed",
+            started_at=started_at,
+            finished_at=finished_at,
+            metrics={"archived_companies": 0},
+            config={"ticker": args.ticker, "limit": args.limit, "store_dir": settings.store_dir},
+            notes=f"{type(exc).__name__}: {exc}",
+        )
+        raise
 
     print("=" * 72)
     print("  TATETUCK BOT vNEXT — SNAPSHOT ARCHIVE")

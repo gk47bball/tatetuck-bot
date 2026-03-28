@@ -115,8 +115,9 @@ class EODHDHistoryProvider:
 
 
 class YFinanceHistoryProvider:
-    def __init__(self, store: LocalResearchStore | None = None):
+    def __init__(self, store: LocalResearchStore | None = None, allow_live: bool = True):
         self.store = store or LocalResearchStore()
+        self.allow_live = allow_live
 
     def load_history(self, ticker: str, start: str, end: str) -> pd.DataFrame:
         cache_key = f"{ticker}_{start}_{end}"
@@ -129,6 +130,8 @@ class YFinanceHistoryProvider:
             frame = frame.dropna(subset=["date"]).sort_values("date")
             frame = frame.set_index("date")
             return frame[["close"]]
+        if not self.allow_live:
+            return pd.DataFrame(columns=["close"])
 
         try:
             history = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=False)
@@ -153,10 +156,11 @@ class YFinanceHistoryProvider:
 class PointInTimeLabeler:
     def __init__(self, store: LocalResearchStore | None = None, history_provider: PriceHistoryProvider | None = None):
         self.store = store or LocalResearchStore()
+        eodhd_key = os.environ.get("EODHD_API_KEY")
         self.history_provider = history_provider or CompositeHistoryProvider(
             [
                 EODHDHistoryProvider(store=self.store),
-                YFinanceHistoryProvider(store=self.store),
+                YFinanceHistoryProvider(store=self.store, allow_live=not bool(eodhd_key)),
             ]
         )
 
@@ -222,7 +226,7 @@ class PointInTimeLabeler:
                     "as_of": snapshot.as_of,
                 }
                 base_ts = pd.Timestamp(snapshot.as_of_ts).to_datetime64().astype("datetime64[ns]")
-                base_price = self._price_at_or_after(close, base_ts)
+                base_price = self._price_at_or_before(close, base_ts)
                 if base_price is None or base_price <= 0:
                     continue
 
@@ -300,9 +304,16 @@ class PointInTimeLabeler:
             return None
         return float(close.iloc[idx])
 
+    @staticmethod
+    def _price_at_or_before(close: pd.Series, timestamp: np.datetime64) -> float | None:
+        idx = close.index.values.searchsorted(timestamp, side="right") - 1
+        if idx < 0:
+            return None
+        return float(close.iloc[idx])
+
     @classmethod
     def _event_window_return(cls, close: pd.Series, event_ts: pd.Timestamp) -> float:
-        start_price = cls._price_at_or_after(
+        start_price = cls._price_at_or_before(
             close,
             (event_ts - timedelta(days=5)).to_datetime64().astype("datetime64[ns]"),
         )
