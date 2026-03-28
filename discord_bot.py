@@ -13,9 +13,16 @@ from dotenv import load_dotenv
 
 from prepare import HOLDOUT_TICKERS, TRAIN_TICKERS
 
-from biopharma_agent.vnext import TatetuckPlatform, VNextSettings, build_readiness_report
+from biopharma_agent.vnext import (
+    AlpacaPaperBroker,
+    PMExecutionPlanner,
+    TatetuckPlatform,
+    VNextSettings,
+    build_readiness_report,
+)
 from biopharma_agent.vnext.storage import LocalResearchStore
 from biopharma_agent.vnext.taxonomy import event_type_priority
+from biopharma_agent.vnext.universe import UniverseResolver
 
 
 load_dotenv()
@@ -43,7 +50,7 @@ GUIDE_OUTPUTS = (
 )
 
 GUIDE_COMMANDS = (
-    "`!analyze TICKER` for one tear sheet, `!top5` for the current best ideas, "
+    "`!analyze TICKER` for one tear sheet, `!top5` for the current best deployable ideas, "
     "`!guide` for the layman version, and `!status` for bot + research health."
 )
 
@@ -76,6 +83,9 @@ def run_self_check() -> int:
     token = get_discord_token()
     channel_id = get_target_channel_id()
     platform, settings, store = build_platform()
+    universe_resolver = UniverseResolver(store=store)
+    broker = AlpacaPaperBroker(settings=settings)
+    planner = PMExecutionPlanner(settings=settings)
     readiness = build_readiness_report(store=store, settings=settings)
 
     print("=" * 72)
@@ -148,6 +158,9 @@ def build_bot() -> commands.Bot:
 
     target_channel_id = get_target_channel_id()
     platform, settings, store = build_platform()
+    universe_resolver = UniverseResolver(store=store)
+    broker = AlpacaPaperBroker(settings=settings)
+    planner = PMExecutionPlanner(settings=settings)
 
     intents = discord.Intents.default()
     intents.message_content = True
@@ -171,18 +184,55 @@ def build_bot() -> commands.Bot:
         )
 
     async def analyze_universe():
+        universe = universe_resolver.resolve_default_universe(prefer_archive=True)
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             partial(
                 platform.analyze_universe,
-                TRAIN_TICKERS + HOLDOUT_TICKERS,
+                universe,
                 include_literature=False,
                 prefer_archive=True,
                 fallback_to_archive=True,
                 persist=False,
             ),
         )
+
+    async def build_pm_top_ideas():
+        analyses = await analyze_universe()
+        loop = asyncio.get_running_loop()
+        readiness = await loop.run_in_executor(
+            None,
+            partial(build_readiness_report, store=store, settings=settings),
+        )
+        if broker.is_configured():
+            account = await loop.run_in_executor(None, broker.account)
+            positions = await loop.run_in_executor(None, broker.positions)
+        else:
+            account = broker.simulated_account()
+            positions = []
+        plan = await loop.run_in_executor(
+            None,
+            partial(
+                planner.build_plan,
+                analyses=analyses,
+                account=account,
+                positions=positions,
+                readiness=readiness,
+            ),
+        )
+        analyses_by_symbol = {analysis.snapshot.ticker: analysis for analysis in analyses}
+        ranked_instructions = sorted(
+            [item for item in plan.instructions if item.action in {"buy", "hold"}],
+            key=lambda item: (item.scaled_target_weight, item.confidence, item.delta_notional),
+            reverse=True,
+        )
+        deployable = [
+            (instruction, analyses_by_symbol[instruction.symbol])
+            for instruction in ranked_instructions
+            if instruction.symbol in analyses_by_symbol
+        ]
+        return deployable, plan, readiness
 
     def resolve_channel() -> discord.abc.Messageable | None:
         channel = None
@@ -390,22 +440,26 @@ def build_bot() -> commands.Bot:
         return embed
 
     async def generate_top5_embed():
-        analyses = await analyze_universe()
-        ranked = sorted(
-            analyses,
-            key=lambda item: (item.portfolio.target_weight, item.signal.confidence, item.signal.expected_return),
-            reverse=True,
-        )
-        top_picks = ranked[:5]
+        deployable, plan, readiness = await build_pm_top_ideas()
+        top_picks = deployable[:5]
         if not top_picks:
             return None
 
         embed = discord.Embed(
-            title="Morning Biotech Brief: Top 5 Alpha Signals",
-            description="Highest ranked names from the Tatetuck event-driven benchmark scan.",
+            title="Morning Biotech Brief: Top Deployable Ideas",
+            description="Names that currently clear the PM execution planner, not just the raw research ranker.",
             color=0x3498DB,
         )
-        for index, analysis in enumerate(top_picks, 1):
+        embed.add_field(
+            name="Planner Context",
+            value=(
+                f"Readiness: `{readiness.status}` | "
+                f"Deployable notional: `${plan.deployable_notional:,.0f}` | "
+                f"Selected: `{len(plan.selected_symbols)}`"
+            ),
+            inline=False,
+        )
+        for index, (instruction, analysis) in enumerate(top_picks, 1):
             primary_event = primary_catalyst(analysis.snapshot, analysis.signal.primary_event_type)
             event_line = (
                 f"**Event**: {primary_event.event_type} on {primary_event.expected_date}"
@@ -416,8 +470,9 @@ def build_bot() -> commands.Bot:
             embed.add_field(
                 name=f"#{index} — {analysis.snapshot.ticker}",
                 value=(
+                    f"**Action**: {instruction.action} | **Planner Profile**: {instruction.execution_profile}\n"
                     f"**Confidence**: {analysis.signal.confidence * 100:.1f}% | "
-                    f"**Target Weight**: {analysis.portfolio.target_weight:.1f}%\n"
+                    f"**Target Weight**: {instruction.scaled_target_weight:.1f}%\n"
                     f"**Expected Return**: {analysis.signal.expected_return * 100:+.1f}% | "
                     f"**Scenario**: {analysis.portfolio.scenario}\n"
                     f"{state_line}\n"
@@ -460,11 +515,11 @@ def build_bot() -> commands.Bot:
 
     @bot.command(name="top5")
     async def top5(ctx):
-        status_msg = await ctx.send("🚀 Running the benchmark scan. This usually takes a few seconds...")
+        status_msg = await ctx.send("🚀 Running the PM deployment scan. This usually takes a few seconds...")
         try:
             embed = await generate_top5_embed()
         except Exception as exc:
-            await status_msg.edit(content=f"❌ Benchmark scan failed: {type(exc).__name__}: {exc}")
+            await status_msg.edit(content=f"❌ PM deployment scan failed: {type(exc).__name__}: {exc}")
             return
         if embed is None:
             await status_msg.edit(content="❌ No ranked ideas were available.")
@@ -531,7 +586,7 @@ def build_bot() -> commands.Bot:
             color=0x2ECC71,
         )
         embed.add_field(name="`!analyze TICKER`", value="Build a tear sheet for one biotech name.", inline=False)
-        embed.add_field(name="`!top5`", value="Show the current top benchmark ideas.", inline=False)
+        embed.add_field(name="`!top5`", value="Show the current top deployable PM ideas.", inline=False)
         embed.add_field(name="`!guide`", value="Show the layman bot guide and how to read the outputs.", inline=False)
         embed.add_field(name="`!setup`", value="Post the guide in the current channel, try to pin it, and show the channel ID.", inline=False)
         embed.add_field(name="`!channelid`", value="Show the current Discord channel ID.", inline=False)
