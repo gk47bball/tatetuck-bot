@@ -1,2 +1,12 @@
-venv/\nrun.log\nresults.tsv\n__pycache__/\n*.pyc\n.env\nreport_*.md
+venv/
+run.log
+results.tsv
+__pycache__/
+*.pyc
+.env
+report_*.md
 .data_cache/
+.tatetuck_store/
+debug_signals.log
+inspect_subset.log
+vnext_run.log

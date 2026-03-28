@@ -1,55 +1,80 @@
 # Tatetuck Bot
 
-**Tatetuck Bot** is a production-grade, autonomous quantitative research engine designed for the biopharma sector. Inspired by Andrej Karpathy's "LLM AutoResearch" pattern, the bot iterates over a valuation strategy, scores biopharma equities based on clinical and financial fundamentals, evaluates the performance against real-world market data, and systematically improves its own logic.
+**Tatetuck Bot** is now a local-first, event-driven biopharma alpha platform.
+It keeps the legacy CLI and Discord surfaces, but the research core has been
+rebuilt around a typed company-program-catalyst graph, persisted research
+artifacts, feature generation, model scoring, and a walk-forward evaluator.
 
-## Overview
+## What Changed
 
-The core of the engine is the **Alpha Stack v13 Breakthrough Edition**, which achieves phenomenal rank correlation and directional accuracy when predicting trailing market performance across an expanded benchmark index of 41 biopharma companies.
+- `prepare.py` and `evaluate.py` remain available as legacy compatibility harnesses.
+- The new primary platform lives under `biopharma_agent/vnext/`.
+- Current company analysis flows through a `TatetuckPlatform` facade that:
+  - ingests and stores raw payloads and normalized snapshots
+  - builds `CompanySnapshot`, `Program`, `CatalystEvent`, and `FinancingEvent`
+  - generates event-driven feature vectors
+  - scores them with a rules + ensemble prediction layer
+  - emits signal artifacts and portfolio recommendations
+- The local store uses **Parquet** for tables and now exposes an optional
+  **DuckDB** query surface.
 
-Key features include:
-*   **Dynamic POS (Probability of Success)**: Adjusts base phase probabilities using active trial counts, maximum single-trial enrollment, and PubMed literature volume.
-*   **Commercial Revenue Differentiation**: Applies distinct NPV algorithms based on commercial vs. pure clinical stage metrics.
-*   **Portfolio Risk Scaling**: Explicitly outputs `recommended_allocation` and `risk_parity_allocation` limits based on volatility, market cap liquidity penalties, and pipeline-concentration dampeners.
-*   **Alpha Stack (5 Orthogonal Sub-signals)**:
-    1.  **Fundamental Value**: Risk-adjusted NPV (rNPV) vs. Market Cap.
-    2.  **Clinical Momentum**: Conviction indexing based on enrollment flow and literature coverage (with heavy concentration penalties).
-    3.  **FDA Safety Composite**: Serious adverse events scaled by total enrollment.
-    4.  **Risk-Adjusted Financial Health**: Net Cash / Enterprise Value scaling.
-    5.  **Market Regime & Autocorrelation**: Macro regime proxy using momentum and volatility interaction.
+## Main Entry Points
 
-## Validation & Performance Highlights
+- `main.py`
+  Generates a company research report through the vNext compatibility facade.
+- `discord_bot.py`
+  Serves event-driven tear sheets and benchmark scans from the vNext platform.
+- `evaluate.py`
+  Legacy scorer for the original heuristic benchmark.
+- `evaluate_vnext.py`
+  New platform smoke path for ingestion, ranking, and walk-forward evaluation.
 
-On the latest v13 benchmark across 41 tickers (14-train, 27-holdout blended evaluation), the agent recorded:
-*   **Valuation Error**: 0.0369
-*   **Directional Accuracy**: 92.0%
-*   **Rank Correlation**: 0.993
-*   **Holdout Error Gap**: 0.01
+## Storage
 
-The engine successfully transformed a baseline heuristic model (0.57 error) into a highly rigorous, non-linear scoring framework capable of accurately stratifying the biopharma ecosystem.
+The new local research store is written to `.tatetuck_store/` and contains:
 
-## Installation & Setup
+- `raw/`
+  Source payloads and compatibility captures
+- `tables/`
+  Normalized Parquet tables for snapshots, programs, trials, catalysts,
+  financing events, feature vectors, and predictions
+- `models/`
+  Serialized model artifacts
+- `experiments/`
+  Experiment registry entries
 
-1.  **Clone the Repository**
-2.  **Create a Virtual Environment**:
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate
-    ```
-3.  **Install Requirements**:
-    ```bash
-    pip install -r requirements.txt
-    ```
-4.  **Run the Research Loop**:
-    ```bash
-    python main.py
-    ```
+## Installation
 
-## Files & Architecture
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-*   `strategy.py`: The single "brain" file the agent modifies. Contains the Alpha Stack logic.
-*   `prepare.py`: The immutable data-gathering and evaluation harness. Fetches real-time data from ClinicalTrials.gov, openFDA, Yahoo Finance, and PubMed.
-*   `evaluate.py`: The execution script that scores the benchmark tickers against strategy performance.
-*   `program.md`: The agent's guiding instructions.
-*   `METHODOLOGY.md`: Detailed breakdown of the quantitative methodologies driving the Alpha Stack.
+## Usage
 
-*Built for advanced theoretical finance and biopharma quantitative analysis.*
+Legacy-style report:
+
+```bash
+python main.py --ticker CRSP
+```
+
+Legacy benchmark:
+
+```bash
+python evaluate.py > run.log 2>&1
+```
+
+vNext platform run:
+
+```bash
+python evaluate_vnext.py > vnext_run.log 2>&1
+```
+
+## Notes
+
+- The new walk-forward evaluator expects **archived snapshots over time**. On a
+  fresh store it will ingest data and rank ideas successfully, but historical
+  backtest metrics will remain empty until enough dated snapshots accumulate.
+- LLM synthesis is still optional. When present, it is treated as structured
+  research support rather than an opaque final scoring engine.

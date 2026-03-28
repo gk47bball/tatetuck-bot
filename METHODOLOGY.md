@@ -1,45 +1,107 @@
-# Alpha Stack v2 Methodology
+# Tatetuck vNext Methodology
 
-The **Alpha Stack v2** operates entirely within `strategy.py`. It is a sophisticated, pure-math (no external ML libs) multi-factor model for biopharma valuation. The entire signal pipeline is meticulously bound and scaled to prevent extreme outliers while retaining deep variance.
+## 1. Core Worldview
 
-## 1. Dynamic POS (Probability of Success)
-Instead of static phase-transition statistics, the model dynamically boosts or penalizes POS:
-*   **Trial Volume Boost**: Modeled via `math.log10(phase_trial_count + 1)`. Companies running multiple concurrent trials in the same phase represent higher conviction.
-*   **Enrollment Power**: Identifies the maximum enrollment of any single active trial. Large pivotal trials represent massive capital commitment, mapped via logarithmic scaling.
-*   **Literature Backing**: Normalizes the volume of PubMed publications related to the active pipeline, acting as a proxy for academic and peer-reviewed conviction.
-*   **Diversity Index**: Rewards pipelines targeting multiple unique conditions (shots on goal).
+The platform no longer treats a biotech as a single scalar score. It models a
+company as a graph of:
 
-## 2. Advanced rNPV & Commercial Differentiation
-*   **Clinical Stage**: Values assets through a standard discounted cash flow (DCF), mapping theoretical peak revenue scaled by disease-specific penetration assumptions, burning capital until theoretical launch.
-*   **Commercial Stage**: Cross-references trailing `totalRevenue`. If revenue exceeds a commercial threshold (e.g., $25M), the valuation shifts to a growth-perpetuity model representing actual cashflow ramps rather than theoretical clinical probabilities.
+- `CompanySnapshot`
+- `Program`
+- `Trial`
+- `ApprovedProduct`
+- `CatalystEvent`
+- `FinancingEvent`
 
-## 3. The 5 Orthogonal Sub-Signals
-The engine outputs a discrete signal bounded between `[-1.0, 1.0]`. It achieves this by squashing five independent sub-signals:
+This lets Tatetuck reason about late-stage programs, commercial assets,
+financing pressure, and the timing and importance of catalysts inside the same
+research artifact.
 
-1.  **Fundamental Value**: Focuses on `rNPV / Market Cap`. Bounded via a sigmoid function (`2.0 / (1.0 + math.exp(-x)) - 1.0`).
-2.  **Clinical Score**: Heavy interaction term combining raw enrollment mass and literature, normalized around typical biotech baselines to achieve a zero-centered output.
-3.  **FDA Safety Penalty**: Isolates `serious` and `death` adverse events from openFDA, strongly divided by the enrollment base to calculate an actual risk-ratio. Mapped through an exponential decay penalty.
-4.  **Financial Health**: Computes `(Cash - Debt) / Enterprise Value`. Shifted to a 0.30 baseline (typical clinical biotech ratio) to effectively reward robust balance sheets and penalize heavy leverage.
-5.  **Market Regime & Autocorrelation**: Uses a trailing 6-month continuous return proxy and 3-month momentum interlocked with linear volatility decay.
+## 2. Data Platform
 
-## 4. Signal Synthesis & Risk Parity Allocation
-The signals are blended using conviction-weighted multipliers. The returned dictionary includes an `alpha_breakdown` mapping every specific signal component for full diagnostic transparency.
+The vNext platform is local-first:
 
-Furthermore, the model layers explicit portfolio-sizing adjustments directly to the output:
-*   **Pipeline Concentration Dampener**: Prevents overexposure to binary event risk in single-asset heavy biotech pipelines.
-*   **Risk-Parity Weighting**: Inversely weights `conviction_weight` relative to 90-day realized volatility, attempting to enforce a targeted 25% annualized volatility allocation limit. Capital distributions are artificially constrained at a 15% maximum single-name exposure limit.
+- raw payloads are persisted to `.tatetuck_store/raw/`
+- normalized tables are written as Parquet in `.tatetuck_store/tables/`
+- model artifacts and experiment metadata are stored alongside them
+- DuckDB can query the normalized Parquet tables directly
 
-## 5. Forward-Testing & Walk-Forward Validation
-While the primary `evaluate.py` harness scores recent 6-month trailing outcomes, the Alpha Stack framework operates on forward-normalized metrics suitable for recursive Walk-Forward optimization.
+`prepare.py` is still used as the compatibility ingestion layer, but scoring and
+evaluation are intended to operate from the local store rather than from live
+point-in-time API calls.
 
-### Simulated Portfolio Metrics
-During extended Walk-Forward validation windows matching fundamental SEC 10-Q reporting sequences (90-day rebalancing offsets):
-*   **Expected Sharpe Ratio Improvement**: By mapping allocations directly via `risk_parity_allocation`, theoretical simulated portfolios significantly reduce max drawdowns (targeting `< 0.15` max_dd per individual allocation node).
-*   **Overfitting Guardrails**: Divergences > 0.15 between Train / Holdout sets immediately flag regime shifts in clinical pricing models, dynamically prompting strategy iteration loops.
+## 3. Feature Families
 
-### V13 Evaluation Benchmark Metrics
-Across a 41-ticker universe (14-train, 27-holdout) the current risk-parity validation yields:
-*   **Valuation Error**: 0.0369
-*   **Directional Accuracy**: 92.0%
-*   **Rank Correlation**: 0.993
-*   **Holdout Error Gap**: 0.01
+The event-driven feature engine is split into five families:
+
+1. `program_quality`
+   POS priors, phase score, enrollment scale, endpoint strength, modality risk,
+   and TAM-to-market-cap context.
+2. `catalyst_timing`
+   Nearest milestone horizon, event probability, event importance, and
+   crowdedness.
+3. `commercial_execution`
+   Revenue scale, revenue-to-market-cap, approved product presence, and growth
+   signal.
+4. `balance_sheet`
+   Cash-to-cap, debt-to-cap, runway months, and financing pressure.
+5. `market_flow`
+   3-month momentum and volatility only. The vNext feature engine does not use
+   the legacy trailing-6-month target as an input feature.
+
+## 4. Model Layer
+
+The prediction stack is a hybrid:
+
+- a transparent rule model provides baseline expected return and catalyst
+  success estimates
+- an optional sklearn ensemble can be trained from archived snapshots when the
+  store has enough historical labeled rows
+- predictions are surfaced as `ModelPrediction` and aggregated into a
+  `SignalArtifact`
+
+Each signal artifact exposes:
+
+- `expected_return`
+- `catalyst_success_prob`
+- `confidence`
+- `crowding_risk`
+- `financing_risk`
+- `thesis_horizon`
+
+## 5. Portfolio Construction
+
+Portfolio recommendations are thesis-aware rather than simple score sorts. The
+constructor blends expected return, confidence, crowding, and financing risk to
+emit:
+
+- stance
+- target weight
+- max weight
+- scenario label
+- risk flags
+
+Scenario labels currently include:
+
+- `pre-catalyst long`
+- `watchlist only`
+- `commercial compounder`
+- `avoid due to financing`
+- `pairs candidate`
+
+## 6. Evaluation
+
+The new primary evaluator is `evaluate_vnext.py`, backed by the
+`WalkForwardEvaluator`.
+
+It is designed for:
+
+- `30d`, `90d`, and `180d` forward returns
+- binary catalyst-success labels
+- rolling time-based splits only
+- leakage audits
+- cross-sectional and portfolio metrics
+
+Because the store is snapshot-based, meaningful walk-forward results require
+multiple archived dates over time. On a fresh store, Tatetuck can ingest and
+rank names immediately, but the backtest metrics remain intentionally empty
+until enough dated observations accumulate.
