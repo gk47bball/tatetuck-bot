@@ -57,13 +57,13 @@ async def analyze(ctx, ticker: str = None):
             await status_msg.edit(content=f"❌ **Analysis Failed for {ticker}**: {data.get('error', 'No data found.')}")
             return
 
-        # Score the company using Alpha Stack v13
+        # Score the company using Alpha Stack v18
         score = score_company(data)
 
         # Assemble the Tear Sheet Embed
         embed = discord.Embed(
             title=f"Tatetuck Analyst Tear Sheet: {ticker}",
-            description="Alpha Stack v13 Breakthrough Profile",
+            description="Alpha Stack v18 (Breakthrough Edition) Profile",
             color=0x2ecc71 if score["signal"] > 0 else 0xe74c3c
         )
 
@@ -144,7 +144,7 @@ async def top5(ctx):
             inline=False
         )
         
-    embed.set_footer(text="Tatetuck Bot - Alpha Stack v13")
+    embed.set_footer(text="Tatetuck Bot - Alpha Stack v18")
     await status_msg.edit(content=None, embed=embed)
 
 @bot.command(name="help")
