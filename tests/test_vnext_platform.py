@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from dataclasses import asdict
 from unittest.mock import patch
 
 import pandas as pd
@@ -220,6 +221,18 @@ class TestVNextPlatform(unittest.TestCase):
             self.assertGreaterEqual(summary.feature_rows, 1)
             self.assertGreaterEqual(summary.prediction_rows, 1)
             self.assertEqual(summary.top_ideas[0]["ticker"], "TEST")
+
+    @patch("biopharma_agent.vnext.facade.IngestionService.ingest_company", side_effect=RuntimeError("offline"))
+    def test_facade_falls_back_to_archived_snapshot(self, _mock_ingest):
+        snapshot = build_company_snapshot(make_raw_company())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.write_raw_payload("snapshots", "TEST_2025-01-01T00-00-00+00-00", asdict(snapshot))
+            platform = TatetuckPlatform(store=store)
+            analysis = platform.analyze_ticker("TEST", "Test Therapeutics", include_literature=False, fallback_to_archive=True)
+            self.assertEqual(analysis.snapshot.ticker, "TEST")
+            self.assertEqual(analysis.metadata["analysis_source"], "archive_fallback")
+            self.assertIn("live_ingestion_error", analysis.snapshot.metadata)
 
     @patch("biopharma_agent.vnext.sources.fetch_legacy_snapshot")
     @patch("biopharma_agent.vnext.sources.CorporateCalendarClient.fetch_company_calendar")

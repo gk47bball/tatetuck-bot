@@ -9,6 +9,7 @@ from .entities import CompanyAnalysis, CompanySnapshot, ModelPrediction
 from .features import FeatureEngineer
 from .models import EventDrivenEnsemble
 from .portfolio import PortfolioConstructor, aggregate_signal
+from .replay import snapshot_from_dict
 from .sources import IngestionService
 from .storage import LocalResearchStore
 
@@ -28,8 +29,32 @@ class TatetuckPlatform:
         company_name: str | None = None,
         include_literature: bool = True,
         as_of: datetime | None = None,
+        prefer_archive: bool = False,
+        fallback_to_archive: bool = True,
     ) -> CompanyAnalysis:
-        snapshot = self.ingestion.ingest_company(ticker, company_name, as_of=as_of)
+        snapshot: CompanySnapshot | None = None
+        analysis_source = "live"
+
+        if prefer_archive:
+            snapshot = self._load_archived_snapshot(ticker)
+            if snapshot is not None:
+                analysis_source = "archive"
+
+        if snapshot is None:
+            try:
+                snapshot = self.ingestion.ingest_company(ticker, company_name, as_of=as_of)
+            except Exception as exc:
+                if not fallback_to_archive:
+                    raise
+                snapshot = self._load_archived_snapshot(ticker)
+                if snapshot is None:
+                    raise
+                snapshot.metadata["live_ingestion_error"] = f"{type(exc).__name__}: {exc}"
+                analysis_source = "archive_fallback"
+            else:
+                analysis_source = "live"
+
+        self.store.write_snapshot(snapshot)
         feature_vectors = self.features.build_all(snapshot)
         self.store.write_feature_vectors(feature_vectors)
 
@@ -50,7 +75,10 @@ class TatetuckPlatform:
             feature_vectors=feature_vectors,
             program_predictions=program_predictions,
             literature_review=literature_review,
-            metadata={"store_dir": str(self.store.base_dir)},
+            metadata={
+                "store_dir": str(self.store.base_dir),
+                "analysis_source": analysis_source,
+            },
         )
 
     def analyze_universe(
@@ -58,6 +86,8 @@ class TatetuckPlatform:
         universe: Iterable[tuple[str, str]],
         include_literature: bool = False,
         as_of: datetime | None = None,
+        prefer_archive: bool = False,
+        fallback_to_archive: bool = True,
     ) -> list[CompanyAnalysis]:
         results: list[CompanyAnalysis] = []
         for ticker, company_name in universe:
@@ -67,9 +97,17 @@ class TatetuckPlatform:
                     company_name=company_name,
                     include_literature=include_literature,
                     as_of=as_of,
+                    prefer_archive=prefer_archive,
+                    fallback_to_archive=fallback_to_archive,
                 )
             )
         return results
+
+    def _load_archived_snapshot(self, ticker: str) -> CompanySnapshot | None:
+        payload = self.store.read_latest_raw_payload("snapshots", f"{ticker}_")
+        if not isinstance(payload, dict):
+            return None
+        return snapshot_from_dict(payload)
 
     def _aggregate_company_signal(self, snapshot: CompanySnapshot, predictions: list[ModelPrediction]):
         rationale = [
