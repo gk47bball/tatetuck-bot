@@ -247,8 +247,17 @@ def score_company(data: dict) -> dict:
                     alpha_fin * 0.05 + 
                     alpha_mom * 0.90)
     
-    # Final clamping to ensure output is strictly within [-1.0, 1.0] bounds
-    final_signal = max(-1.0, min(1.0, total_signal))
+    # -------------------------------------------------------------
+    # REGULARIZATION: Macro Regime-Shift Dampener
+    # -------------------------------------------------------------
+    # If standard market volatility is exceptionally high (bear/panic regime), 
+    # we aggressively dampen conviction across all assets to simulate a shift to cash.
+    regime_dampener = 1.0
+    if vol is not None and vol > 0.08: # >8% daily vol is extreme market stress
+        regime_dampener = 0.5
+    
+    # Apply regime suppression to the base multi-factor signal
+    final_signal = max(-1.0, min(1.0, total_signal * regime_dampener))
     
     # =========================================================================
     # PORTFOLIO CONSTRUCTION & RISK SIZING
@@ -268,11 +277,18 @@ def score_company(data: dict) -> dict:
     conviction_weight = raw_conviction * vol_penalty * liq_modifier * safety_modifier
     conviction_weight = max(0.0, min(1.0, conviction_weight))
     
+    # Calculate an explicit Risk-Parity Allocation (inverse volatility weighting normalized to target exposure)
+    # Assumes a target sub-portfolio volatility of ~25% annualized.
+    base_alloc = conviction_weight * 10.0
+    risk_parity_allocation = base_alloc * (0.03 / max(vol, 0.01)) if vol is not None else base_alloc * 0.5
+    risk_parity_allocation = max(0.0, min(15.0, risk_parity_allocation)) # Cap strictly at 15% max position
+    
     return {
         "signal": final_signal,
         "pos": pos,
         "rnpv": rnpv,
         "alpha_breakdown": alpha_breakdown,
         "conviction_weight": conviction_weight,
-        "recommended_allocation": round(conviction_weight * 10.0, 2) # Assume max 10% single-position limit
+        "recommended_allocation": round(base_alloc, 2),
+        "risk_parity_allocation": round(risk_parity_allocation, 2)
     }

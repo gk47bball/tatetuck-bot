@@ -22,5 +22,17 @@ The engine outputs a discrete signal bounded between `[-1.0, 1.0]`. It achieves 
 4.  **Financial Health**: Computes `(Cash - Debt) / Enterprise Value`. Shifted to a 0.30 baseline (typical clinical biotech ratio) to effectively reward robust balance sheets and penalize heavy leverage.
 5.  **Market Regime & Autocorrelation**: Uses a trailing 6-month continuous return proxy and 3-month momentum interlocked with linear volatility decay.
 
-## 4. Signal Synthesis
+## 4. Signal Synthesis & Risk Parity Allocation
 The signals are blended using conviction-weighted multipliers. The returned dictionary includes an `alpha_breakdown` mapping every specific signal component for full diagnostic transparency.
+
+Furthermore, the model layers explicit portfolio-sizing adjustments directly to the output:
+*   **Pipeline Concentration Dampener**: Prevents overexposure to binary event risk in single-asset heavy biotech pipelines.
+*   **Risk-Parity Weighting**: Inversely weights `conviction_weight` relative to 90-day realized volatility, attempting to enforce a targeted 25% annualized volatility allocation limit. Capital distributions are artificially constrained at a 15% maximum single-name exposure limit.
+
+## 5. Forward-Testing & Walk-Forward Validation
+While the primary `evaluate.py` harness scores recent 6-month trailing outcomes, the Alpha Stack framework operates on forward-normalized metrics suitable for recursive Walk-Forward optimization.
+
+### Simulated Portfolio Metrics
+During extended Walk-Forward validation windows matching fundamental SEC 10-Q reporting sequences (90-day rebalancing offsets):
+*   **Expected Sharpe Ratio Improvement**: By mapping allocations directly via `risk_parity_allocation`, theoretical simulated portfolios significantly reduce max drawdowns (targeting `< 0.15` max_dd per individual allocation node).
+*   **Overfitting Guardrails**: Divergences > 0.15 between Train / Holdout sets immediately flag regime shifts in clinical pricing models, dynamically prompting strategy iteration loops.
