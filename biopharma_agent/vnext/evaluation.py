@@ -9,6 +9,7 @@ from .entities import ModelPrediction, SignalArtifact
 from .labels import PointInTimeLabeler
 from .models import EventDrivenEnsemble
 from .portfolio import PortfolioConstructor, aggregate_signal
+from .settings import VNextSettings
 from .storage import LocalResearchStore
 from .taxonomy import event_type_bucket
 
@@ -43,8 +44,9 @@ class WalkForwardSummary:
 
 
 class WalkForwardEvaluator:
-    def __init__(self, store: LocalResearchStore | None = None):
+    def __init__(self, store: LocalResearchStore | None = None, settings: VNextSettings | None = None):
         self.store = store or LocalResearchStore()
+        self.settings = settings or VNextSettings.from_env()
         self.labeler = PointInTimeLabeler(store=self.store)
         self.portfolio = PortfolioConstructor()
 
@@ -111,7 +113,7 @@ class WalkForwardEvaluator:
             )
 
         frame = frame.sort_values(["evaluation_date", "as_of"])
-        unique_dates = sorted(frame["evaluation_date"].drop_duplicates().tolist())
+        unique_dates = self._rebalance_dates(sorted(frame["evaluation_date"].drop_duplicates().tolist()))
         if len(unique_dates) < 3:
             return WalkForwardSummary(
                 num_rows=len(frame),
@@ -142,14 +144,13 @@ class WalkForwardEvaluator:
         event_type_rows: dict[str, list[dict[str, float]]] = {}
 
         for split_idx in range(2, len(unique_dates)):
-            train_dates = unique_dates[:split_idx]
             test_date = unique_dates[split_idx]
-            train = frame[frame["evaluation_date"].isin(train_dates)].copy()
-            test = frame[frame["evaluation_date"] == test_date].copy()
+            train = frame[frame["evaluation_date"] < test_date].copy()
+            test = self._latest_test_frame(frame, test_date)
             if len(train) < min_train_rows or test.empty:
                 continue
 
-            ensemble.fit(train, persist_artifact=False)
+            ensemble.fit(train, persist_artifact=False, register_experiment=False)
             predictions = ensemble.score(
                 [
                     self._row_to_feature_vector(row)
@@ -167,6 +168,8 @@ class WalkForwardEvaluator:
                 continue
             company_frame = company_frame.dropna(subset=["target_return_90d"])
             if company_frame.empty:
+                continue
+            if company_frame["ticker"].nunique() < self.settings.evaluation_min_names_per_window:
                 continue
 
             num_windows += 1
@@ -247,6 +250,31 @@ class WalkForwardEvaluator:
             event_type_scorecards=event_type_scorecards,
         )
 
+    def _rebalance_dates(self, unique_dates: list[pd.Timestamp]) -> list[pd.Timestamp]:
+        spacing_days = max(int(self.settings.evaluation_rebalance_spacing_days), 1)
+        selected: list[pd.Timestamp] = []
+        for date in unique_dates:
+            if not selected:
+                selected.append(date)
+                continue
+            if (date - selected[-1]).days >= spacing_days:
+                selected.append(date)
+        if unique_dates and selected[-1] != unique_dates[-1]:
+            selected.append(unique_dates[-1])
+        return selected
+
+    def _latest_test_frame(self, frame: pd.DataFrame, test_date: pd.Timestamp) -> pd.DataFrame:
+        eligible = frame[frame["evaluation_date"] <= test_date].copy()
+        if eligible.empty:
+            return eligible
+        eligible["staleness_days"] = (test_date - eligible["evaluation_date"]).dt.days.astype(float)
+        eligible = eligible[eligible["staleness_days"] <= self.settings.evaluation_max_snapshot_staleness_days]
+        if eligible.empty:
+            return eligible
+        latest_as_of = eligible.groupby("ticker")["as_of"].transform("max")
+        test = eligible[eligible["as_of"] == latest_as_of].copy()
+        return test.sort_values(["ticker", "entity_id"])
+
     def _company_test_frame(
         self,
         test: pd.DataFrame,
@@ -311,8 +339,14 @@ class WalkForwardEvaluator:
             return company_frame, set(), current_recommendations, current_signals
         actionable = company_frame[company_frame["target_weight"] > 0].copy()
         rank_source = actionable if not actionable.empty else company_frame
-        top_count = max(1, len(rank_source) // 5)
-        current_top = set(rank_source.nlargest(top_count, "target_weight")["ticker"].tolist())
+        current_top = set(
+            rank_source[
+                rank_source["target_weight"] >= self.settings.evaluation_turnover_book_weight_floor
+            ]["ticker"].tolist()
+        )
+        if not current_top:
+            top_count = max(1, len(rank_source) // 5)
+            current_top = set(rank_source.nlargest(top_count, "target_weight")["ticker"].tolist())
         sticky_holds = set(
             company_frame[
                 company_frame["ticker"].isin(previous_top)

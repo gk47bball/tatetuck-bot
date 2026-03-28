@@ -57,7 +57,7 @@ def main():
                 f"scenario={analysis.portfolio.scenario}"
             )
 
-        evaluator = WalkForwardEvaluator(store=platform.store)
+        evaluator = WalkForwardEvaluator(store=platform.store, settings=settings)
         summary = evaluator.evaluate()
         finished_at = utc_now_iso()
         record_pipeline_run(

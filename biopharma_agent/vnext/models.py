@@ -90,7 +90,12 @@ class EventDrivenEnsemble:
             and column != "evaluation_date"
         ]
 
-    def fit(self, frame: pd.DataFrame, persist_artifact: bool = True) -> ExperimentRecord | None:
+    def fit(
+        self,
+        frame: pd.DataFrame,
+        persist_artifact: bool = True,
+        register_experiment: bool = True,
+    ) -> ExperimentRecord | None:
         required = {"target_return_90d", "target_catalyst_success"}
         if frame.empty or not required.issubset(frame.columns):
             return None
@@ -148,7 +153,8 @@ class EventDrivenEnsemble:
             },
             artifact_path=str(artifact_path) if artifact_path is not None else None,
         )
-        self.store.register_experiment(record)
+        if register_experiment:
+            self.store.register_experiment(record)
         if artifact_error:
             self.store.write_pipeline_run(
                 {

@@ -49,7 +49,7 @@ def run_vnext_pipeline(
         replay_summary = HistoricalReplayEngine(store=store).rebuild_from_archived_snapshots(limit=replay_limit)
         label_summary = PointInTimeLabeler(store=store).materialize_labels()
         if run_evaluation:
-            evaluation = WalkForwardEvaluator(store=store).evaluate()
+            evaluation = WalkForwardEvaluator(store=store, settings=settings).evaluate()
         else:
             evaluation = WalkForwardSummary(
                 num_rows=0,

@@ -9,6 +9,7 @@ from biopharma_agent.vnext.entities import ModelPrediction
 from biopharma_agent.vnext.evaluation import WalkForwardEvaluator
 from biopharma_agent.vnext.labels import EODHDHistoryProvider, PointInTimeLabeler
 from biopharma_agent.vnext.models import EventDrivenEnsemble
+from biopharma_agent.vnext.settings import VNextSettings
 from biopharma_agent.vnext.replay import HistoricalReplayEngine
 from biopharma_agent.vnext.storage import LocalResearchStore
 
@@ -383,7 +384,12 @@ class TestVNextHistory(unittest.TestCase):
             pd.DataFrame(label_rows).to_parquet(store.tables_dir / "labels.parquet", index=False)
             pd.DataFrame(snapshot_rows).to_parquet(store.tables_dir / "company_snapshots.parquet", index=False)
 
-            summary = WalkForwardEvaluator(store=store).evaluate(min_train_rows=2)
+            settings = VNextSettings(
+                evaluation_min_names_per_window=2,
+                evaluation_rebalance_spacing_days=1,
+                evaluation_turnover_book_weight_floor=1.0,
+            )
+            summary = WalkForwardEvaluator(store=store, settings=settings).evaluate(min_train_rows=2)
             self.assertGreaterEqual(summary.num_windows, 1)
             self.assertIn("none", summary.event_type_scorecards)
 
@@ -410,6 +416,49 @@ class TestVNextHistory(unittest.TestCase):
             record = EventDrivenEnsemble(store=store).fit(frame, persist_artifact=False)
             self.assertIsNotNone(record)
             self.assertIsNone(record.artifact_path)
+
+    def test_evaluator_coarsens_rebalance_dates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = VNextSettings(
+                evaluation_rebalance_spacing_days=14,
+                evaluation_min_names_per_window=1,
+                evaluation_max_snapshot_staleness_days=120,
+                evaluation_turnover_book_weight_floor=1.0,
+            )
+            evaluator = WalkForwardEvaluator(store=LocalResearchStore(base_dir=tmpdir), settings=settings)
+            unique_dates = list(pd.to_datetime(["2025-01-01", "2025-01-08", "2025-01-22", "2025-02-10"]))
+            selected = evaluator._rebalance_dates(unique_dates)
+            self.assertEqual([item.strftime("%Y-%m-%d") for item in selected], ["2025-01-01", "2025-01-22", "2025-02-10"])
+
+    def test_evaluator_carries_forward_latest_snapshot_within_staleness_window(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            frame = pd.DataFrame(
+                [
+                    {
+                        "entity_id": "AAA:1",
+                        "ticker": "AAA",
+                        "as_of": "2025-01-01T00:00:00+00:00",
+                        "evaluation_date": pd.Timestamp("2025-01-01"),
+                    },
+                    {
+                        "entity_id": "BBB:1",
+                        "ticker": "BBB",
+                        "as_of": "2025-01-15T00:00:00+00:00",
+                        "evaluation_date": pd.Timestamp("2025-01-15"),
+                    },
+                ]
+            )
+            evaluator = WalkForwardEvaluator(
+                store=store,
+                settings=VNextSettings(
+                    evaluation_rebalance_spacing_days=1,
+                    evaluation_min_names_per_window=1,
+                    evaluation_max_snapshot_staleness_days=30,
+                ),
+            )
+            test = evaluator._latest_test_frame(frame, pd.Timestamp("2025-01-20"))
+            self.assertEqual(sorted(test["ticker"].tolist()), ["AAA", "BBB"])
 
 
 if __name__ == "__main__":

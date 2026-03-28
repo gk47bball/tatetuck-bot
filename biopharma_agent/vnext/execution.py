@@ -256,7 +256,7 @@ class PMExecutionPlanner:
         positions_by_symbol = {position.symbol: position for position in positions}
         blockers: list[str] = []
         warnings: list[str] = list(readiness.blockers)
-        selected = self._select_recommendations(analyses)
+        selected = self._select_recommendations(analyses, positions_by_symbol)
         deployable_notional = min(
             account.equity * (self.settings.max_gross_exposure_pct / 100.0),
             account.buying_power,
@@ -290,6 +290,8 @@ class PMExecutionPlanner:
             position = positions_by_symbol.get(ticker)
             current_notional = position.market_value if position else 0.0
             delta_notional = target_notional - current_notional
+            current_weight_pct = (current_notional / max(account.equity, 1e-9)) * 100.0 if current_notional else 0.0
+            weight_gap_pct = abs(scaled_target_weight - current_weight_pct)
             action = "hold"
             side = "none"
             qty = None
@@ -300,7 +302,11 @@ class PMExecutionPlanner:
                 f"target_weight={rec.target_weight:.2f}%",
                 f"scaled_target_weight={scaled_target_weight:.2f}%",
             ]
-            if delta_notional >= self.settings.min_order_notional:
+            if position and weight_gap_pct < self.settings.execution_rebalance_band_pct:
+                rationale.append(
+                    f"inside_rebalance_band={self.settings.execution_rebalance_band_pct:.2f}%"
+                )
+            elif delta_notional >= self.settings.min_order_notional:
                 action = "buy"
                 side = "buy"
                 notional = round(delta_notional, 2)
@@ -333,10 +339,32 @@ class PMExecutionPlanner:
             )
 
         managed_symbols = {analysis.snapshot.ticker for analysis in analyses}
+        analyses_by_symbol = {analysis.snapshot.ticker: analysis for analysis in analyses}
         for symbol, position in positions_by_symbol.items():
             if symbol in selected_symbols or symbol not in managed_symbols:
                 continue
             if position.market_value < self.settings.min_order_notional:
+                continue
+            analysis = analyses_by_symbol.get(symbol)
+            if analysis is not None and self._qualifies_hold(analysis):
+                instructions.append(
+                    ExecutionInstruction(
+                        symbol=symbol,
+                        company_name=analysis.snapshot.company_name,
+                        action="hold",
+                        side="none",
+                        scenario=f"hold {analysis.portfolio.scenario}",
+                        confidence=analysis.portfolio.confidence,
+                        target_weight=analysis.portfolio.target_weight,
+                        scaled_target_weight=analysis.portfolio.target_weight,
+                        target_notional=round(position.market_value, 2),
+                        current_notional=round(position.market_value, 2),
+                        delta_notional=0.0,
+                        qty=None,
+                        notional=None,
+                        rationale=["Existing position retained under PM holdover thresholds."],
+                    )
+                )
                 continue
             instructions.append(
                 ExecutionInstruction(
@@ -370,24 +398,78 @@ class PMExecutionPlanner:
             readiness_status=readiness.status,
         )
 
-    def _select_recommendations(self, analyses: list[CompanyAnalysis]) -> list[CompanyAnalysis]:
-        eligible = [
+    def _select_recommendations(
+        self,
+        analyses: list[CompanyAnalysis],
+        positions_by_symbol: dict[str, BrokerPosition],
+    ) -> list[CompanyAnalysis]:
+        auto_eligible = [
             analysis
             for analysis in analyses
-            if analysis.portfolio.scenario in self.AUTO_SCENARIOS
-            and analysis.portfolio.target_weight >= self.settings.min_execution_weight_pct
-            and analysis.portfolio.confidence >= self.settings.min_execution_confidence
-            and analysis.portfolio.stance == "long"
+            if self._qualifies_auto(analysis)
         ]
-        eligible = sorted(
-            eligible,
+        auto_eligible = sorted(
+            auto_eligible,
             key=lambda analysis: (
                 analysis.portfolio.target_weight * analysis.portfolio.confidence,
                 analysis.signal.expected_return,
             ),
             reverse=True,
         )
-        return eligible[: self.settings.max_new_positions]
+        selected: list[CompanyAnalysis] = []
+        selected_symbols: set[str] = set()
+
+        for analysis in auto_eligible:
+            if analysis.snapshot.ticker in positions_by_symbol:
+                selected.append(analysis)
+                selected_symbols.add(analysis.snapshot.ticker)
+
+        new_slots = max(self.settings.max_new_positions, 0)
+        for analysis in auto_eligible:
+            if analysis.snapshot.ticker in selected_symbols:
+                continue
+            if new_slots <= 0:
+                break
+            selected.append(analysis)
+            selected_symbols.add(analysis.snapshot.ticker)
+            new_slots -= 1
+
+        holdovers = [
+            analysis
+            for analysis in analyses
+            if analysis.snapshot.ticker in positions_by_symbol
+            and analysis.snapshot.ticker not in selected_symbols
+            and self._qualifies_hold(analysis)
+        ]
+        holdovers = sorted(
+            holdovers,
+            key=lambda analysis: (
+                analysis.portfolio.target_weight,
+                analysis.portfolio.confidence,
+                analysis.signal.expected_return,
+            ),
+            reverse=True,
+        )
+        selected.extend(holdovers)
+        return selected
+
+    def _qualifies_auto(self, analysis: CompanyAnalysis) -> bool:
+        return (
+            analysis.portfolio.scenario in self.AUTO_SCENARIOS
+            and analysis.portfolio.target_weight >= self.settings.min_execution_weight_pct
+            and analysis.portfolio.confidence >= self.settings.min_execution_confidence
+            and analysis.portfolio.stance == "long"
+        )
+
+    def _qualifies_hold(self, analysis: CompanyAnalysis) -> bool:
+        if analysis.portfolio.stance != "long":
+            return False
+        if analysis.portfolio.scenario == "avoid due to financing":
+            return False
+        return (
+            analysis.portfolio.target_weight >= self.settings.execution_hold_weight_pct
+            and analysis.portfolio.confidence >= self.settings.execution_hold_confidence
+        )
 
 
 def execute_plan(

@@ -47,7 +47,7 @@ def main() -> None:
 
         evaluation = None
         if not args.skip_eval:
-            evaluation = WalkForwardEvaluator(store=store).evaluate()
+            evaluation = WalkForwardEvaluator(store=store, settings=settings).evaluate()
 
         finished_at = utc_now_iso()
         record_pipeline_run(

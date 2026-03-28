@@ -97,7 +97,7 @@ def build_readiness_report(
     labels = store.read_table("labels")
     event_labels = store.read_table("event_labels")
     pipeline_runs = store.read_table("pipeline_runs")
-    evaluator = WalkForwardEvaluator(store=store)
+    evaluator = WalkForwardEvaluator(store=store, settings=settings)
     evaluation = evaluator.evaluate() if (not snapshots.empty and not labels.empty) or refresh_labels else WalkForwardSummary(
         num_rows=0,
         num_windows=0,

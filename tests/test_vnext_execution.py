@@ -41,6 +41,8 @@ def make_analysis(
         crowding_risk=0.2,
         financing_risk=0.2,
         thesis_horizon="90d",
+        primary_event_type="phase3_readout",
+        primary_event_bucket="clinical",
         rationale=[],
         supporting_evidence=[],
     )
@@ -53,6 +55,7 @@ def make_analysis(
         confidence=confidence,
         scenario=scenario,
         thesis_horizon="90d",
+        primary_event_type="phase3_readout",
         risk_flags=[],
     )
     return CompanyAnalysis(
@@ -114,6 +117,12 @@ class TestVNextExecution(unittest.TestCase):
             min_execution_confidence=0.60,
             min_order_notional=150.0,
             max_new_positions=6,
+            execution_hold_weight_pct=0.75,
+            execution_hold_confidence=0.50,
+            execution_rebalance_band_pct=0.75,
+            evaluation_rebalance_spacing_days=21,
+            evaluation_min_names_per_window=3,
+            evaluation_turnover_book_weight_floor=1.0,
             allow_blocked_paper_trading=True,
         )
 
@@ -145,6 +154,29 @@ class TestVNextExecution(unittest.TestCase):
             broker.submit_market_notional_buy.assert_not_called()
             self.assertTrue(submissions)
             self.assertEqual(submissions[0].status, "planned")
+
+    def test_planner_keeps_existing_position_as_holdover(self):
+        settings = self.make_settings()
+        planner = PMExecutionPlanner(settings)
+        analyses = [make_analysis("CRSP", "pairs candidate", 1.2, 0.56, expected_return=0.09)]
+        account = DummyAccount()
+        positions = [DummyPosition("CRSP", qty=40.0, market_value=1200.0, current_price=30.0)]
+        plan = planner.build_plan(analyses, account, positions, DummyReadiness(blockers=[]))
+
+        instruction = next(item for item in plan.instructions if item.symbol == "CRSP")
+        self.assertEqual(instruction.action, "hold")
+        self.assertIn("CRSP", plan.selected_symbols)
+
+    def test_planner_uses_rebalance_band_for_small_deltas(self):
+        settings = self.make_settings()
+        planner = PMExecutionPlanner(settings)
+        analyses = [make_analysis("CRSP", "pre-catalyst long", 4.0, 0.72)]
+        account = DummyAccount()
+        positions = [DummyPosition("CRSP", qty=126.6667, market_value=3800.0, current_price=30.0)]
+        plan = planner.build_plan(analyses, account, positions, DummyReadiness(blockers=[]))
+
+        instruction = next(item for item in plan.instructions if item.symbol == "CRSP")
+        self.assertEqual(instruction.action, "hold")
 
     def test_alpaca_broker_uses_paper_headers(self):
         settings = self.make_settings()

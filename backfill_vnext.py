@@ -40,7 +40,7 @@ def main() -> None:
         label_summary = labeler.materialize_labels()
         summary = None
         if not args.skip_eval:
-            evaluator = WalkForwardEvaluator(store=replay.store)
+            evaluator = WalkForwardEvaluator(store=replay.store, settings=settings)
             summary = evaluator.evaluate()
         finished_at = utc_now_iso()
         record_pipeline_run(

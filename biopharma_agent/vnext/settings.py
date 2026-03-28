@@ -44,6 +44,13 @@ class VNextSettings:
     min_execution_confidence: float = 0.60
     min_order_notional: float = 150.0
     max_new_positions: int = 6
+    execution_hold_weight_pct: float = 0.75
+    execution_hold_confidence: float = 0.50
+    execution_rebalance_band_pct: float = 0.75
+    evaluation_rebalance_spacing_days: int = 21
+    evaluation_min_names_per_window: int = 3
+    evaluation_turnover_book_weight_floor: float = 1.0
+    evaluation_max_snapshot_staleness_days: int = 120
     allow_blocked_paper_trading: bool = False
     simulated_paper_equity: float = 100000.0
 
@@ -70,6 +77,13 @@ class VNextSettings:
             min_execution_confidence=float(os.environ.get("TATETUCK_MIN_EXECUTION_CONFIDENCE", "0.60")),
             min_order_notional=float(os.environ.get("TATETUCK_MIN_ORDER_NOTIONAL", "150.0")),
             max_new_positions=_env_int("TATETUCK_MAX_NEW_POSITIONS", 6),
+            execution_hold_weight_pct=float(os.environ.get("TATETUCK_EXECUTION_HOLD_WEIGHT_PCT", "0.75")),
+            execution_hold_confidence=float(os.environ.get("TATETUCK_EXECUTION_HOLD_CONFIDENCE", "0.50")),
+            execution_rebalance_band_pct=float(os.environ.get("TATETUCK_EXECUTION_REBALANCE_BAND_PCT", "0.75")),
+            evaluation_rebalance_spacing_days=_env_int("TATETUCK_EVAL_REBALANCE_SPACING_DAYS", 21),
+            evaluation_min_names_per_window=_env_int("TATETUCK_EVAL_MIN_NAMES_PER_WINDOW", 3),
+            evaluation_turnover_book_weight_floor=float(os.environ.get("TATETUCK_EVAL_TURNOVER_BOOK_WEIGHT_FLOOR", "1.0")),
+            evaluation_max_snapshot_staleness_days=_env_int("TATETUCK_EVAL_MAX_SNAPSHOT_STALENESS_DAYS", 120),
             allow_blocked_paper_trading=_env_flag("TATETUCK_ALLOW_BLOCKED_PAPER_TRADING", False),
             simulated_paper_equity=float(os.environ.get("TATETUCK_SIMULATED_PAPER_EQUITY", "100000.0")),
         )
