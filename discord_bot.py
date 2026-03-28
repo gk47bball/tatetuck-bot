@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import asyncio
 
 # Import the core biopharma engine
-from prepare import gather_company_data, TICKERS_TRAIN, TICKERS_HOLDOUT
+from prepare import gather_company_data, TRAIN_TICKERS, HOLDOUT_TICKERS
 from strategy import score_company
 
 # Load environment variables
@@ -41,12 +41,17 @@ async def analyze(ctx, ticker: str = None):
         return
 
     ticker = ticker.upper()
+    
+    # Try to find the actual company name from our lists
+    all_dict = {t[0]: t[1] for t in TRAIN_TICKERS + HOLDOUT_TICKERS}
+    company_name = all_dict.get(ticker, ticker)
+    
     status_msg = await ctx.send(f"🔬 **Initiating Alpha Stack Analysis for {ticker}**...\nGathering SEC, FDA, and PubMed data.")
 
     # Run data gathering in a separate thread so we don't block the async event loop
     loop = asyncio.get_event_loop()
     try:
-        data = await loop.run_in_executor(None, gather_company_data, ticker)
+        data = await loop.run_in_executor(None, gather_company_data, ticker, company_name)
         
         if not data or data.get("error"):
             await status_msg.edit(content=f"❌ **Analysis Failed for {ticker}**: {data.get('error', 'No data found.')}")
@@ -98,14 +103,14 @@ async def top5(ctx):
     status_msg = await ctx.send("🚀 **Initiating Benchmark Scan** (This may take ~30-60 seconds)...")
 
     loop = asyncio.get_event_loop()
-    all_tickers = TICKERS_TRAIN + TICKERS_HOLDOUT
+    all_tickers = TRAIN_TICKERS + HOLDOUT_TICKERS
     
     results = []
     
     # We will gather and score all tickers
-    for ticker in all_tickers:
+    for ticker, company_name in all_tickers:
         try:
-            data = await loop.run_in_executor(None, gather_company_data, ticker)
+            data = await loop.run_in_executor(None, gather_company_data, ticker, company_name)
             if data and not data.get("error"):
                 score = score_company(data)
                 
