@@ -36,6 +36,19 @@ TRAIN_TICKERS = [
     ("ARVN", "Arvinas"),
     ("APLS", "Apellis Pharmaceuticals"),
     ("BBIO", "BridgeBio Pharma"),
+    ("REGN", "Regeneron Pharmaceuticals"),
+    ("BIIB", "Biogen"),
+    ("ALNY", "Alnylam Pharmaceuticals"),
+    ("INCY", "Incyte"),
+    ("EXAS", "Exact Sciences"),
+    ("DNA", "Ginkgo Bioworks"),
+    ("SAGE", "Sage Therapeutics"),
+    ("BLUE", "bluebird bio"),
+    ("BMRN", "BioMarin Pharmaceutical"),
+    ("NVAX", "Novavax"),
+    ("VIR", "Vir Biotechnology"),
+    ("HALO", "Halozyme Therapeutics"),
+    ("PTCT", "PTC Therapeutics"),
 ]
 
 HOLDOUT_TICKERS = [
@@ -45,6 +58,14 @@ HOLDOUT_TICKERS = [
     ("IOVA", "Iovance Biotherapeutics"),
     ("VRTX", "Vertex Pharmaceuticals"),
     ("BPMC", "Blueprint Medicines"),
+    ("GILD", "Gilead Sciences"),
+    ("AMGN", "Amgen"),
+    ("ABBV", "AbbVie"),
+    ("MRNA", "Moderna"),
+    ("BNTX", "BioNTech"),
+    ("ROIV", "Roivant Sciences"),
+    ("RETA", "Reata Pharmaceuticals"),
+    ("UTHR", "United Therapeutics"),
 ]
 
 # All tickers combined (for full evaluation)

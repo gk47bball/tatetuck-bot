@@ -230,9 +230,29 @@ def score_company(data: dict) -> dict:
     # Final clamping to ensure output is strictly within [-1.0, 1.0] bounds
     final_signal = max(-1.0, min(1.0, total_signal))
     
+    # =========================================================================
+    # PORTFOLIO CONSTRUCTION & RISK SIZING
+    # =========================================================================
+    raw_conviction = abs(final_signal)
+    
+    vol_penalty = 1.0 - min(vol * 2.0, 0.5) if vol is not None else 0.8
+    
+    liq_modifier = 1.0
+    if market_cap < 500_000_000:
+        liq_modifier = 0.5
+    elif market_cap < 1_500_000_000:
+        liq_modifier = 0.8
+        
+    safety_modifier = max(0.2, 1.0 + alpha_safety) # alpha_safety is <= 0 
+    
+    conviction_weight = raw_conviction * vol_penalty * liq_modifier * safety_modifier
+    conviction_weight = max(0.0, min(1.0, conviction_weight))
+    
     return {
         "signal": final_signal,
         "pos": pos,
         "rnpv": rnpv,
-        "alpha_breakdown": alpha_breakdown
+        "alpha_breakdown": alpha_breakdown,
+        "conviction_weight": conviction_weight,
+        "recommended_allocation": round(conviction_weight * 10.0, 2) # Assume max 10% single-position limit
     }
