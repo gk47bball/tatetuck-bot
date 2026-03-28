@@ -4,8 +4,13 @@ Epi-Model: Phase-Based Probability of Success & Risk-Adjusted NPV Valuation
 Uses industry-standard clinical phase transition probabilities (BIO/QLS/Informa data)
 to calculate a heuristic POS, then computes rNPV and compares to current market cap
 to find the alpha signal.
+
+The evaluator's `prepare.py` module is the canonical source for phase classification.
+Import it here to prevent drift between the package workflow and the scoring harness.
 """
 from typing import Dict, Any, List, Optional
+
+from prepare import classify_phase
 
 # Industry-standard clinical phase transition probabilities
 # Source: BIO / QLS Advisors / Informa Pharma Intelligence
@@ -30,23 +35,6 @@ DISEASE_AREA_ADJUSTMENT = {
     "metabolic":      0.90,
     "default":        1.00,
 }
-
-def classify_phase(phase_list: List[str]) -> str:
-    """Map ClinicalTrials.gov phase strings to our lookup key."""
-    if not phase_list:
-        return "PHASE1"
-    phase_str = " ".join(phase_list).upper()
-    if "PHASE3" in phase_str or "PHASE 3" in phase_str:
-        return "PHASE3"
-    if "PHASE2" in phase_str or "PHASE 2" in phase_str:
-        return "PHASE2"
-    if "PHASE1" in phase_str or "PHASE 1" in phase_str:
-        if "PHASE2" in phase_str or "PHASE 2" in phase_str:
-            return "PHASE2"
-        return "PHASE1"
-    if "EARLY" in phase_str:
-        return "EARLY_PHASE1"
-    return "PHASE1"
 
 def get_disease_multiplier(conditions: List[str]) -> float:
     """Heuristic: adjust POS based on therapeutic area."""

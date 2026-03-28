@@ -15,6 +15,8 @@ import xml.etree.ElementTree as ET
 import yfinance as yf
 from typing import List, Dict, Any, Optional
 
+from biopharma_agent.types import CompanyData, FinanceData
+
 # ─── Fixed Constants ────────────────────────────────────────────────────────────
 
 # TRAIN set: 14 tickers the agent optimizes against.
@@ -98,10 +100,27 @@ def _cache_key(prefix: str, *args) -> str:
     return hashlib.md5(raw.encode()).hexdigest()
 
 def _cache_get(key: str) -> Optional[Any]:
-    return None
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, f"{key}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        stat = os.stat(path)
+        if time.time() - stat.st_mtime >= CACHE_TTL_SECONDS:
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
 
 def _cache_set(key: str, data: Any) -> None:
-    pass
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, f"{key}.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError:
+        return
 
 
 # ─── Retry Logic ─────────────────────────────────────────────────────────────────
@@ -126,7 +145,7 @@ def _request_with_retry(url: str, params: dict, timeout: int = 15,
 
 # ─── Data Fetching (Fixed — agent cannot change how data is gathered) ───────────
 
-def fetch_financial_data(ticker: str) -> Dict[str, Any]:
+def fetch_financial_data(ticker: str) -> FinanceData:
     """Pull key financial metrics from Yahoo Finance, including 3-month momentum."""
     key = _cache_key("finance_v2", ticker)
     cached = _cache_get(key)
@@ -156,11 +175,19 @@ def fetch_financial_data(ticker: str) -> Dict[str, Any]:
         result = {
             "ticker": ticker,
             "shortName": info.get("shortName"),
+            "longName": info.get("longName"),
+            "sector": info.get("sector"),
+            "industry": info.get("industry"),
+            "description": info.get("longBusinessSummary"),
             "marketCap": info.get("marketCap"),
             "enterpriseValue": info.get("enterpriseValue"),
             "totalRevenue": info.get("totalRevenue"),
+            "grossMargins": info.get("grossMargins"),
+            "operatingMargins": info.get("operatingMargins"),
             "cash": info.get("totalCash"),
             "debt": info.get("totalDebt"),
+            "netIncome": info.get("netIncomeToCommon"),
+            "_52WeekChange": info.get("52WeekChange"),
             "trailing_6mo_return": trailing_return,
             "momentum_3mo": momentum_3mo,
             "volatility": volatility,
@@ -290,7 +317,7 @@ def classify_phase(phase_list: List[str]) -> str:
     return "PHASE1"
 
 
-def gather_company_data(ticker: str, company_name: str) -> Dict[str, Any]:
+def gather_company_data(ticker: str, company_name: str) -> CompanyData:
     """Gather ALL available data for a single company. Returns a single dict."""
     print(f"  Gathering data for {ticker} ({company_name})...")
 

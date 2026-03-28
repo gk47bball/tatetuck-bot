@@ -1,6 +1,8 @@
 import requests
 from typing import Dict, Any, List
 
+from prepare import fetch_fda_adverse_events
+
 class OpenFDAAPI:
     BASE_URL = "https://api.fda.gov/drug"
 
@@ -22,18 +24,5 @@ class OpenFDAAPI:
             raise e
 
     def get_adverse_events(self, brand_name: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get recent adverse events for a drug."""
-        url = f"{self.BASE_URL}/event.json"
-        params = {
-            "search": f'patient.drug.openfda.brand_name:"{brand_name}"',
-            "limit": limit
-        }
-        try:
-            response = requests.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
-            return data.get("results", [])
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                return []
-            raise e
+        """Delegate to prepare.py so adverse-event lookups share cache and retry behavior."""
+        return fetch_fda_adverse_events(brand_name, limit=limit)
