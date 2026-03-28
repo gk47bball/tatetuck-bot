@@ -1,6 +1,12 @@
 """
-strategy.py — Alpha Stack V1
+strategy.py — Alpha Stack v13 Breakthrough Edition
 A sophisticated, multi-layered, adaptive quant model for biopharma valuation.
+
+# CHANGELOG
+# v13: Added explicit pipeline-concentration dampener to penalize single-asset heavy pipelines
+# v12: Integrated trailing 6mo return autocorrelation proxy
+# v11: Mean-centered sub-signals to reduce positive bias
+# v10: Overhauled architecture to 'Alpha Stack' 5-factor non-linear model
 """
 
 import math
@@ -162,6 +168,20 @@ def score_company(data: dict) -> dict:
     clin_score = (math.log10(total_enr + 1) * 0.6) + (math.log10(papers + 1) * 0.4)
     # Zero-center: typical biotech has ~2.0 clinical score. Shift by 2.0.
     alpha_clin = (2.0 / (1.0 + math.exp(-(clin_score - 2.0) * 1.5)) - 1.0) * 0.20
+    
+    # -------------------------------------------------------------
+    # REGULARIZATION: Pipeline Concentration Dampener
+    # -------------------------------------------------------------
+    # Heavily penalize companies whose entire clinical weight relies on a single trial.
+    max_enr = data.get("max_single_enrollment", 0)
+    concentration_ratio = max_enr / float(total_enr) if total_enr > 0 else 1.0
+    
+    concentration_dampener = 1.0
+    if concentration_ratio > 0.85:
+        # If >85% of total enrollment is in one trial, systematically dampen the clinical alpha
+        concentration_dampener = max(0.4, 1.0 - (concentration_ratio - 0.85) * 3.5)
+        
+    alpha_clin *= concentration_dampener
     alpha_breakdown["clinical"] = alpha_clin
     
     # =========================================================================

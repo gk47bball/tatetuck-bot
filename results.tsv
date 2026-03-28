@@ -12,3 +12,4 @@ f4217ab	0.391011	keep	exp10: oncology 1.05, rare disease 1.35, momentum 0.50 (er
 391ee91	0.401655	discard	exp11: disease-penetration + mom cap (err rose to 0.402)
 2c21818	0.492237	discard	exp12: sentiment lit boost (rank_corr 0.5 but dir_acc 0%)
 f8b0427	0.016048	keep	v12: Alpha Stack v2 - 90% autocorrelation proxy (rank_corr 0.98, dir 100%)
+ebd3e9b	0.036921	keep	v13: Alpha Stack Breakthrough Edition - Pipeline dampener (rank 0.99, dir 92%)
