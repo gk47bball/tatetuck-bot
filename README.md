@@ -24,6 +24,8 @@ artifacts, feature generation, model scoring, and a walk-forward evaluator.
   Generates a company research report through the vNext compatibility facade.
 - `discord_bot.py`
   Serves event-driven tear sheets and benchmark scans from the vNext platform.
+- `BOT_GUIDE.md`
+  Plain-English explanation of what the Discord bot does and how to read it.
 - `evaluate.py`
   Legacy scorer for the original heuristic benchmark.
 - `evaluate_vnext.py`
@@ -70,6 +72,30 @@ vNext platform run:
 ```bash
 python evaluate_vnext.py > vnext_run.log 2>&1
 ```
+
+Discord bot self-check:
+
+```bash
+python discord_bot.py --self-check
+```
+
+Discord bot run:
+
+```bash
+python discord_bot.py
+```
+
+Discord setup requires:
+
+- `DISCORD_TOKEN`
+- `DISCORD_CHANNEL_ID`
+
+Once online, the bot supports:
+
+- `!analyze TICKER`
+- `!top5`
+- `!guide`
+- `!status`
 
 ## Notes
 

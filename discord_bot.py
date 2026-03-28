@@ -1,79 +1,209 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
 import os
+from datetime import time, timezone
+from functools import partial
+from pathlib import Path
+
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-import asyncio
-from datetime import time, timezone
 
-# Import the core biopharma engine
-from prepare import TRAIN_TICKERS, HOLDOUT_TICKERS
-from biopharma_agent.vnext import TatetuckPlatform
+from prepare import HOLDOUT_TICKERS, TRAIN_TICKERS
 
-# Load environment variables
+from biopharma_agent.vnext import TatetuckPlatform, VNextSettings, build_readiness_report
+from biopharma_agent.vnext.storage import LocalResearchStore
+
+
 load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-TARGET_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
 
-if not TOKEN or TOKEN == "your_discord_bot_token_here":
-    print("CRITICAL ERROR: DISCORD_TOKEN is not set in .env")
-    print("Please add your token to .env and restart.")
-    exit(1)
+BOT_GUIDE_PATH = Path(__file__).with_name("BOT_GUIDE.md")
 
-# Initialize bot with message intents
-intents = discord.Intents.default()
-intents.message_content = True
+GUIDE_OVERVIEW = (
+    "Tatetuck Bot is a biotech research assistant. It looks at a company’s drug programs, "
+    "upcoming catalysts, cash runway, and recent market behavior, then turns that into a "
+    "simple PM-style view of which names look strongest over the next 1-6 months."
+)
 
-# We use the '!' prefix for commands
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-platform = TatetuckPlatform()
+GUIDE_HOW_IT_WORKS = (
+    "In plain English: the bot treats each biotech company like a small portfolio of bets. "
+    "It asks which drug is most important, how likely the next catalyst is to matter, how big "
+    "the commercial opportunity could be, and whether the company has enough cash to get there "
+    "without painful dilution."
+)
 
-@bot.event
-async def on_ready():
-    print(f"✅ Tatetuck Analyst ({bot.user}) is online and ready for scans.")
-    # Set custom status
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Phase 3 Trials"))
-    
-    # Start the daily scheduled task if it's not already running
-    if not morning_briefing.is_running():
-        morning_briefing.start()
+GUIDE_OUTPUTS = (
+    "`Confidence` is how strong the overall setup looks. "
+    "`Expected Return` is the model’s directional 90-day view. "
+    "`Catalyst Success` is the probability the next key event is favorable. "
+    "`Target Weight` is a paper-portfolio sizing suggestion, not a guarantee."
+)
 
-@bot.command(name="analyze")
-async def analyze(ctx, ticker: str = None):
-    """
-    Analyzes a single biopharma ticker and returns a detailed Tear Sheet.
-    Usage: !analyze CRSP
-    """
-    if not ticker:
-        await ctx.send("⚠️ Please provide a ticker symbol. Example: `!analyze CRSP`")
-        return
+GUIDE_COMMANDS = (
+    "`!analyze TICKER` for one tear sheet, `!top5` for the current best ideas, "
+    "`!guide` for the layman version, and `!status` for bot + research health."
+)
 
-    ticker = ticker.upper()
-    
-    # Try to find the actual company name from our lists
-    all_dict = {t[0]: t[1] for t in TRAIN_TICKERS + HOLDOUT_TICKERS}
-    company_name = all_dict.get(ticker, ticker)
-    
-    status_msg = await ctx.send(f"🔬 **Initiating Tatetuck vNext analysis for {ticker}**...\nBuilding the company-program-catalyst graph and scoring the thesis.")
 
-    # Run data gathering in a separate thread so we don't block the async event loop
-    loop = asyncio.get_event_loop()
+def get_discord_token() -> str | None:
+    return os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
+
+
+def get_target_channel_id() -> str | None:
+    return os.getenv("DISCORD_CHANNEL_ID") or os.getenv("TATETUCK_DISCORD_CHANNEL_ID")
+
+
+def build_platform() -> tuple[TatetuckPlatform, VNextSettings, LocalResearchStore]:
+    settings = VNextSettings.from_env()
+    store = LocalResearchStore(settings.store_dir)
+    return TatetuckPlatform(store=store), settings, store
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run or self-check the Tatetuck Discord bot.")
+    parser.add_argument(
+        "--self-check",
+        action="store_true",
+        help="Validate local bot configuration and the research backend without connecting to Discord.",
+    )
+    return parser.parse_args()
+
+
+def run_self_check() -> int:
+    token = get_discord_token()
+    channel_id = get_target_channel_id()
+    platform, settings, store = build_platform()
+    readiness = build_readiness_report(store=store, settings=settings)
+
+    print("=" * 72)
+    print("  TATETUCK BOT — DISCORD SELF CHECK")
+    print("=" * 72)
+    print(f"discord_token_present:     {bool(token)}")
+    print(f"discord_channel_present:   {bool(channel_id)}")
+    print(f"discord_py_version:        {discord.__version__}")
+    print(f"store_dir:                 {settings.store_dir}")
+    print(f"readiness_status:          {readiness.status}")
+    print(f"walkforward_windows:       {readiness.walkforward_windows}")
+    print(f"leakage_passed:            {readiness.leakage_passed}")
+
     try:
-        analysis = await loop.run_in_executor(None, platform.analyze_ticker, ticker, company_name, False)
+        analysis = platform.analyze_ticker(
+            "CRSP",
+            company_name="CRISPR Therapeutics",
+            include_literature=False,
+            prefer_archive=True,
+            fallback_to_archive=True,
+        )
+        print(f"sample_analysis:           ok ({analysis.snapshot.ticker} {analysis.portfolio.scenario})")
+    except Exception as exc:
+        print(f"sample_analysis:           failed ({type(exc).__name__}: {exc})")
+        return 1
 
-        # Assemble the Tear Sheet Embed
-        embed = discord.Embed(
-            title=f"Tatetuck Analyst Tear Sheet: {ticker}",
-            description="Event-driven biopharma alpha profile",
-            color=0x2ecc71 if analysis.signal.expected_return > 0 else 0xe74c3c
+    if not token:
+        print("\n[result]")
+        print("- Bot code is healthy, but it cannot connect to Discord until DISCORD_TOKEN is set.")
+        return 1
+
+    print("\n[result]")
+    print("- Bot is configured locally and ready to connect to Discord.")
+    return 0
+
+
+def build_guide_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="Tatetuck Bot Guide",
+        description="Biotech event-driven research, explained for someone with basic finance knowledge.",
+        color=0x2ecc71,
+    )
+    embed.add_field(name="What It Does", value=GUIDE_OVERVIEW, inline=False)
+    embed.add_field(name="How It Thinks", value=GUIDE_HOW_IT_WORKS, inline=False)
+    embed.add_field(name="How To Read The Output", value=GUIDE_OUTPUTS, inline=False)
+    embed.add_field(name="Commands", value=GUIDE_COMMANDS, inline=False)
+    embed.set_footer(text="Tatetuck Bot vNext")
+    return embed
+
+
+def build_bot() -> commands.Bot:
+    token = get_discord_token()
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN is not set. Add it to .env before starting the Discord bot.")
+
+    target_channel_id = get_target_channel_id()
+    platform, settings, store = build_platform()
+
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.guilds = True
+
+    bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+    async def analyze_one(ticker: str, company_name: str):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            partial(
+                platform.analyze_ticker,
+                ticker,
+                company_name=company_name,
+                include_literature=False,
+                prefer_archive=True,
+                fallback_to_archive=True,
+            ),
         )
 
-        embed.add_field(name="🧬 Confidence", value=f"{round(analysis.signal.confidence * 100, 1)}%", inline=True)
-        embed.add_field(name="📊 Target Weight", value=f"{analysis.portfolio.target_weight}%", inline=True)
-        embed.add_field(name="🛡️ Scenario", value=analysis.portfolio.scenario, inline=True)
+    async def analyze_universe():
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            partial(
+                platform.analyze_universe,
+                TRAIN_TICKERS + HOLDOUT_TICKERS,
+                include_literature=False,
+                prefer_archive=True,
+                fallback_to_archive=True,
+            ),
+        )
 
-        embed.add_field(name="🎯 Expected Return (90d)", value=f"{analysis.signal.expected_return * 100:+.1f}%", inline=True)
-        embed.add_field(name="📅 Catalyst Success", value=f"{analysis.signal.catalyst_success_prob * 100:.1f}%", inline=True)
-        embed.add_field(name="⚠️ Financing Risk", value=f"{analysis.signal.financing_risk:.2f}", inline=True)
+    def resolve_channel() -> discord.abc.Messageable | None:
+        channel = None
+        if target_channel_id:
+            try:
+                channel = bot.get_channel(int(target_channel_id))
+            except ValueError:
+                channel = None
+        if channel is not None:
+            return channel
+
+        for guild in bot.guilds:
+            me = guild.me or guild.get_member(bot.user.id if bot.user else 0)
+            if me is None:
+                continue
+            for text_channel in guild.text_channels:
+                if text_channel.permissions_for(me).send_messages:
+                    return text_channel
+        return None
+
+    def build_tearsheet_embed(analysis) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"Tatetuck Analyst Tear Sheet: {analysis.snapshot.ticker}",
+            description="Event-driven biopharma alpha profile",
+            color=0x2ecc71 if analysis.signal.expected_return > 0 else 0xe74c3c,
+        )
+        embed.add_field(name="Confidence", value=f"{round(analysis.signal.confidence * 100, 1)}%", inline=True)
+        embed.add_field(name="Target Weight", value=f"{analysis.portfolio.target_weight}%", inline=True)
+        embed.add_field(name="Scenario", value=analysis.portfolio.scenario, inline=True)
+
+        embed.add_field(name="Expected Return (90d)", value=f"{analysis.signal.expected_return * 100:+.1f}%", inline=True)
+        embed.add_field(name="Catalyst Success", value=f"{analysis.signal.catalyst_success_prob * 100:.1f}%", inline=True)
+        embed.add_field(name="Financing Risk", value=f"{analysis.signal.financing_risk:.2f}", inline=True)
+
+        embed.add_field(
+            name="How To Read This",
+            value="Higher confidence + higher target weight usually means the bot sees a cleaner catalyst setup with less financing risk.",
+            inline=False,
+        )
 
         rationale = "\n".join(f"• {line}" for line in analysis.signal.rationale[:4]) or "No rationale available."
         embed.add_field(name="Core Thesis", value=rationale, inline=False)
@@ -90,115 +220,160 @@ async def analyze(ctx, ticker: str = None):
             embed.add_field(name="Risk Flags", value=", ".join(analysis.portfolio.risk_flags), inline=False)
 
         embed.set_footer(text="Tatetuck Bot vNext - Event-Driven Biopharma Alpha Platform")
+        return embed
 
-        await status_msg.edit(content=None, embed=embed)
-
-    except Exception as e:
-        await status_msg.edit(content=f"❌ **System Error analyzing {ticker}**: {str(e)}")
-
-async def generate_top5_embed():
-    """Shared helper to generate the Top 5 scan embed."""
-    loop = asyncio.get_event_loop()
-    all_tickers = TRAIN_TICKERS + HOLDOUT_TICKERS
-    
-    results = []
-    
-    # We will gather and score all tickers
-    for ticker, company_name in all_tickers:
-        try:
-            analysis = await loop.run_in_executor(None, platform.analyze_ticker, ticker, company_name, False)
-            results.append({
-                "ticker": ticker,
-                "confidence": analysis.signal.confidence,
-                "allocation": analysis.portfolio.target_weight,
-                "expected_return": analysis.signal.expected_return,
-                "scenario": analysis.portfolio.scenario,
-            })
-        except Exception:
-            pass # Skip failed tickers during bulk scan
-            
-    if not results:
-        return None
-        
-    # Sort by highest target weight
-    results.sort(key=lambda x: x["allocation"], reverse=True)
-    top_picks = results[:5]
-    
-    embed = discord.Embed(
-        title="☀️ Morning Biotech Brief: Top 5 Alpha Signals",
-        description="Highest ranked targets across the benchmark based on vNext event-driven position sizing.",
-        color=0x3498db
-    )
-    
-    for i, pick in enumerate(top_picks, 1):
-        # Prevent TypeError if values are missing
-        conv_val = float(pick['confidence']) * 100 if pick['confidence'] is not None else 0.0
-        alloc_val = pick['allocation'] if pick['allocation'] is not None else 0.0
-        
-        embed.add_field(
-            name=f"#{i} — {pick['ticker']}",
-            value=(
-                f"**Confidence**: {round(conv_val, 1)}% | **Target Allocation**: {alloc_val}%\n"
-                f"**Expected Return**: {pick['expected_return'] * 100:+.1f}% | **Scenario**: {pick['scenario']}"
-            ),
-            inline=False
+    async def generate_top5_embed():
+        analyses = await analyze_universe()
+        ranked = sorted(
+            analyses,
+            key=lambda item: (item.portfolio.target_weight, item.signal.confidence, item.signal.expected_return),
+            reverse=True,
         )
-        
-    embed.set_footer(text="Tatetuck AutoResearch - vNext Event-Driven Platform")
-    return embed
+        top_picks = ranked[:5]
+        if not top_picks:
+            return None
 
-@bot.command(name="top5")
-async def top5(ctx):
-    """
-    Scans the benchmark universe and returns the Top 5 highest conviction trades.
-    """
-    status_msg = await ctx.send("🚀 **Initiating Benchmark Scan** (This may take ~30-60 seconds)...")
-    
-    embed = await generate_top5_embed()
-    
-    if embed:
+        embed = discord.Embed(
+            title="Morning Biotech Brief: Top 5 Alpha Signals",
+            description="Highest ranked names from the Tatetuck event-driven benchmark scan.",
+            color=0x3498DB,
+        )
+        for index, analysis in enumerate(top_picks, 1):
+            embed.add_field(
+                name=f"#{index} — {analysis.snapshot.ticker}",
+                value=(
+                    f"**Confidence**: {analysis.signal.confidence * 100:.1f}% | "
+                    f"**Target Weight**: {analysis.portfolio.target_weight:.1f}%\n"
+                    f"**Expected Return**: {analysis.signal.expected_return * 100:+.1f}% | "
+                    f"**Scenario**: {analysis.portfolio.scenario}"
+                ),
+                inline=False,
+            )
+        embed.set_footer(text="Tatetuck Bot vNext")
+        return embed
+
+    @bot.event
+    async def on_ready():
+        print(f"✅ Tatetuck Bot ({bot.user}) is online.")
+        await bot.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
+                name="biotech catalysts",
+            )
+        )
+        if not morning_briefing.is_running():
+            morning_briefing.start()
+
+    @bot.command(name="analyze")
+    async def analyze(ctx, ticker: str | None = None):
+        if not ticker:
+            await ctx.send("Please provide a ticker. Example: `!analyze CRSP`")
+            return
+
+        ticker = ticker.upper()
+        all_companies = {item[0]: item[1] for item in TRAIN_TICKERS + HOLDOUT_TICKERS}
+        company_name = all_companies.get(ticker, ticker)
+        status_msg = await ctx.send(
+            f"🔬 Running Tatetuck analysis for **{ticker}** using the archive-first biotech catalyst engine..."
+        )
+        try:
+            analysis = await analyze_one(ticker, company_name)
+            await status_msg.edit(content=None, embed=build_tearsheet_embed(analysis))
+        except Exception as exc:
+            await status_msg.edit(content=f"❌ Analysis failed for `{ticker}`: {type(exc).__name__}: {exc}")
+
+    @bot.command(name="top5")
+    async def top5(ctx):
+        status_msg = await ctx.send("🚀 Running the benchmark scan. This usually takes a few seconds...")
+        try:
+            embed = await generate_top5_embed()
+        except Exception as exc:
+            await status_msg.edit(content=f"❌ Benchmark scan failed: {type(exc).__name__}: {exc}")
+            return
+        if embed is None:
+            await status_msg.edit(content="❌ No ranked ideas were available.")
+            return
         await status_msg.edit(content=None, embed=embed)
-    else:
-        await status_msg.edit(content="❌ **Scan Failed**: Unable to retrieve any benchmark data.")
 
-# Scheduled Daily Task: 9:00 AM EST is roughly 13:00 UTC (14:00 UTC during standard time, using 13:30 UTC generic)
-@tasks.loop(time=time(hour=13, minute=30, tzinfo=timezone.utc))
-async def morning_briefing():
-    print("Executing automated morning briefing...")
-    embed = await generate_top5_embed()
-    if embed:
-        channel = None
-        if TARGET_CHANNEL_ID:
-            try:
-                channel = bot.get_channel(int(TARGET_CHANNEL_ID))
-            except ValueError:
-                pass
-        
-        # Fallback to the first text channel the bot can write to if ID is missing or invalid
-        if not channel:
-            for guild in bot.guilds:
-                for t_channel in guild.text_channels:
-                    if t_channel.permissions_for(guild.me).send_messages:
-                        channel = t_channel
-                        break
-                if channel:
-                    break
-                    
-        if channel:
-            await channel.send("🔔 **Automated Market Scan Complete**", embed=embed)
+    @bot.command(name="guide")
+    async def guide(ctx):
+        await ctx.send(embed=build_guide_embed())
+
+    @bot.command(name="status")
+    async def status(ctx):
+        loop = asyncio.get_running_loop()
+        readiness = await loop.run_in_executor(
+            None,
+            partial(build_readiness_report, store=store, settings=settings),
+        )
+        embed = discord.Embed(
+            title="Tatetuck Bot Status",
+            description="Current research-engine and Discord-surface health.",
+            color=0x1ABC9C if readiness.status == "production_ready" else 0xF39C12,
+        )
+        embed.add_field(name="Research Status", value=readiness.status, inline=True)
+        embed.add_field(name="Walk-Forward Windows", value=str(readiness.walkforward_windows), inline=True)
+        embed.add_field(name="Latest Snapshot Dates", value=str(readiness.distinct_snapshot_dates), inline=True)
+        embed.add_field(name="Matured 90d Labels", value=str(readiness.matured_return_90d_rows), inline=True)
+        embed.add_field(name="Evaluate Runs", value=f"{readiness.successful_evaluate_runs}/{readiness.evaluate_run_count}", inline=True)
+        embed.add_field(name="Leakage Audit", value="pass" if readiness.leakage_passed else "fail", inline=True)
+        if readiness.blockers:
+            embed.add_field(name="Blockers", value="\n".join(f"• {item}" for item in readiness.blockers[:5]), inline=False)
         else:
-            print("ERROR: Could not find a valid channel to broadcast the morning briefing.")
+            embed.add_field(name="Blockers", value="None", inline=False)
+        if readiness.warnings:
+            embed.add_field(name="Warnings", value="\n".join(f"• {item}" for item in readiness.warnings[:5]), inline=False)
+        embed.set_footer(text="Use !guide if you want the plain-English explanation.")
+        await ctx.send(embed=embed)
 
-@bot.command(name="help")
-async def custom_help(ctx):
-    embed = discord.Embed(
-        title="Tatetuck Analyst Commands",
-        description="I am your event-driven quantitative biopharma research engine.",
-        color=0x9b59b6
-    )
-    embed.add_field(name="`!analyze TICKER`", value="Builds the company-program-catalyst graph for one biotech ticker and returns its event-driven tear sheet.", inline=False)
-    embed.add_field(name="`!top5`", value="Scans the benchmark universe and returns the best current event-driven ideas from the vNext platform.", inline=False)
-    await ctx.send(embed=embed)
+    @bot.command(name="help")
+    async def custom_help(ctx):
+        embed = discord.Embed(
+            title="Tatetuck Bot Commands",
+            description="Event-driven biotech research in Discord.",
+            color=0x2ECC71,
+        )
+        embed.add_field(name="`!analyze TICKER`", value="Build a tear sheet for one biotech name.", inline=False)
+        embed.add_field(name="`!top5`", value="Show the current top benchmark ideas.", inline=False)
+        embed.add_field(name="`!guide`", value="Show the layman bot guide and how to read the outputs.", inline=False)
+        embed.add_field(name="`!status`", value="Show research-engine health and readiness.", inline=False)
+        await ctx.send(embed=embed)
+
+    @tasks.loop(time=time(hour=13, minute=30, tzinfo=timezone.utc))
+    async def morning_briefing():
+        try:
+            embed = await generate_top5_embed()
+        except Exception as exc:
+            print(f"ERROR: morning briefing failed: {type(exc).__name__}: {exc}")
+            return
+        if embed is None:
+            print("ERROR: morning briefing produced no ranked ideas.")
+            return
+
+        channel = resolve_channel()
+        if channel is None:
+            print("ERROR: no writable Discord channel found for the morning briefing.")
+            return
+        await channel.send("🔔 **Automated Tatetuck morning scan complete**", embed=embed)
+
+    return bot
+
+
+def main() -> int:
+    args = parse_args()
+    if args.self_check:
+        return run_self_check()
+
+    token = get_discord_token()
+    if not token:
+        print("CRITICAL ERROR: DISCORD_TOKEN is not set in .env")
+        print("Add DISCORD_TOKEN and DISCORD_CHANNEL_ID, then rerun the bot.")
+        return 1
+
+    bot = build_bot()
+    bot.run(token)
+    return 0
+
 
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    raise SystemExit(main())
