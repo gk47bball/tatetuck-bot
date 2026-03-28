@@ -13,7 +13,10 @@ from .storage import LocalResearchStore
 def _spearman(a: pd.Series, b: pd.Series) -> float:
     if len(a) < 3:
         return 0.0
-    return float(a.rank().corr(b.rank(), method="pearson") or 0.0)
+    corr = a.rank().corr(b.rank(), method="pearson")
+    if corr is None or pd.isna(corr):
+        return 0.0
+    return float(corr)
 
 
 def _safe_mean(values: list[float]) -> float:
@@ -55,7 +58,7 @@ class WalkForwardEvaluator:
         frame = features.merge(labels, on=["ticker", "as_of"], how="left")
         if frame.empty:
             return frame
-        frame["as_of"] = pd.to_datetime(frame["as_of"])
+        frame["as_of"] = pd.to_datetime(frame["as_of"], errors="coerce", utc=True, format="mixed").dt.tz_convert(None)
         frame["evaluation_date"] = frame["as_of"].dt.normalize()
         frame = frame.sort_values("as_of").drop_duplicates(
             subset=["ticker", "entity_id", "evaluation_date"],
@@ -140,6 +143,13 @@ class WalkForwardEvaluator:
                 ]
             )
             pred_df = pd.DataFrame([pred.to_record() for pred in predictions])
+            if not pred_df.empty and "as_of" in pred_df.columns:
+                pred_df["as_of"] = pd.to_datetime(
+                    pred_df["as_of"],
+                    errors="coerce",
+                    utc=True,
+                    format="mixed",
+                ).dt.tz_convert(None)
             merged = test.merge(pred_df, on=["ticker", "as_of"], how="inner")
             if merged.empty:
                 continue

@@ -112,7 +112,7 @@ class EventDrivenEnsemble:
     def _predict_frame(self, frame: pd.DataFrame, feature_vectors: list[FeatureVector]) -> list[ModelPrediction]:
         predictions: list[ModelPrediction] = []
         feature_columns = self.bundle.feature_columns or self.feature_columns(frame)
-        X = frame[feature_columns].fillna(0.0).to_numpy(dtype=float)
+        X = frame.reindex(columns=feature_columns, fill_value=0.0).fillna(0.0).to_numpy(dtype=float)
 
         reg_scores = None
         clf_scores = None

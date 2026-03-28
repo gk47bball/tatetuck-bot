@@ -1,10 +1,11 @@
 import json
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
+from biopharma_agent.vnext.entities import ModelPrediction
 from biopharma_agent.vnext.evaluation import WalkForwardEvaluator
 from biopharma_agent.vnext.labels import EODHDHistoryProvider, PointInTimeLabeler
 from biopharma_agent.vnext.replay import HistoricalReplayEngine
@@ -286,6 +287,68 @@ class TestVNextHistory(unittest.TestCase):
             frame = WalkForwardEvaluator(store=store).build_training_frame()
             self.assertEqual(len(frame), 2)
             self.assertTrue((frame["evaluation_date"].nunique()) == 2)
+
+    @patch("biopharma_agent.vnext.evaluation.EventDrivenEnsemble.fit", return_value=None)
+    @patch("biopharma_agent.vnext.evaluation.EventDrivenEnsemble.score")
+    def test_evaluator_normalizes_prediction_timestamps_before_merge(self, mock_score, _mock_fit):
+        def fake_score(vectors):
+            return [
+                ModelPrediction(
+                    entity_id=vector.entity_id,
+                    ticker=vector.ticker,
+                    as_of=str(vector.as_of),
+                    expected_return=0.10,
+                    catalyst_success_prob=0.60,
+                    confidence=0.70,
+                    crowding_risk=0.30,
+                    financing_risk=0.20,
+                    thesis_horizon=vector.thesis_horizon,
+                    model_name="test",
+                    model_version="v1",
+                    metadata={},
+                )
+                for vector in vectors
+            ]
+
+        mock_score.side_effect = fake_score
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            rows = []
+            label_rows = []
+            snapshot_rows = []
+            for ticker in ["AAA", "BBB"]:
+                for as_of, target in [
+                    ("2025-01-15T00:00:00+00:00", 0.10),
+                    ("2025-02-15T00:00:00+00:00", 0.05),
+                    ("2025-03-15T00:00:00+00:00", -0.02),
+                ]:
+                    rows.append(
+                        {
+                            "entity_id": f"{ticker}:1",
+                            "ticker": ticker,
+                            "as_of": as_of,
+                            "thesis_horizon": "90d",
+                            "program_quality_pos_prior": 0.4 if ticker == "AAA" else 0.3,
+                            "catalyst_timing_probability": 0.6,
+                        }
+                    )
+                    label_rows.append(
+                        {
+                            "ticker": ticker,
+                            "as_of": as_of,
+                            "target_return_90d": target,
+                            "target_catalyst_success": int(target > 0),
+                        }
+                    )
+                    snapshot_rows.append({"ticker": ticker, "as_of": as_of})
+
+            pd.DataFrame(rows).to_parquet(store.tables_dir / "feature_vectors.parquet", index=False)
+            pd.DataFrame(label_rows).to_parquet(store.tables_dir / "labels.parquet", index=False)
+            pd.DataFrame(snapshot_rows).to_parquet(store.tables_dir / "company_snapshots.parquet", index=False)
+
+            summary = WalkForwardEvaluator(store=store).evaluate(min_train_rows=2)
+            self.assertGreaterEqual(summary.num_windows, 1)
 
 
 if __name__ == "__main__":

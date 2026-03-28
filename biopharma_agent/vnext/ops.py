@@ -116,7 +116,12 @@ def build_readiness_report(
     distinct_snapshot_dates = 0
     latest_snapshot_age_hours: float | None = None
     if not snapshots.empty and "as_of" in snapshots.columns:
-        snapshot_ts = pd.to_datetime(snapshots["as_of"], errors="coerce", utc=True).dt.tz_convert(None)
+        snapshot_ts = pd.to_datetime(
+            snapshots["as_of"],
+            errors="coerce",
+            utc=True,
+            format="mixed",
+        ).dt.tz_convert(None)
         snapshot_ts = snapshot_ts.dropna()
         if not snapshot_ts.empty:
             distinct_snapshot_dates = int(snapshot_ts.dt.normalize().nunique())

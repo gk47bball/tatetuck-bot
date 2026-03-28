@@ -188,13 +188,19 @@ class PointInTimeLabeler:
         if snapshots.empty:
             return pd.DataFrame(), pd.DataFrame()
 
-        snapshots["as_of_ts"] = pd.to_datetime(snapshots["as_of"], errors="coerce", utc=True).dt.tz_convert(None)
+        snapshots["as_of_ts"] = pd.to_datetime(
+            snapshots["as_of"],
+            errors="coerce",
+            utc=True,
+            format="mixed",
+        ).dt.tz_convert(None)
         snapshots = snapshots.dropna(subset=["as_of_ts"]).sort_values(["ticker", "as_of_ts"])
         if not catalysts.empty and "expected_date" in catalysts.columns:
             catalysts["expected_date_ts"] = pd.to_datetime(
                 catalysts["expected_date"],
                 errors="coerce",
                 utc=True,
+                format="mixed",
             ).dt.tz_convert(None)
         else:
             catalysts = pd.DataFrame()

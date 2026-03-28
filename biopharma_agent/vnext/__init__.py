@@ -4,6 +4,7 @@ from .archive import ArchiveSummary, archive_universe
 from .audit import ResearchAudit, ResearchAuditBuilder
 from .execution import AlpacaPaperBroker, ExecutionPlan, ExecutionInstruction, OrderSubmission, PMExecutionPlanner
 from .facade import TatetuckPlatform
+from .history import HistoricalSnapshotBootstrapper, HistoryBootstrapSummary
 from .labels import LabelSummary, PointInTimeLabeler
 from .ops import PipelineRunRecord, ReadinessReport, build_readiness_report, record_pipeline_run
 from .pipeline import PipelineExecutionSummary, run_vnext_pipeline
@@ -18,6 +19,8 @@ __all__ = [
     "ExecutionInstruction",
     "ExecutionPlan",
     "HistoricalReplayEngine",
+    "HistoricalSnapshotBootstrapper",
+    "HistoryBootstrapSummary",
     "LabelSummary",
     "OrderSubmission",
     "PMExecutionPlanner",
