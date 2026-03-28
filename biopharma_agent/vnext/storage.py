@@ -40,6 +40,24 @@ class LocalResearchStore:
             json.dump(payload, f, indent=2, sort_keys=True)
         return path
 
+    def read_latest_raw_payload(self, namespace: str, key_prefix: str) -> Any | None:
+        target = self.raw_dir / namespace
+        if not target.exists():
+            return None
+        safe_prefix = key_prefix.replace("/", "_")
+        candidates = sorted(
+            target.glob(f"{safe_prefix}*.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for path in candidates:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+        return None
+
     def append_records(self, table_name: str, rows: Iterable[dict[str, Any]]) -> Path:
         rows = list(rows)
         path = self.tables_dir / f"{table_name}.parquet"

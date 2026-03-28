@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime
 from typing import Iterable
 
 from ..agents.pubmed_agent import AutoResearchAgent
@@ -21,8 +22,14 @@ class TatetuckPlatform:
         self.portfolio = PortfolioConstructor()
         self.literature = AutoResearchAgent()
 
-    def analyze_ticker(self, ticker: str, company_name: str | None = None, include_literature: bool = True) -> CompanyAnalysis:
-        snapshot = self.ingestion.ingest_company(ticker, company_name)
+    def analyze_ticker(
+        self,
+        ticker: str,
+        company_name: str | None = None,
+        include_literature: bool = True,
+        as_of: datetime | None = None,
+    ) -> CompanyAnalysis:
+        snapshot = self.ingestion.ingest_company(ticker, company_name, as_of=as_of)
         feature_vectors = self.features.build_all(snapshot)
         self.store.write_feature_vectors(feature_vectors)
 
@@ -46,10 +53,22 @@ class TatetuckPlatform:
             metadata={"store_dir": str(self.store.base_dir)},
         )
 
-    def analyze_universe(self, universe: Iterable[tuple[str, str]], include_literature: bool = False) -> list[CompanyAnalysis]:
+    def analyze_universe(
+        self,
+        universe: Iterable[tuple[str, str]],
+        include_literature: bool = False,
+        as_of: datetime | None = None,
+    ) -> list[CompanyAnalysis]:
         results: list[CompanyAnalysis] = []
         for ticker, company_name in universe:
-            results.append(self.analyze_ticker(ticker, company_name=company_name, include_literature=include_literature))
+            results.append(
+                self.analyze_ticker(
+                    ticker,
+                    company_name=company_name,
+                    include_literature=include_literature,
+                    as_of=as_of,
+                )
+            )
         return results
 
     def _aggregate_company_signal(self, snapshot: CompanySnapshot, predictions: list[ModelPrediction]):

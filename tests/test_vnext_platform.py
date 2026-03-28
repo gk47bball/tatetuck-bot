@@ -4,11 +4,12 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from biopharma_agent.vnext import TatetuckPlatform
+from biopharma_agent.vnext import TatetuckPlatform, archive_universe
 from biopharma_agent.vnext.evaluation import WalkForwardEvaluator
 from biopharma_agent.vnext.features import FeatureEngineer
 from biopharma_agent.vnext.graph import build_company_snapshot
 from biopharma_agent.vnext.portfolio import PortfolioConstructor, aggregate_signal
+from biopharma_agent.vnext.sources import IngestionService, enrich_snapshot_with_external_data
 from biopharma_agent.vnext.storage import LocalResearchStore
 
 
@@ -70,12 +71,66 @@ class TestVNextPlatform(unittest.TestCase):
 
     def test_feature_engineer_outputs_non_leaky_vectors(self):
         snapshot = build_company_snapshot(make_raw_company())
+        snapshot.metadata.update(
+            {
+                "sec_revenue_ttm": 120_000_000,
+                "sec_operating_cashflow": 20_000_000,
+                "last_10q_date": "2025-01-15",
+                "recent_offering_signal": 1.0,
+            }
+        )
         engineer = FeatureEngineer()
         vectors = engineer.build_all(snapshot)
         self.assertTrue(vectors)
         program_vector = vectors[0]
         self.assertNotIn("market_flow_return_6mo_legacy", program_vector.feature_family)
         self.assertIn("catalyst_timing_probability", program_vector.feature_family)
+        self.assertIn("commercial_execution_sec_revenue_scale", program_vector.feature_family)
+        self.assertIn("balance_sheet_recent_offering_signal", program_vector.feature_family)
+        self.assertGreaterEqual(program_vector.feature_family["catalyst_timing_filing_freshness_days"], 0.0)
+
+    def test_external_enrichment_adds_sec_evidence_calendar_and_financing(self):
+        snapshot = build_company_snapshot(make_raw_company())
+        sec_payload = {
+            "cik": "0000000123",
+            "parsed": {
+                "revenue_ttm": 150_000_000,
+                "cash_latest": 600_000_000,
+                "operating_cashflow": 30_000_000,
+                "last_10q_date": "2025-02-01",
+                "recent_filings": [
+                    {
+                        "form": "10-Q",
+                        "filing_date": "2025-02-01",
+                        "accession_number": "0001",
+                        "primary_document": "q1.htm",
+                        "url": "https://example.com/10q",
+                    }
+                ],
+                "recent_offering_forms": [
+                    {
+                        "form": "S-3",
+                        "filing_date": "2025-02-15",
+                    }
+                ],
+            },
+        }
+        calendar_payload = {
+            "events": [
+                {
+                    "event_type": "earnings",
+                    "title": "TEST estimated quarterly update",
+                    "expected_date": "2025-05-01",
+                }
+            ]
+        }
+
+        enriched = enrich_snapshot_with_external_data(snapshot, sec_payload, calendar_payload)
+        self.assertEqual(enriched.metadata["sec_cik"], "0000000123")
+        self.assertEqual(enriched.metadata["recent_offering_signal"], 1.0)
+        self.assertTrue(any(item.source == "sec" for item in enriched.evidence))
+        self.assertTrue(any(event.event_type == "earnings" for event in enriched.catalyst_events))
+        self.assertTrue(any(event.event_type == "recent_offering_filing" for event in enriched.financing_events))
 
     def test_portfolio_constructor_flags_financing_overhang(self):
         snapshot = build_company_snapshot(make_raw_company())
@@ -138,6 +193,92 @@ class TestVNextPlatform(unittest.TestCase):
             self.assertIn("signal_artifact", report)
             self.assertIn("portfolio_recommendation", report)
             self.assertEqual(report["ticker"], "TEST")
+
+    @patch("biopharma_agent.vnext.sources.fetch_legacy_snapshot")
+    @patch("biopharma_agent.vnext.sources.CorporateCalendarClient.fetch_company_calendar")
+    @patch("biopharma_agent.vnext.sources.SECXBRLClient.fetch_company_facts")
+    def test_archive_universe_returns_store_summary(self, mock_sec, mock_calendar, mock_fetch):
+        mock_fetch.return_value = make_raw_company()
+        mock_sec.return_value = {
+            "ticker": "TEST",
+            "cik": "0000000123",
+            "parsed": {
+                "revenue_ttm": 120_000_000,
+                "operating_cashflow": 25_000_000,
+                "recent_filings": [],
+                "recent_offering_forms": [],
+            },
+        }
+        mock_calendar.return_value = {"ticker": "TEST", "events": []}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            platform = TatetuckPlatform(store=LocalResearchStore(base_dir=tmpdir))
+            analyses, summary = archive_universe(platform, [("TEST", "Test Therapeutics")])
+            self.assertEqual(len(analyses), 1)
+            self.assertEqual(summary.archived_companies, 1)
+            self.assertEqual(summary.sec_enriched_companies, 1)
+            self.assertGreaterEqual(summary.snapshot_rows, 1)
+            self.assertGreaterEqual(summary.feature_rows, 1)
+            self.assertGreaterEqual(summary.prediction_rows, 1)
+            self.assertEqual(summary.top_ideas[0]["ticker"], "TEST")
+
+    @patch("biopharma_agent.vnext.sources.fetch_legacy_snapshot")
+    @patch("biopharma_agent.vnext.sources.CorporateCalendarClient.fetch_company_calendar")
+    @patch("biopharma_agent.vnext.sources.SECXBRLClient.fetch_company_facts")
+    def test_ingestion_service_recovers_from_cached_payloads(self, mock_sec, mock_calendar, mock_fetch):
+        sparse_raw = {
+            "ticker": "TEST",
+            "company_name": "Test Therapeutics",
+            "finance": {"ticker": "TEST", "trailing_6mo_return": None, "momentum_3mo": None},
+            "trials": [],
+            "num_trials": 0,
+            "num_total_trials": 0,
+            "pubmed_papers": [],
+            "num_papers": 0,
+            "conditions": [],
+        }
+        mock_fetch.return_value = sparse_raw
+        mock_sec.return_value = {"ticker": "TEST", "records": [], "source": "sec_xbrl", "status": "missing_cik"}
+        mock_calendar.return_value = {"ticker": "TEST", "events": []}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.write_raw_payload("legacy_prepare", "TEST_2025-01-01T00-00-00+00-00", make_raw_company())
+            store.write_raw_payload(
+                "sec_xbrl",
+                "TEST_2025-01-01T00-00-00+00-00",
+                {
+                    "ticker": "TEST",
+                    "cik": "0000000123",
+                    "parsed": {
+                        "revenue_ttm": 120_000_000,
+                        "operating_cashflow": 25_000_000,
+                        "recent_filings": [],
+                        "recent_offering_forms": [],
+                    },
+                },
+            )
+            store.write_raw_payload(
+                "corp_calendar",
+                "TEST_2025-01-01T00-00-00+00-00",
+                {
+                    "ticker": "TEST",
+                    "events": [
+                        {
+                            "event_type": "earnings",
+                            "title": "TEST estimated quarterly update",
+                            "expected_date": "2025-05-01",
+                        }
+                    ],
+                },
+            )
+
+            snapshot = IngestionService(store=store).ingest_company("TEST", "Test Therapeutics")
+            self.assertTrue(snapshot.programs)
+            self.assertEqual(snapshot.metadata["sec_cik"], "0000000123")
+            self.assertEqual(
+                snapshot.metadata["fallback_sources"],
+                ["corp_calendar", "legacy_prepare", "sec_xbrl"],
+            )
 
 
 if __name__ == "__main__":

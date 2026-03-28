@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 
+import pandas as pd
+
 from .entities import CompanySnapshot, FeatureVector, Program
 
 
@@ -18,6 +20,11 @@ class FeatureEngineer:
         revenue = snapshot.revenue
         market_cap = max(snapshot.market_cap, 1.0)
         tam = max(program.tam_estimate, 1.0)
+        sec_revenue_ttm = float(snapshot.metadata.get("sec_revenue_ttm", revenue) or revenue or 0.0)
+        sec_operating_cashflow = float(snapshot.metadata.get("sec_operating_cashflow", 0.0) or 0.0)
+        recent_offering_signal = float(snapshot.metadata.get("recent_offering_signal", 0.0) or 0.0)
+        filing_freshness_days = self._filing_freshness_days(snapshot)
+        op_cf_margin = sec_operating_cashflow / max(sec_revenue_ttm, 1.0) if sec_revenue_ttm > 0 else 0.0
 
         features = {
             "program_quality_pos_prior": program.pos_prior,
@@ -30,13 +37,17 @@ class FeatureEngineer:
             "catalyst_timing_probability": float(top_catalyst.probability if top_catalyst else 0.35),
             "catalyst_timing_importance": float(top_catalyst.importance if top_catalyst else 0.40),
             "catalyst_timing_crowdedness": float(top_catalyst.crowdedness if top_catalyst else 0.30),
+            "catalyst_timing_filing_freshness_days": filing_freshness_days,
             "commercial_execution_revenue_scale": math.log10(revenue + 1.0),
             "commercial_execution_revenue_to_cap": math.log10(max(revenue / market_cap, 1e-6)),
             "commercial_execution_has_product": 1.0 if snapshot.approved_products else 0.0,
+            "commercial_execution_sec_revenue_scale": math.log10(sec_revenue_ttm + 1.0),
             "balance_sheet_cash_to_cap": snapshot.cash / market_cap,
             "balance_sheet_debt_to_cap": snapshot.debt / market_cap,
             "balance_sheet_runway_months": runway_months,
             "balance_sheet_financing_pressure": 1.0 if snapshot.financing_events else 0.0,
+            "balance_sheet_operating_cashflow_margin": op_cf_margin,
+            "balance_sheet_recent_offering_signal": recent_offering_signal,
             "market_flow_momentum_3mo": float(snapshot.momentum_3mo or 0.0),
             "market_flow_volatility": float(snapshot.volatility or 0.0),
         }
@@ -67,10 +78,13 @@ class FeatureEngineer:
             "program_quality_approved_product_count": float(len(snapshot.approved_products)),
             "catalyst_timing_company_event_count": float(len(snapshot.catalyst_events)),
             "catalyst_timing_nearest_event_days": float(top_horizon),
+            "catalyst_timing_filing_freshness_days": self._filing_freshness_days(snapshot),
             "commercial_execution_revenue_scale": math.log10(snapshot.revenue + 1.0),
+            "commercial_execution_sec_revenue_scale": math.log10(float(snapshot.metadata.get("sec_revenue_ttm", snapshot.revenue) or snapshot.revenue or 0.0) + 1.0),
             "balance_sheet_cash_to_cap": snapshot.cash / max(snapshot.market_cap, 1.0),
             "balance_sheet_debt_to_cap": snapshot.debt / max(snapshot.market_cap, 1.0),
             "balance_sheet_runway_months": float(snapshot.metadata.get("runway_months", 0.0) or 0.0),
+            "balance_sheet_recent_offering_signal": float(snapshot.metadata.get("recent_offering_signal", 0.0) or 0.0),
             "market_flow_momentum_3mo": float(snapshot.momentum_3mo or 0.0),
             "market_flow_volatility": float(snapshot.volatility or 0.0),
         }
@@ -131,3 +145,16 @@ class FeatureEngineer:
         if days <= 120:
             return "90d"
         return "180d"
+
+    @staticmethod
+    def _filing_freshness_days(snapshot: CompanySnapshot) -> float:
+        as_of = snapshot.as_of.split("T")[0]
+        filing_date = snapshot.metadata.get("last_10q_date") or snapshot.metadata.get("last_10k_date")
+        if not filing_date:
+            return 180.0
+        try:
+            as_of_dt = pd.Timestamp(as_of)
+            filing_dt = pd.Timestamp(filing_date)
+            return float(max((as_of_dt - filing_dt).days, 0))
+        except Exception:
+            return 180.0
