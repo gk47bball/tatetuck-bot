@@ -58,6 +58,13 @@ class LocalResearchStore:
                 continue
         return None
 
+    def list_raw_payload_paths(self, namespace: str, key_prefix: str | None = None) -> list[Path]:
+        target = self.raw_dir / namespace
+        if not target.exists():
+            return []
+        pattern = "*.json" if not key_prefix else f"{key_prefix.replace('/', '_')}*.json"
+        return sorted(target.glob(pattern))
+
     def append_records(self, table_name: str, rows: Iterable[dict[str, Any]]) -> Path:
         rows = list(rows)
         path = self.tables_dir / f"{table_name}.parquet"
@@ -78,6 +85,17 @@ class LocalResearchStore:
         if not path.exists():
             return pd.DataFrame()
         return pd.read_parquet(path)
+
+    def replace_table(self, table_name: str, rows: Iterable[dict[str, Any]]) -> Path:
+        rows = list(rows)
+        path = self.tables_dir / f"{table_name}.parquet"
+        if not rows:
+            pd.DataFrame().to_parquet(path, index=False)
+            return path
+        frame = self._normalize_frame(pd.DataFrame(rows))
+        frame = frame.drop_duplicates()
+        frame.to_parquet(path, index=False)
+        return path
 
     def write_snapshot(self, snapshot: CompanySnapshot) -> None:
         snapshot_id = f"{snapshot.ticker}_{snapshot.as_of.replace(':', '-')}"
@@ -176,6 +194,12 @@ class LocalResearchStore:
 
     def write_predictions(self, predictions: list[ModelPrediction]) -> None:
         self.append_records("predictions", [item.to_record() for item in predictions])
+
+    def write_labels(self, rows: Iterable[dict[str, Any]]) -> Path:
+        return self.replace_table("labels", rows)
+
+    def write_event_labels(self, rows: Iterable[dict[str, Any]]) -> Path:
+        return self.replace_table("event_labels", rows)
 
     def latest_snapshot_for(self, ticker: str) -> dict[str, Any] | None:
         table = self.read_table("company_snapshots")

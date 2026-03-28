@@ -60,7 +60,9 @@ class EventDrivenEnsemble:
                 "target_return_180d",
                 "target_catalyst_success",
             }
+            and not column.startswith("target_")
             and not column.startswith("meta_")
+            and column != "evaluation_date"
         ]
 
     def fit(self, frame: pd.DataFrame) -> ExperimentRecord | None:

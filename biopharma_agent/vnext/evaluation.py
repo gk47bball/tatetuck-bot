@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
-from typing import Any
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
+from .labels import PointInTimeLabeler
 from .models import EventDrivenEnsemble
 from .storage import LocalResearchStore
 
@@ -40,59 +38,42 @@ class WalkForwardSummary:
 class WalkForwardEvaluator:
     def __init__(self, store: LocalResearchStore | None = None):
         self.store = store or LocalResearchStore()
+        self.labeler = PointInTimeLabeler(store=self.store)
 
-    def build_training_frame(self) -> pd.DataFrame:
+    def build_training_frame(self, refresh_labels: bool = False) -> pd.DataFrame:
         features = self.store.read_table("feature_vectors")
         snapshots = self.store.read_table("company_snapshots")
         if features.empty or snapshots.empty:
             return pd.DataFrame()
 
-        labels = self._build_labels(snapshots)
+        labels = self.store.read_table("labels")
+        if refresh_labels or labels.empty:
+            self.labeler.materialize_labels(snapshots=snapshots, catalysts=self.store.read_table("catalysts"))
+            labels = self.store.read_table("labels")
         if labels.empty:
             return pd.DataFrame()
-        return features.merge(labels, on=["ticker", "as_of"], how="left")
-
-    def _build_labels(self, snapshots: pd.DataFrame) -> pd.DataFrame:
-        rows: list[dict[str, Any]] = []
-        for ticker in sorted(set(snapshots["ticker"].tolist())):
-            ticker_snaps = snapshots[snapshots["ticker"] == ticker].copy()
-            if ticker_snaps.empty:
-                continue
-            start = (pd.to_datetime(ticker_snaps["as_of"]).min() - timedelta(days=14)).date().isoformat()
-            end = (pd.to_datetime(ticker_snaps["as_of"]).max() + timedelta(days=220)).date().isoformat()
-            history = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=False)
-            if history.empty:
-                continue
-            close = history["Close"]
-            close.index = pd.to_datetime(close.index, utc=True).tz_convert(None).astype("datetime64[ns]")
-            for as_of in ticker_snaps["as_of"].tolist():
-                timestamp = pd.Timestamp(as_of)
-                if timestamp.tzinfo is not None:
-                    timestamp = timestamp.tz_convert(None)
-                snapshot_ts = timestamp.to_datetime64().astype("datetime64[ns]")
-                base_idx = close.index.values.searchsorted(snapshot_ts, side="left")
-                if base_idx >= len(close):
-                    continue
-                base_price = float(close.iloc[base_idx])
-                row = {"ticker": ticker, "as_of": as_of}
-                for horizon, days in (("30d", 30), ("90d", 90), ("180d", 180)):
-                    target_ts = snapshot_ts + np.timedelta64(days, "D")
-                    future_idx = close.index.values.searchsorted(target_ts, side="left")
-                    if future_idx >= len(close) or base_price <= 0:
-                        row[f"target_return_{horizon}"] = np.nan
-                    else:
-                        future_price = float(close.iloc[future_idx])
-                        row[f"target_return_{horizon}"] = (future_price / base_price) - 1.0
-                catalyst_label = row.get("target_return_90d")
-                row["target_catalyst_success"] = int(pd.notna(catalyst_label) and float(catalyst_label) > 0.08)
-                rows.append(row)
-        return pd.DataFrame(rows)
+        frame = features.merge(labels, on=["ticker", "as_of"], how="left")
+        if frame.empty:
+            return frame
+        frame["as_of"] = pd.to_datetime(frame["as_of"])
+        frame["evaluation_date"] = frame["as_of"].dt.normalize()
+        frame = frame.sort_values("as_of").drop_duplicates(
+            subset=["ticker", "entity_id", "evaluation_date"],
+            keep="last",
+        )
+        return frame
 
     def leakage_audit(self, frame: pd.DataFrame) -> bool:
         if frame.empty:
             return False
         forbidden_prefixes = ("target_",)
-        feature_columns = [col for col in frame.columns if col not in {"entity_id", "ticker", "as_of", "thesis_horizon"}]
+        feature_columns = [
+            col
+            for col in frame.columns
+            if col not in {"entity_id", "ticker", "as_of", "thesis_horizon", "evaluation_date"}
+            and not col.startswith("target_")
+            and not col.startswith("meta_")
+        ]
         if any(col.startswith(forbidden_prefixes) and col in feature_columns for col in feature_columns):
             return False
         if "market_flow_return_6mo_legacy" in feature_columns:
@@ -116,9 +97,8 @@ class WalkForwardEvaluator:
                 message="No archived snapshots with forward labels yet. Collect snapshots over time, then rerun.",
             )
 
-        frame["as_of"] = pd.to_datetime(frame["as_of"])
-        frame = frame.sort_values("as_of")
-        unique_dates = sorted(frame["as_of"].drop_duplicates().tolist())
+        frame = frame.sort_values(["evaluation_date", "as_of"])
+        unique_dates = sorted(frame["evaluation_date"].drop_duplicates().tolist())
         if len(unique_dates) < 3:
             return WalkForwardSummary(
                 num_rows=len(frame),
@@ -147,8 +127,8 @@ class WalkForwardEvaluator:
         for split_idx in range(2, len(unique_dates)):
             train_dates = unique_dates[:split_idx]
             test_date = unique_dates[split_idx]
-            train = frame[frame["as_of"].isin(train_dates)].copy()
-            test = frame[frame["as_of"] == test_date].copy()
+            train = frame[frame["evaluation_date"].isin(train_dates)].copy()
+            test = frame[frame["evaluation_date"] == test_date].copy()
             if len(train) < min_train_rows or test.empty:
                 continue
 
@@ -224,11 +204,9 @@ class WalkForwardEvaluator:
                 "ticker",
                 "as_of",
                 "thesis_horizon",
-                "target_return_30d",
-                "target_return_90d",
-                "target_return_180d",
-                "target_catalyst_success",
+                "evaluation_date",
             }
+            and not key.startswith("target_")
             and not key.startswith("meta_")
         }
         metadata = {key[5:]: row[key] for key in row.index if key.startswith("meta_")}
