@@ -138,24 +138,6 @@ class LocalResearchStore:
                         "primary_outcomes": json.dumps(trial.primary_outcomes),
                     }
                 )
-            for catalyst in program.catalyst_events:
-                catalyst_rows.append(
-                    {
-                        "ticker": snapshot.ticker,
-                        "as_of": snapshot.as_of,
-                        "program_id": catalyst.program_id,
-                        "event_id": catalyst.event_id,
-                        "event_type": catalyst.event_type,
-                        "title": catalyst.title,
-                        "expected_date": catalyst.expected_date,
-                        "horizon_days": catalyst.horizon_days,
-                        "probability": catalyst.probability,
-                        "importance": catalyst.importance,
-                        "crowdedness": catalyst.crowdedness,
-                        "status": catalyst.status,
-                    }
-                )
-
         for approved_product in snapshot.approved_products:
             program_rows.append(
                 {
@@ -168,6 +150,29 @@ class LocalResearchStore:
                     "conditions": json.dumps([approved_product.indication]),
                     "pos_prior": 1.0,
                     "tam_estimate": approved_product.annual_revenue,
+                }
+            )
+
+        seen_catalysts: set[tuple[str, str | None]] = set()
+        for catalyst in snapshot.catalyst_events:
+            dedupe_key = (catalyst.event_id, catalyst.expected_date)
+            if dedupe_key in seen_catalysts:
+                continue
+            seen_catalysts.add(dedupe_key)
+            catalyst_rows.append(
+                {
+                    "ticker": snapshot.ticker,
+                    "as_of": snapshot.as_of,
+                    "program_id": catalyst.program_id,
+                    "event_id": catalyst.event_id,
+                    "event_type": catalyst.event_type,
+                    "title": catalyst.title,
+                    "expected_date": catalyst.expected_date,
+                    "horizon_days": catalyst.horizon_days,
+                    "probability": catalyst.probability,
+                    "importance": catalyst.importance,
+                    "crowdedness": catalyst.crowdedness,
+                    "status": catalyst.status,
                 }
             )
 

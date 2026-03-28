@@ -5,10 +5,21 @@ import math
 import pandas as pd
 
 from .entities import CompanySnapshot, FeatureVector, Program
+from .taxonomy import event_type_bucket, event_type_priority, is_clinical_event_type
 
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+EVENT_TYPE_FEATURES = (
+    "phase1_readout",
+    "phase2_readout",
+    "phase3_readout",
+    "pdufa",
+    "commercial_update",
+    "earnings",
+)
 
 
 class FeatureEngineer:
@@ -16,6 +27,7 @@ class FeatureEngineer:
         lead_trial = program.trials[0] if program.trials else None
         enrollment = float(lead_trial.enrollment if lead_trial else 0)
         top_catalyst = program.catalyst_events[0] if program.catalyst_events else None
+        company_primary_event = self._primary_company_event(snapshot)
         runway_months = float(snapshot.metadata.get("runway_months", 0.0) or 0.0)
         revenue = snapshot.revenue
         market_cap = max(snapshot.market_cap, 1.0)
@@ -25,6 +37,8 @@ class FeatureEngineer:
         recent_offering_signal = float(snapshot.metadata.get("recent_offering_signal", 0.0) or 0.0)
         filing_freshness_days = self._filing_freshness_days(snapshot)
         op_cf_margin = sec_operating_cashflow / max(sec_revenue_ttm, 1.0) if sec_revenue_ttm > 0 else 0.0
+        top_event_type = top_catalyst.event_type if top_catalyst else None
+        company_event_type = company_primary_event.event_type if company_primary_event else None
 
         features = {
             "program_quality_pos_prior": program.pos_prior,
@@ -38,6 +52,15 @@ class FeatureEngineer:
             "catalyst_timing_importance": float(top_catalyst.importance if top_catalyst else 0.40),
             "catalyst_timing_crowdedness": float(top_catalyst.crowdedness if top_catalyst else 0.30),
             "catalyst_timing_filing_freshness_days": filing_freshness_days,
+            "catalyst_timing_expected_value": float(
+                (top_catalyst.probability * top_catalyst.importance * (1.0 - top_catalyst.crowdedness))
+                if top_catalyst
+                else 0.10
+            ),
+            "catalyst_timing_clinical_focus": 1.0 if is_clinical_event_type(top_event_type) else 0.0,
+            "catalyst_timing_company_event_priority": float(event_type_priority(company_event_type)),
+            "catalyst_timing_company_event_clinical": 1.0 if is_clinical_event_type(company_event_type) else 0.0,
+            "catalyst_timing_company_event_earnings": 1.0 if company_event_type == "earnings" else 0.0,
             "commercial_execution_revenue_scale": math.log10(revenue + 1.0),
             "commercial_execution_revenue_to_cap": math.log10(max(revenue / market_cap, 1e-6)),
             "commercial_execution_has_product": 1.0 if snapshot.approved_products else 0.0,
@@ -57,6 +80,8 @@ class FeatureEngineer:
         features["commercial_execution_growth_signal"] = (
             snapshot.approved_products[0].growth_signal if snapshot.approved_products else 0.0
         )
+        features.update(self._event_type_features(top_event_type, prefix="catalyst_timing_event"))
+        features.update(self._event_type_features(company_event_type, prefix="catalyst_timing_company_event"))
 
         return FeatureVector(
             entity_id=program.program_id,
@@ -68,17 +93,25 @@ class FeatureEngineer:
                 "program_name": program.name,
                 "phase": program.phase,
                 "modality": program.modality,
+                "event_type": top_event_type,
+                "event_bucket": event_type_bucket(top_event_type),
+                "company_primary_event_type": company_event_type,
             },
         )
 
     def build_company_aggregate_features(self, snapshot: CompanySnapshot) -> FeatureVector:
+        company_primary_event = self._primary_company_event(snapshot)
         top_horizon = min((event.horizon_days for event in snapshot.catalyst_events), default=180)
+        company_event_type = company_primary_event.event_type if company_primary_event else None
         aggregate = {
             "program_quality_program_count": float(len(snapshot.programs)),
             "program_quality_approved_product_count": float(len(snapshot.approved_products)),
             "catalyst_timing_company_event_count": float(len(snapshot.catalyst_events)),
             "catalyst_timing_nearest_event_days": float(top_horizon),
             "catalyst_timing_filing_freshness_days": self._filing_freshness_days(snapshot),
+            "catalyst_timing_clinical_focus": 1.0 if is_clinical_event_type(company_event_type) else 0.0,
+            "catalyst_timing_company_event_priority": float(event_type_priority(company_event_type)),
+            "catalyst_timing_company_event_earnings": 1.0 if company_event_type == "earnings" else 0.0,
             "commercial_execution_revenue_scale": math.log10(snapshot.revenue + 1.0),
             "commercial_execution_sec_revenue_scale": math.log10(float(snapshot.metadata.get("sec_revenue_ttm", snapshot.revenue) or snapshot.revenue or 0.0) + 1.0),
             "balance_sheet_cash_to_cap": snapshot.cash / max(snapshot.market_cap, 1.0),
@@ -88,13 +121,18 @@ class FeatureEngineer:
             "market_flow_momentum_3mo": float(snapshot.momentum_3mo or 0.0),
             "market_flow_volatility": float(snapshot.volatility or 0.0),
         }
+        aggregate.update(self._event_type_features(company_event_type, prefix="catalyst_timing_company_event"))
         return FeatureVector(
             entity_id=f"{snapshot.ticker}:company",
             ticker=snapshot.ticker,
             as_of=snapshot.as_of,
             thesis_horizon=self._horizon_label(top_horizon),
             feature_family=aggregate,
-            metadata={"aggregate": True},
+            metadata={
+                "aggregate": True,
+                "event_type": company_event_type,
+                "event_bucket": event_type_bucket(company_event_type),
+            },
         )
 
     def build_all(self, snapshot: CompanySnapshot) -> list[FeatureVector]:
@@ -158,3 +196,19 @@ class FeatureEngineer:
             return float(max((as_of_dt - filing_dt).days, 0))
         except Exception:
             return 180.0
+
+    @staticmethod
+    def _event_type_features(event_type: str | None, prefix: str) -> dict[str, float]:
+        payload = {f"{prefix}_{name}": 0.0 for name in EVENT_TYPE_FEATURES}
+        if event_type in EVENT_TYPE_FEATURES:
+            payload[f"{prefix}_{event_type}"] = 1.0
+        return payload
+
+    @staticmethod
+    def _primary_company_event(snapshot: CompanySnapshot):
+        if not snapshot.catalyst_events:
+            return None
+        return min(
+            snapshot.catalyst_events,
+            key=lambda event: (-event_type_priority(event.event_type), event.horizon_days, -event.importance, event.crowdedness),
+        )

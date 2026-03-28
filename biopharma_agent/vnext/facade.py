@@ -20,7 +20,7 @@ class TatetuckPlatform:
         self.ingestion = IngestionService(store=self.store)
         self.features = FeatureEngineer()
         self.ensemble = EventDrivenEnsemble(store=self.store)
-        self.portfolio = PortfolioConstructor()
+        self.portfolio = PortfolioConstructor(store=self.store)
         self.literature = AutoResearchAgent()
 
     def analyze_ticker(

@@ -5,6 +5,7 @@ Builds current company snapshots into the local research store, then runs the
 new walk-forward evaluator when enough historical snapshots exist.
 """
 
+import argparse
 import time
 
 import prepare
@@ -15,7 +16,18 @@ from biopharma_agent.vnext.ops import utc_now_iso
 from biopharma_agent.vnext.storage import LocalResearchStore
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run the vNext event-driven evaluator.")
+    parser.add_argument(
+        "--prefer-archive",
+        action="store_true",
+        help="Use archived snapshots when available instead of refreshing every ticker live first.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     print("=" * 72)
     print("  TATETUCK BOT vNEXT — EVENT-DRIVEN BIOPHARMA ALPHA PLATFORM")
     print("=" * 72)
@@ -27,7 +39,12 @@ def main():
     try:
         platform = TatetuckPlatform(store=store)
         print("\n[ingest] Building company-program-catalyst snapshots...")
-        analyses = platform.analyze_universe(prepare.BENCHMARK_TICKERS, include_literature=settings.include_literature)
+        analyses = platform.analyze_universe(
+            prepare.BENCHMARK_TICKERS,
+            include_literature=settings.include_literature,
+            prefer_archive=args.prefer_archive,
+            fallback_to_archive=True,
+        )
 
         print("\n[signals] Current top event-driven ideas")
         ranked = sorted(analyses, key=lambda item: item.portfolio.target_weight, reverse=True)
@@ -55,9 +72,16 @@ def main():
                 "rank_ic": summary.rank_ic,
                 "hit_rate": summary.hit_rate,
                 "top_bottom_spread": summary.top_bottom_spread,
+                "turnover": summary.turnover,
+                "brier": summary.calibrated_brier,
                 "leakage_passed": summary.leakage_passed,
+                "event_type_scorecards": summary.event_type_scorecards,
             },
-            config={"store_dir": settings.store_dir, "include_literature": settings.include_literature},
+            config={
+                "store_dir": settings.store_dir,
+                "include_literature": settings.include_literature,
+                "prefer_archive": args.prefer_archive,
+            },
         )
     except Exception as exc:
         finished_at = utc_now_iso()
@@ -68,7 +92,11 @@ def main():
             started_at=started_at,
             finished_at=finished_at,
             metrics={},
-            config={"store_dir": settings.store_dir, "include_literature": settings.include_literature},
+            config={
+                "store_dir": settings.store_dir,
+                "include_literature": settings.include_literature,
+                "prefer_archive": args.prefer_archive,
+            },
             notes=f"{type(exc).__name__}: {exc}",
         )
         raise
@@ -86,6 +114,21 @@ def main():
     print(f"leakage_passed:   {summary.leakage_passed}")
     if summary.message:
         print(f"message:          {summary.message}")
+    if summary.event_type_scorecards:
+        print("\n[event_scorecards]")
+        for event_type, metrics in sorted(
+            summary.event_type_scorecards.items(),
+            key=lambda item: item[1].get("top_bottom_spread", 0.0),
+            reverse=True,
+        ):
+            print(
+                f"{event_type:18} | "
+                f"bucket={metrics.get('event_bucket', 'other'):10} | "
+                f"rows={int(metrics.get('rows', 0)):>4} | "
+                f"hit={metrics.get('hit_rate', 0.0):.3f} | "
+                f"spread={metrics.get('top_bottom_spread', 0.0):+.3f} | "
+                f"brier={metrics.get('calibrated_brier', 1.0):.3f}"
+            )
 
     print(f"\n[summary] elapsed_seconds={time.time() - start:.1f}")
 

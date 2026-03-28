@@ -11,6 +11,7 @@ import requests
 import yfinance as yf
 
 from .storage import LocalResearchStore
+from .taxonomy import event_type_bucket, event_type_priority
 
 
 class PriceHistoryProvider(Protocol):
@@ -254,12 +255,14 @@ class PointInTimeLabeler:
                     row["target_event_success"] = int(pd.notna(event_return) and float(event_return) > 0.05)
                     row["target_primary_event_days"] = int(primary_event["horizon_days"])
                     row["target_primary_event_type"] = primary_event["event_type"]
+                    row["target_primary_event_bucket"] = event_type_bucket(primary_event["event_type"])
                     event_rows.append(
                         {
                             "ticker": ticker,
                             "as_of": snapshot.as_of,
                             "event_id": primary_event["event_id"],
                             "event_type": primary_event["event_type"],
+                            "event_bucket": event_type_bucket(primary_event["event_type"]),
                             "expected_date": primary_event["expected_date"],
                             "horizon_days": int(primary_event["horizon_days"]),
                             "target_event_return_10d": event_return,
@@ -273,6 +276,7 @@ class PointInTimeLabeler:
                     row["target_event_success"] = np.nan
                     row["target_primary_event_days"] = np.nan
                     row["target_primary_event_type"] = None
+                    row["target_primary_event_bucket"] = "none"
                     catalyst_anchor = row.get("target_return_90d")
                     catalyst_threshold = 0.08
 
@@ -300,7 +304,15 @@ class PointInTimeLabeler:
         exact = exact[exact["expected_date_ts"] >= as_of_ts]
         if exact.empty:
             return None
-        exact = exact.sort_values(["expected_date_ts", "importance"], ascending=[True, False])
+        if "importance" not in exact.columns:
+            exact["importance"] = 0.0
+        if "crowdedness" not in exact.columns:
+            exact["crowdedness"] = 0.50
+        exact["event_priority"] = exact["event_type"].map(event_type_priority).fillna(0)
+        exact = exact.sort_values(
+            ["event_priority", "importance", "expected_date_ts", "crowdedness"],
+            ascending=[False, False, True, True],
+        )
         return exact.iloc[0]
 
     @staticmethod

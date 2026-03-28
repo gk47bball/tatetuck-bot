@@ -134,6 +134,15 @@ class TestVNextPlatform(unittest.TestCase):
         self.assertTrue(any(event.event_type == "earnings" for event in enriched.catalyst_events))
         self.assertTrue(any(event.event_type == "recent_offering_filing" for event in enriched.financing_events))
 
+    def test_store_persists_company_level_catalysts(self):
+        snapshot = build_company_snapshot(make_raw_company())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.write_snapshot(snapshot)
+            catalysts = store.read_table("catalysts")
+            self.assertIn("phase3_readout", catalysts["event_type"].tolist())
+            self.assertIn("earnings", catalysts["event_type"].tolist())
+
     def test_portfolio_constructor_flags_financing_overhang(self):
         snapshot = build_company_snapshot(make_raw_company())
         engineer = FeatureEngineer()
@@ -175,6 +184,8 @@ class TestVNextPlatform(unittest.TestCase):
             crowding_risk=0.22,
             financing_risk=0.18,
             thesis_horizon="90d",
+            primary_event_type="phase3_readout",
+            primary_event_bucket="clinical",
             rationale=[],
             supporting_evidence=[],
         )
@@ -187,6 +198,8 @@ class TestVNextPlatform(unittest.TestCase):
             crowding_risk=0.35,
             financing_risk=0.30,
             thesis_horizon="90d",
+            primary_event_type="phase2_readout",
+            primary_event_bucket="clinical",
             rationale=[],
             supporting_evidence=[],
         )
@@ -197,6 +210,46 @@ class TestVNextPlatform(unittest.TestCase):
         self.assertEqual(high_rec.scenario, "pre-catalyst long")
         self.assertGreater(high_rec.target_weight, medium_rec.target_weight)
         self.assertGreaterEqual(high_rec.target_weight, 3.0)
+
+    def test_portfolio_constructor_smooths_small_weight_changes(self):
+        constructor = PortfolioConstructor()
+        previous_signal = SignalArtifact(
+            ticker="STBL",
+            as_of="2025-01-01T00:00:00+00:00",
+            expected_return=0.18,
+            catalyst_success_prob=0.68,
+            confidence=0.78,
+            crowding_risk=0.28,
+            financing_risk=0.20,
+            thesis_horizon="90d",
+            primary_event_type="phase3_readout",
+            primary_event_bucket="clinical",
+            rationale=[],
+            supporting_evidence=[],
+        )
+        current_signal = SignalArtifact(
+            ticker="STBL",
+            as_of="2025-02-01T00:00:00+00:00",
+            expected_return=0.17,
+            catalyst_success_prob=0.65,
+            confidence=0.75,
+            crowding_risk=0.29,
+            financing_risk=0.21,
+            thesis_horizon="90d",
+            primary_event_type="phase3_readout",
+            primary_event_bucket="clinical",
+            rationale=[],
+            supporting_evidence=[],
+        )
+        previous_recommendation = constructor.recommend(previous_signal)
+        current_recommendation = constructor.recommend(
+            current_signal,
+            previous_recommendation=previous_recommendation,
+            previous_signal=previous_signal,
+        )
+
+        self.assertGreater(previous_recommendation.target_weight, 0.0)
+        self.assertLess(abs(current_recommendation.target_weight - previous_recommendation.target_weight), 1.0)
 
     def test_walk_forward_leakage_audit_rejects_legacy_feature(self):
         with tempfile.TemporaryDirectory() as tmpdir:

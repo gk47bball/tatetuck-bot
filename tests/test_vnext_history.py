@@ -8,6 +8,7 @@ import pandas as pd
 from biopharma_agent.vnext.entities import ModelPrediction
 from biopharma_agent.vnext.evaluation import WalkForwardEvaluator
 from biopharma_agent.vnext.labels import EODHDHistoryProvider, PointInTimeLabeler
+from biopharma_agent.vnext.models import EventDrivenEnsemble
 from biopharma_agent.vnext.replay import HistoricalReplayEngine
 from biopharma_agent.vnext.storage import LocalResearchStore
 
@@ -119,6 +120,41 @@ class TestVNextHistory(unittest.TestCase):
             self.assertIn("target_event_return_10d", labels.columns)
             self.assertTrue(labels["target_return_90d"].notna().all())
             self.assertTrue(event_labels["target_event_return_10d"].notna().all())
+
+    def test_labeler_prioritizes_clinical_events_over_earnings_noise(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            snapshots = pd.DataFrame([{"ticker": "TEST", "as_of": "2025-01-15T00:00:00"}])
+            catalysts = pd.DataFrame(
+                [
+                    {
+                        "ticker": "TEST",
+                        "as_of": "2025-01-15T00:00:00",
+                        "event_id": "TEST:earnings",
+                        "event_type": "earnings",
+                        "expected_date": "2025-01-25",
+                        "horizon_days": 10,
+                        "importance": 0.4,
+                    },
+                    {
+                        "ticker": "TEST",
+                        "as_of": "2025-01-15T00:00:00",
+                        "event_id": "TEST:phase3",
+                        "event_type": "phase3_readout",
+                        "expected_date": "2025-02-20",
+                        "horizon_days": 36,
+                        "importance": 0.9,
+                    },
+                ]
+            )
+            labeler = PointInTimeLabeler(
+                store=store,
+                history_provider=StubHistoryProvider({"TEST": make_price_frame()}),
+            )
+            labeler.materialize_labels(snapshots=snapshots, catalysts=catalysts)
+            labels = store.read_table("labels")
+            self.assertEqual(labels.iloc[0]["target_primary_event_type"], "phase3_readout")
+            self.assertEqual(labels.iloc[0]["target_primary_event_bucket"], "clinical")
 
     def test_labeler_anchors_base_price_on_prior_trading_day(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -349,6 +385,31 @@ class TestVNextHistory(unittest.TestCase):
 
             summary = WalkForwardEvaluator(store=store).evaluate(min_train_rows=2)
             self.assertGreaterEqual(summary.num_windows, 1)
+            self.assertIn("none", summary.event_type_scorecards)
+
+    def test_ensemble_fit_can_skip_artifact_persistence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            rows = []
+            for idx in range(24):
+                rows.append(
+                    {
+                        "entity_id": f"T{idx}:1",
+                        "ticker": f"T{idx}",
+                        "as_of": f"2025-01-{(idx % 9) + 1:02d}T00:00:00+00:00",
+                        "thesis_horizon": "90d",
+                        "program_quality_pos_prior": 0.2 + (idx * 0.01),
+                        "program_quality_phase_score": 0.3 + ((idx % 3) * 0.1),
+                        "catalyst_timing_probability": 0.4 + ((idx % 4) * 0.05),
+                        "catalyst_timing_expected_value": 0.1 + ((idx % 5) * 0.02),
+                        "target_return_90d": -0.05 + (idx * 0.01),
+                        "target_catalyst_success": idx % 2,
+                    }
+                )
+            frame = pd.DataFrame(rows)
+            record = EventDrivenEnsemble(store=store).fit(frame, persist_artifact=False)
+            self.assertIsNotNone(record)
+            self.assertIsNone(record.artifact_path)
 
 
 if __name__ == "__main__":

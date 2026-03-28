@@ -16,6 +16,7 @@ from .entities import (
     Program,
     Trial,
 )
+from .taxonomy import program_event_type_for_phase
 
 
 MODALITY_KEYWORDS = {
@@ -119,7 +120,7 @@ def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -
         program_catalysts = [
             _build_catalyst(
                 program_id=f"{raw.get('ticker')}:{idx}",
-                event_type="clinical_readout" if phase != "APPROVED" else "commercial_update",
+                event_type=program_event_type_for_phase(phase),
                 title=f"{program_name} next milestone",
                 horizon_days=PHASE_HORIZONS.get(phase, 180),
                 probability=0.45 + min(pos_prior * 0.4, 0.35),

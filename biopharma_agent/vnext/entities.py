@@ -175,8 +175,10 @@ class SignalArtifact:
     crowding_risk: float
     financing_risk: float
     thesis_horizon: str
-    rationale: list[str]
-    supporting_evidence: list[EvidenceSnippet]
+    rationale: list[str] = field(default_factory=list)
+    supporting_evidence: list[EvidenceSnippet] = field(default_factory=list)
+    primary_event_type: str | None = None
+    primary_event_bucket: str | None = None
     program_predictions: list[ModelPrediction] = field(default_factory=list)
 
     def to_record(self) -> dict[str, Any]:
@@ -189,6 +191,8 @@ class SignalArtifact:
             "crowding_risk": self.crowding_risk,
             "financing_risk": self.financing_risk,
             "thesis_horizon": self.thesis_horizon,
+            "primary_event_type": self.primary_event_type,
+            "primary_event_bucket": self.primary_event_bucket,
             "rationale": self.rationale,
             "supporting_evidence": [asdict(item) for item in self.supporting_evidence],
             "supporting_evidence_count": len(self.supporting_evidence),
@@ -206,6 +210,7 @@ class PortfolioRecommendation:
     confidence: float
     scenario: str
     thesis_horizon: str
+    primary_event_type: str | None = None
     risk_flags: list[str] = field(default_factory=list)
 
     def to_record(self) -> dict[str, Any]:

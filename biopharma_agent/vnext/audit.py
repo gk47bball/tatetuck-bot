@@ -68,7 +68,7 @@ class ResearchAudit:
 class ResearchAuditBuilder:
     def __init__(self, store: LocalResearchStore | None = None):
         self.store = store or LocalResearchStore()
-        self.portfolio = PortfolioConstructor()
+        self.portfolio = PortfolioConstructor(store=self.store)
         self.features = FeatureEngineer()
         self.ensemble = EventDrivenEnsemble(store=self.store)
 
@@ -290,6 +290,12 @@ class ResearchAuditBuilder:
     ) -> SignalArtifact:
         signal_row = None if refresh_company_views else self._lookup_row(signals, snapshot.ticker, snapshot.as_of)
         if signal_row is not None:
+            primary_event_type = signal_row.get("primary_event_type")
+            if isinstance(primary_event_type, float) and pd.isna(primary_event_type):
+                primary_event_type = None
+            primary_event_bucket = signal_row.get("primary_event_bucket", "none")
+            if isinstance(primary_event_bucket, float) and pd.isna(primary_event_bucket):
+                primary_event_bucket = "none"
             return SignalArtifact(
                 ticker=snapshot.ticker,
                 as_of=snapshot.as_of,
@@ -301,6 +307,8 @@ class ResearchAuditBuilder:
                 thesis_horizon=str(signal_row.get("thesis_horizon", "90d")),
                 rationale=_coerce_list(signal_row.get("rationale")),
                 supporting_evidence=snapshot.evidence[:5],
+                primary_event_type=None if primary_event_type is None else str(primary_event_type),
+                primary_event_bucket=str(primary_event_bucket),
                 program_predictions=[],
             )
 
@@ -327,6 +335,9 @@ class ResearchAuditBuilder:
     ) -> PortfolioRecommendation:
         recommendation_row = None if refresh_company_views else self._lookup_row(recommendations, snapshot.ticker, snapshot.as_of)
         if recommendation_row is not None:
+            primary_event_type = recommendation_row.get("primary_event_type")
+            if isinstance(primary_event_type, float) and pd.isna(primary_event_type):
+                primary_event_type = None
             return PortfolioRecommendation(
                 ticker=snapshot.ticker,
                 as_of=snapshot.as_of,
@@ -336,6 +347,7 @@ class ResearchAuditBuilder:
                 confidence=float(recommendation_row["confidence"]),
                 scenario=str(recommendation_row["scenario"]),
                 thesis_horizon=str(recommendation_row["thesis_horizon"]),
+                primary_event_type=None if primary_event_type is None else str(primary_event_type),
                 risk_flags=_coerce_list(recommendation_row.get("risk_flags")),
             )
         return self.portfolio.recommend(signal)
