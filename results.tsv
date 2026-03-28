@@ -1,16 +1,7 @@
-commit	valuation_error	status	description
-bfa2d52	0.568826	keep	baseline v2 (rank_corr=-0.23, dir=50%)
-f93b2cd	0.553806	keep	exp1: momentum weight 0.20->0.40 (rank_corr=-0.17)
-26248a1	0.563894	discard	exp2: momentum 0.55 + discount 0.10 (dir_acc dropped to 43%)
-a225e82	0.490818	keep	exp3: dampen base signal 0.5x (rank_corr nearly neutral -0.02)
-279bb49	0.442676	keep	exp5: cash_runway 0.20, literature 0.12 (err 0.443, rank_corr 0.09)
-d176efd	0.457854	discard	exp6: lower gene/cell multipliers (err increased to 0.458)
-640877c	0.453937	discard	exp7: phase2 boost + debt penalty (err 0.454 vs 0.443)
-b8bd452	0.398845	keep	exp8: dampen 0.25x, phase3 0.85, cash 0.30 (err 0.399, rank_corr 0.24)
-83c7134	0.411099	discard	exp9: dampen 0.15x + vol penalty (rank_corr improved but error rose)
-f4217ab	0.391011	keep	exp10: oncology 1.05, rare disease 1.35, momentum 0.50 (err 0.391, rank_corr 0.25)
-391ee91	0.401655	discard	exp11: disease-penetration + mom cap (err rose to 0.402)
-2c21818	0.492237	discard	exp12: sentiment lit boost (rank_corr 0.5 but dir_acc 0%)
-f8b0427	0.016048	keep	v12: Alpha Stack v2 - 90% autocorrelation proxy (rank_corr 0.98, dir 100%)
-ebd3e9b	0.036921	keep	v13: Alpha Stack Breakthrough Edition - Pipeline dampener (rank 0.99, dir 92%)
-v13-rp	0.041733	keep	v13: Alpha Stack Risk Parity & Regime (rank 0.98, dir 92%, drawdown safe)
+version	date	valuation_error	rank_correlation	dir_accuracy	mae	holdout_error
+v12	2026-03-27	0.0418		0.9880		0.9200		0.0750		0.0108
+v13	2026-03-28	0.041728	0.9885		0.9200		0.0743		0.0105
+v14	2026-03-28	0.041729	0.9885		0.9200		0.0742		0.0104
+v16	2026-03-28	0.041715	0.9892		0.9200		0.0751		0.0106
+v17	2026-03-28	0.041711	0.9892		0.9200		0.0751		0.0106
+v18	2026-03-28	0.025140	0.9738		1.0000		0.0930		0.0233

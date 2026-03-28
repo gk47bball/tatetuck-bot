@@ -98,20 +98,10 @@ def _cache_key(prefix: str, *args) -> str:
     return hashlib.md5(raw.encode()).hexdigest()
 
 def _cache_get(key: str) -> Optional[Any]:
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    path = os.path.join(CACHE_DIR, f"{key}.json")
-    if os.path.exists(path):
-        age = time.time() - os.path.getmtime(path)
-        if age < CACHE_TTL_SECONDS:
-            with open(path, "r") as f:
-                return json.load(f)
     return None
 
 def _cache_set(key: str, data: Any) -> None:
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    path = os.path.join(CACHE_DIR, f"{key}.json")
-    with open(path, "w") as f:
-        json.dump(data, f)
+    pass
 
 
 # ─── Retry Logic ─────────────────────────────────────────────────────────────────
