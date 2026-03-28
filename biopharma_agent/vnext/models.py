@@ -48,7 +48,7 @@ class EnsembleBundle:
 
 
 class EventDrivenEnsemble:
-    def __init__(self, store: LocalResearchStore | None = None, model_name: str = "event_driven_ensemble", model_version: str = "v2"):
+    def __init__(self, store: LocalResearchStore | None = None, model_name: str = "event_driven_ensemble", model_version: str = "v3"):
         self.store = store or LocalResearchStore()
         self.model_name = model_name
         self.model_version = model_version
@@ -315,6 +315,18 @@ class EventDrivenEnsemble:
 
     @staticmethod
     def _rule_score_from_features(features: dict[str, float] | pd.Series) -> tuple[float, float]:
+        pre_commercial = _feature_value(features, "state_profile_pre_commercial", 0.0)
+        commercial_launch = _feature_value(features, "state_profile_commercial_launch", 0.0)
+        commercialized = _feature_value(features, "state_profile_commercialized", 0.0)
+        competition_intensity = _feature_value(features, "state_profile_competition_intensity", 0.55)
+        floor_support = _feature_value(features, "state_profile_floor_support_pct", 0.0)
+        launch_progress = _feature_value(features, "state_profile_launch_progress_pct", _feature_value(features, "commercial_execution_launch_progress_pct", 0.0))
+        lifecycle_score = _feature_value(features, "state_profile_lifecycle_management_score", _feature_value(features, "commercial_execution_lifecycle_management_score", 0.0))
+        pipeline_optionality = _feature_value(features, "state_profile_pipeline_optionality_score", 0.0)
+        capital_deployment = _feature_value(features, "state_profile_capital_deployment_score", _feature_value(features, "balance_sheet_capital_deployment_score", 0.0))
+        hard_catalyst_presence = _feature_value(features, "state_profile_hard_catalyst_presence", 0.0)
+        precommercial_value_gap = _feature_value(features, "state_profile_precommercial_value_gap", 0.0)
+
         expected_return = (
             0.18 * _feature_value(features, "program_quality_pos_prior", 0.15)
             + 0.12 * _feature_value(features, "program_quality_phase_score", 0.20)
@@ -333,6 +345,17 @@ class EventDrivenEnsemble:
             - 0.04 * _feature_value(features, "market_flow_volatility", 0.0)
             - 0.05 * _feature_value(features, "catalyst_timing_company_event_earnings", 0.0)
         )
+        expected_return += (
+            0.08 * pre_commercial * precommercial_value_gap
+            + 0.06 * commercial_launch * launch_progress
+            + 0.06 * commercial_launch * lifecycle_score
+            + 0.05 * commercialized * pipeline_optionality
+            + 0.05 * commercialized * capital_deployment
+            + 0.04 * floor_support
+            + 0.03 * hard_catalyst_presence
+            - 0.08 * pre_commercial * competition_intensity * (1.0 - hard_catalyst_presence)
+            - 0.03 * competition_intensity
+        )
         success_prob = _sigmoid(
             (1.4 * _feature_value(features, "program_quality_pos_prior", 0.15))
             + (0.7 * _feature_value(features, "program_quality_phase_score", 0.20))
@@ -341,7 +364,11 @@ class EventDrivenEnsemble:
             + (0.5 * _feature_value(features, "catalyst_timing_clinical_focus", 0.0))
             + (0.2 * _feature_value(features, "catalyst_timing_event_pdufa", 0.0))
             + (0.2 * _feature_value(features, "catalyst_timing_event_phase3_readout", 0.0))
+            + (0.15 * hard_catalyst_presence)
+            + (0.08 * commercial_launch * launch_progress)
+            + (0.06 * commercialized * pipeline_optionality)
             - (0.6 * _feature_value(features, "program_quality_modality_risk", 0.50))
             - (0.3 * _feature_value(features, "catalyst_timing_company_event_earnings", 0.0))
+            - (0.25 * pre_commercial * competition_intensity * (1.0 - hard_catalyst_presence))
         )
         return expected_return, success_prob

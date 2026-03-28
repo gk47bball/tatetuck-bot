@@ -16,6 +16,7 @@ from .entities import (
     Program,
     Trial,
 )
+from .market_profile import update_snapshot_profile
 from .taxonomy import program_event_type_for_phase
 
 
@@ -301,9 +302,10 @@ def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -
         "description": finance.get("description"),
         "commercial_revenue_present": revenue > 10_000_000,
         "approved_product_registry_hit": bool(approved_products),
+        "price_now": finance.get("price_now"),
     }
 
-    return CompanySnapshot(
+    snapshot = CompanySnapshot(
         ticker=raw.get("ticker") or "UNKNOWN",
         company_name=raw.get("company_name") or raw.get("ticker") or "Unknown",
         as_of=as_of.isoformat(),
@@ -322,6 +324,7 @@ def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -
         evidence=evidence,
         metadata=snapshot_metadata,
     )
+    return update_snapshot_profile(snapshot)
 
 
 def fetch_legacy_snapshot(ticker: str, company_name: str | None = None) -> dict[str, Any]:

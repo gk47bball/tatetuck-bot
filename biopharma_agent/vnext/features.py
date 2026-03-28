@@ -5,6 +5,7 @@ import math
 import pandas as pd
 
 from .entities import CompanySnapshot, FeatureVector, Program
+from .market_profile import build_snapshot_profile
 from .taxonomy import event_type_bucket, event_type_priority, is_clinical_event_type
 
 
@@ -24,6 +25,7 @@ EVENT_TYPE_FEATURES = (
 
 class FeatureEngineer:
     def build_program_features(self, snapshot: CompanySnapshot, program: Program) -> FeatureVector:
+        profile = build_snapshot_profile(snapshot)
         lead_trial = program.trials[0] if program.trials else None
         enrollment = float(lead_trial.enrollment if lead_trial else 0)
         top_catalyst = program.catalyst_events[0] if program.catalyst_events else None
@@ -74,6 +76,17 @@ class FeatureEngineer:
             "balance_sheet_recent_offering_signal": recent_offering_signal,
             "market_flow_momentum_3mo": float(snapshot.momentum_3mo or 0.0),
             "market_flow_volatility": float(snapshot.volatility or 0.0),
+            "state_profile_pre_commercial": 1.0 if profile["company_state"] == "pre_commercial" else 0.0,
+            "state_profile_commercial_launch": 1.0 if profile["company_state"] == "commercial_launch" else 0.0,
+            "state_profile_commercialized": 1.0 if profile["company_state"] == "commercialized" else 0.0,
+            "state_profile_competition_intensity": float(profile["competition_intensity"]),
+            "state_profile_floor_support_pct": float(profile["floor_support_pct"]),
+            "state_profile_launch_progress_pct": float(profile["launch_progress_pct"]),
+            "state_profile_lifecycle_management_score": float(profile["lifecycle_management_score"]),
+            "state_profile_pipeline_optionality_score": float(profile["pipeline_optionality_score"]),
+            "state_profile_capital_deployment_score": float(profile["capital_deployment_score"]),
+            "state_profile_hard_catalyst_presence": 1.0 if profile["has_near_term_hard_catalyst"] else 0.0,
+            "state_profile_precommercial_value_gap": math.log10(max(tam / market_cap, 1e-6)),
         }
 
         features["balance_sheet_runway_score"] = _clamp(runway_months / 24.0, 0.0, 2.0)
@@ -99,10 +112,13 @@ class FeatureEngineer:
                 "event_type": top_event_type,
                 "event_bucket": event_type_bucket(top_event_type),
                 "company_primary_event_type": company_event_type,
+                "company_state": profile["company_state"],
+                "primary_indication": profile["primary_indication"],
             },
         )
 
     def build_company_aggregate_features(self, snapshot: CompanySnapshot) -> FeatureVector:
+        profile = build_snapshot_profile(snapshot)
         company_primary_event = self._primary_company_event(snapshot)
         top_horizon = min((event.horizon_days for event in snapshot.catalyst_events), default=180)
         company_event_type = company_primary_event.event_type if company_primary_event else None
@@ -118,12 +134,22 @@ class FeatureEngineer:
             "commercial_execution_revenue_scale": math.log10(snapshot.revenue + 1.0),
             "commercial_execution_sec_revenue_scale": math.log10(float(snapshot.metadata.get("sec_revenue_ttm", snapshot.revenue) or snapshot.revenue or 0.0) + 1.0),
             "commercial_execution_has_product": 1.0 if (snapshot.approved_products or snapshot.metadata.get("commercial_revenue_present")) else 0.0,
+            "commercial_execution_launch_progress_pct": float(profile["launch_progress_pct"]),
+            "commercial_execution_lifecycle_management_score": float(profile["lifecycle_management_score"]),
             "balance_sheet_cash_to_cap": snapshot.cash / max(snapshot.market_cap, 1.0),
             "balance_sheet_debt_to_cap": snapshot.debt / max(snapshot.market_cap, 1.0),
             "balance_sheet_runway_months": float(snapshot.metadata.get("runway_months", 0.0) or 0.0),
             "balance_sheet_recent_offering_signal": float(snapshot.metadata.get("recent_offering_signal", 0.0) or 0.0),
+            "balance_sheet_floor_support_pct": float(profile["floor_support_pct"]),
+            "balance_sheet_capital_deployment_score": float(profile["capital_deployment_score"]),
             "market_flow_momentum_3mo": float(snapshot.momentum_3mo or 0.0),
             "market_flow_volatility": float(snapshot.volatility or 0.0),
+            "state_profile_pre_commercial": 1.0 if profile["company_state"] == "pre_commercial" else 0.0,
+            "state_profile_commercial_launch": 1.0 if profile["company_state"] == "commercial_launch" else 0.0,
+            "state_profile_commercialized": 1.0 if profile["company_state"] == "commercialized" else 0.0,
+            "state_profile_competition_intensity": float(profile["competition_intensity"]),
+            "state_profile_pipeline_optionality_score": float(profile["pipeline_optionality_score"]),
+            "state_profile_hard_catalyst_presence": 1.0 if profile["has_near_term_hard_catalyst"] else 0.0,
         }
         aggregate.update(self._event_type_features(company_event_type, prefix="catalyst_timing_company_event"))
         return FeatureVector(
@@ -136,6 +162,8 @@ class FeatureEngineer:
                 "aggregate": True,
                 "event_type": company_event_type,
                 "event_bucket": event_type_bucket(company_event_type),
+                "company_state": profile["company_state"],
+                "primary_indication": profile["primary_indication"],
             },
         )
 

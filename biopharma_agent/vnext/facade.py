@@ -9,6 +9,7 @@ import pandas as pd
 from ..agents.pubmed_agent import AutoResearchAgent
 from .entities import CompanyAnalysis, CompanySnapshot, ModelPrediction
 from .features import FeatureEngineer
+from .market_profile import build_expectation_lens, build_snapshot_profile, classify_company_state
 from .models import EventDrivenEnsemble
 from .portfolio import PortfolioConstructor, aggregate_signal
 from .replay import snapshot_from_dict
@@ -76,7 +77,19 @@ class TatetuckPlatform:
         if not program_vectors:
             program_vectors = [vector for vector in feature_vectors if vector.metadata.get("aggregate")]
         program_predictions = self.ensemble.score(program_vectors, persist=persist)
-        signal = self._aggregate_company_signal(snapshot, program_predictions)
+        company_state = classify_company_state(snapshot)
+        signal = self._aggregate_company_signal(snapshot, program_predictions, company_state=company_state)
+        signal.company_state = company_state
+        primary_event = self._primary_event(snapshot, preferred_event_type=signal.primary_event_type)
+        peer_context = self._peer_context(snapshot)
+        expectation_lens = build_expectation_lens(snapshot, signal, primary_event, peer_context)
+        signal.setup_type = str(expectation_lens["setup_type"])
+        signal.internal_value = float(expectation_lens["internal_value"])
+        signal.internal_price_target = (
+            None if expectation_lens["internal_price_target"] is None else float(expectation_lens["internal_price_target"])
+        )
+        signal.internal_upside_pct = float(expectation_lens["internal_upside_pct"])
+        signal.floor_support_pct = float(expectation_lens["floor_support_pct"])
         portfolio_rec = self.portfolio.recommend(signal)
         if persist:
             self.store.write_signal_artifacts([signal])
@@ -87,11 +100,10 @@ class TatetuckPlatform:
             conditions = [condition for program in snapshot.programs[:2] for condition in program.conditions[:2]]
             literature_review = self.literature.generate_literature_review(snapshot.company_name, drug_names, conditions)
 
-        primary_event = self._primary_event(snapshot, preferred_event_type=signal.primary_event_type)
-        peer_context = self._peer_context(snapshot)
+        profile = build_snapshot_profile(snapshot)
         expectations_summary = self._expectations_summary(snapshot, signal, primary_event)
         kill_points = self._kill_points(snapshot, signal, primary_event)
-        why_now = self._why_now(snapshot, signal, primary_event, expectations_summary, peer_context["summary"])
+        why_now = self._why_now(snapshot, signal, primary_event, expectations_summary, peer_context["summary"], expectation_lens["state_focus"])
 
         return CompanyAnalysis(
             snapshot=snapshot,
@@ -104,6 +116,8 @@ class TatetuckPlatform:
                 "store_dir": str(self.store.base_dir),
                 "analysis_source": analysis_source,
                 "persisted": persist,
+                "company_state": company_state,
+                "setup_type": signal.setup_type,
                 "primary_event_date": primary_event.expected_date if primary_event is not None else None,
                 "primary_event_status": primary_event.status if primary_event is not None else None,
                 "why_now": why_now,
@@ -111,6 +125,18 @@ class TatetuckPlatform:
                 "valuation_summary": peer_context["summary"],
                 "peer_tickers": peer_context["peer_tickers"],
                 "peer_stage": peer_context["peer_stage"],
+                "primary_indication": expectation_lens["primary_indication"],
+                "competitive_summary": expectation_lens["competitive_summary"],
+                "differentiation_focus": expectation_lens["differentiation_focus"],
+                "state_focus": expectation_lens["state_focus"],
+                "market_view": expectation_lens["market_view"],
+                "asymmetry_summary": expectation_lens["asymmetry_summary"],
+                "asymmetry_label": expectation_lens["asymmetry_label"],
+                "internal_value": signal.internal_value,
+                "internal_price_target": signal.internal_price_target,
+                "internal_upside_pct": signal.internal_upside_pct,
+                "floor_support_pct": signal.floor_support_pct,
+                "market_leaders": profile["market_leaders"],
                 "kill_points": kill_points,
             },
         )
@@ -184,9 +210,20 @@ class TatetuckPlatform:
                 "summary": "Peer context unavailable until more archived snapshots are loaded.",
                 "peer_tickers": [],
                 "peer_stage": "unknown",
+                "valuation_posture": "unknown",
+                "current_multiple": None,
+                "median_multiple": None,
+                "metric_label": "value",
             }
 
-        stage = "commercial" if snapshot.revenue > 10_000_000 or snapshot.approved_products else "late_stage" if any(PHASE_RANK.get(program.phase, 0) >= 4 for program in snapshot.programs) else "clinical"
+        company_state = classify_company_state(snapshot)
+        stage = (
+            "commercial"
+            if company_state in {"commercial_launch", "commercialized"}
+            else "late_stage"
+            if any(PHASE_RANK.get(program.phase, 0) >= 4 for program in snapshot.programs)
+            else "clinical"
+        )
         if stage == "commercial":
             peers = latest_companies[latest_companies["revenue"].fillna(0.0) > 10_000_000].copy()
             current_multiple = snapshot.enterprise_value / max(snapshot.revenue, 1.0)
@@ -211,6 +248,10 @@ class TatetuckPlatform:
                 "summary": "Peer context is still sparse for this stage bucket.",
                 "peer_tickers": [],
                 "peer_stage": stage,
+                "valuation_posture": "unknown",
+                "current_multiple": None,
+                "median_multiple": None,
+                "metric_label": metric_label,
             }
 
         peers = peers.replace([pd.NA, float("inf"), float("-inf")], pd.NA).dropna(subset=["comparison_metric"])
@@ -219,6 +260,10 @@ class TatetuckPlatform:
                 "summary": "Peer context is still sparse for this stage bucket.",
                 "peer_tickers": [],
                 "peer_stage": stage,
+                "valuation_posture": "unknown",
+                "current_multiple": current_multiple,
+                "median_multiple": None,
+                "metric_label": metric_label,
             }
 
         median_multiple = float(peers["comparison_metric"].median())
@@ -235,6 +280,10 @@ class TatetuckPlatform:
             "summary": summary,
             "peer_tickers": peer_tickers,
             "peer_stage": stage,
+            "valuation_posture": valuation_posture,
+            "current_multiple": current_multiple,
+            "median_multiple": median_multiple,
+            "metric_label": metric_label,
         }
 
     @staticmethod
@@ -252,7 +301,8 @@ class TatetuckPlatform:
         event_label = primary_event.event_type if primary_event is not None else "no clear dated catalyst"
         return (
             f"Shares look {price_setup}; crowding risk is {crowding} and financing pressure is {financing} "
-            f"heading into {event_label}."
+            f"heading into {event_label}. Internal upside screens at {(signal.internal_upside_pct or 0.0) * 100:+.1f}% "
+            f"with a floor support estimate of {(signal.floor_support_pct or 0.0) * 100:.1f}%."
         )
 
     @staticmethod
@@ -271,23 +321,34 @@ class TatetuckPlatform:
             kill_points.append("Crowding is high enough that a good outcome could still meet sell-the-news pressure.")
         if snapshot.revenue > 10_000_000 and not snapshot.approved_products:
             kill_points.append("Commercial revenue is present, but the exact product contribution still needs verification.")
+        if signal.company_state == "pre_commercial" and signal.setup_type == "asymmetry_without_near_term_catalyst":
+            kill_points.append("There is no clean hard catalyst yet, so time and sentiment can dominate before fundamentals close the gap.")
         return kill_points[:3] or ["No single red flag dominates the setup right now."]
 
     @staticmethod
-    def _why_now(snapshot: CompanySnapshot, signal, primary_event, expectations_summary: str, valuation_summary: str) -> str:
+    def _why_now(snapshot: CompanySnapshot, signal, primary_event, expectations_summary: str, valuation_summary: str, state_focus: str) -> str:
         lead_program = snapshot.programs[0] if snapshot.programs else None
-        catalyst_line = (
-            f"{lead_program.name if lead_program else snapshot.ticker} is driving the setup into "
-            f"{primary_event.event_type if primary_event is not None else 'an undated catalyst'} "
-            f"on {primary_event.expected_date if primary_event is not None and primary_event.expected_date else 'TBD'}."
-        )
+        if signal.setup_type == "asymmetry_without_near_term_catalyst":
+            catalyst_line = (
+                f"{lead_program.name if lead_program else snapshot.ticker} is currently an asymmetry setup rather than a clean dated catalyst trade."
+            )
+        elif signal.setup_type == "sentiment_floor":
+            catalyst_line = (
+                f"{lead_program.name if lead_program else snapshot.ticker} is currently trading more off sentiment and downside floor than a single hard catalyst."
+            )
+        else:
+            catalyst_line = (
+                f"{lead_program.name if lead_program else snapshot.ticker} is driving the setup into "
+                f"{primary_event.event_type if primary_event is not None else 'an undated catalyst'} "
+                f"on {primary_event.expected_date if primary_event is not None and primary_event.expected_date else 'TBD'}."
+            )
         conviction_line = (
             f"The model sees {signal.expected_return * 100:+.1f}% expected 90-day return with "
             f"{signal.catalyst_success_prob * 100:.0f}% catalyst success probability."
         )
-        return f"{catalyst_line} {conviction_line} {expectations_summary} {valuation_summary}"
+        return f"{state_focus} {catalyst_line} {conviction_line} {expectations_summary} {valuation_summary}"
 
-    def _aggregate_company_signal(self, snapshot: CompanySnapshot, predictions: list[ModelPrediction]):
+    def _aggregate_company_signal(self, snapshot: CompanySnapshot, predictions: list[ModelPrediction], company_state: str | None = None):
         primary_event = self._primary_event(snapshot)
         commercial_truth = (
             f"Approved/commercial products: {', '.join(item.name for item in snapshot.approved_products[:2])}."
@@ -319,6 +380,7 @@ class TatetuckPlatform:
             predictions=predictions,
             evidence_rationale=rationale,
             evidence=snapshot.evidence[:5],
+            company_state=company_state,
         )
 
     def build_legacy_report(self, ticker: str, company_name: str | None = None) -> dict:

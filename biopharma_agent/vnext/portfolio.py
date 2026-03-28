@@ -106,6 +106,8 @@ class PortfolioConstructor:
             scenario=scenario,
             thesis_horizon=signal.thesis_horizon,
             primary_event_type=signal.primary_event_type,
+            company_state=signal.company_state,
+            setup_type=signal.setup_type,
             risk_flags=risk_flags,
         )
 
@@ -115,17 +117,24 @@ class PortfolioConstructor:
 
     @staticmethod
     def _scenario(signal: SignalArtifact) -> str:
+        catalyst_setup = signal.setup_type in {"hard_catalyst", "soft_catalyst"} or (
+            signal.setup_type is None and signal.primary_event_bucket in {"clinical", "regulatory"}
+        )
         if signal.financing_risk > 0.80:
             return "avoid due to financing"
+        if signal.company_state == "pre_commercial" and signal.setup_type == "asymmetry_without_near_term_catalyst":
+            if signal.expected_return > 0.12 and (signal.floor_support_pct or 0.0) > 0.18:
+                return "pairs candidate"
+            return "watchlist only"
         if (
-            signal.primary_event_bucket in {"clinical", "regulatory"}
+            catalyst_setup
             and signal.expected_return > 0.16
             and signal.catalyst_success_prob > 0.52
             and signal.thesis_horizon in {"30d", "90d"}
         ):
             return "pre-catalyst long"
         if (
-            signal.primary_event_bucket == "commercial"
+            signal.company_state in {"commercial_launch", "commercialized"}
             and signal.expected_return > 0.10
             and signal.catalyst_success_prob > 0.55
         ):
@@ -145,6 +154,10 @@ class PortfolioConstructor:
             flags.append("low catalyst probability")
         if signal.primary_event_bucket == "earnings":
             flags.append("earnings-driven setup")
+        if signal.company_state == "pre_commercial" and signal.setup_type == "asymmetry_without_near_term_catalyst":
+            flags.append("no hard catalyst yet")
+        if (signal.internal_upside_pct or 0.0) < 0.0:
+            flags.append("negative asymmetry")
         return flags
 
     @staticmethod
@@ -203,6 +216,12 @@ class PortfolioConstructor:
         primary_event_type = row.get("primary_event_type")
         if isinstance(primary_event_type, float) and primary_event_type != primary_event_type:
             primary_event_type = None
+        company_state = row.get("company_state")
+        if isinstance(company_state, float) and company_state != company_state:
+            company_state = None
+        setup_type = row.get("setup_type")
+        if isinstance(setup_type, float) and setup_type != setup_type:
+            setup_type = None
         return PortfolioRecommendation(
             ticker=str(row["ticker"]),
             as_of=str(row["as_of"]),
@@ -213,6 +232,8 @@ class PortfolioConstructor:
             scenario=str(row["scenario"]),
             thesis_horizon=str(row["thesis_horizon"]),
             primary_event_type=None if primary_event_type is None else str(primary_event_type),
+            company_state=None if company_state is None else str(company_state),
+            setup_type=None if setup_type is None else str(setup_type),
             risk_flags=_coerce_list(row.get("risk_flags")),
         )
 
@@ -234,6 +255,12 @@ class PortfolioConstructor:
             primary_event_type = None
         if primary_event_type is not None and not isinstance(primary_event_type, str):
             primary_event_type = str(primary_event_type)
+        company_state = row.get("company_state")
+        if isinstance(company_state, float) and company_state != company_state:
+            company_state = None
+        setup_type = row.get("setup_type")
+        if isinstance(setup_type, float) and setup_type != setup_type:
+            setup_type = None
         primary_bucket = row.get("primary_event_bucket")
         if primary_bucket is None or (isinstance(primary_bucket, float) and primary_bucket != primary_bucket):
             primary_bucket = event_type_bucket(primary_event_type)
@@ -250,11 +277,24 @@ class PortfolioConstructor:
             supporting_evidence=[],
             primary_event_type=primary_event_type,
             primary_event_bucket=str(primary_bucket),
+            company_state=None if company_state is None else str(company_state),
+            setup_type=None if setup_type is None else str(setup_type),
+            internal_value=float(row["internal_value"]) if row.get("internal_value") is not None else None,
+            internal_price_target=float(row["internal_price_target"]) if row.get("internal_price_target") is not None else None,
+            internal_upside_pct=float(row["internal_upside_pct"]) if row.get("internal_upside_pct") is not None else None,
+            floor_support_pct=float(row["floor_support_pct"]) if row.get("floor_support_pct") is not None else None,
             program_predictions=[],
         )
 
 
-def aggregate_signal(ticker: str, as_of: str, predictions: list[ModelPrediction], evidence_rationale: list[str], evidence) -> SignalArtifact:
+def aggregate_signal(
+    ticker: str,
+    as_of: str,
+    predictions: list[ModelPrediction],
+    evidence_rationale: list[str],
+    evidence,
+    company_state: str | None = None,
+) -> SignalArtifact:
     if not predictions:
         return SignalArtifact(
             ticker=ticker,
@@ -269,6 +309,7 @@ def aggregate_signal(ticker: str, as_of: str, predictions: list[ModelPrediction]
             supporting_evidence=list(evidence),
             primary_event_type=None,
             primary_event_bucket="none",
+            company_state=company_state,
             program_predictions=[],
         )
 
@@ -300,5 +341,6 @@ def aggregate_signal(ticker: str, as_of: str, predictions: list[ModelPrediction]
         supporting_evidence=list(evidence),
         primary_event_type=primary_event_type,
         primary_event_bucket=event_type_bucket(primary_event_type),
+        company_state=company_state,
         program_predictions=predictions,
     )

@@ -8,6 +8,7 @@ import requests
 
 from .entities import CatalystEvent, CompanySnapshot, EvidenceSnippet, FinancingEvent
 from .graph import build_company_snapshot, fetch_legacy_snapshot, infer_runway_months
+from .market_profile import update_snapshot_profile
 from .storage import LocalResearchStore
 
 
@@ -351,7 +352,7 @@ def enrich_snapshot_with_external_data(
     else:
         snapshot.metadata["recent_offering_signal"] = 0.0
 
-    return snapshot
+    return update_snapshot_profile(snapshot)
 
 
 class IngestionService:

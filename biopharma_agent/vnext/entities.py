@@ -179,6 +179,12 @@ class SignalArtifact:
     supporting_evidence: list[EvidenceSnippet] = field(default_factory=list)
     primary_event_type: str | None = None
     primary_event_bucket: str | None = None
+    company_state: str | None = None
+    setup_type: str | None = None
+    internal_value: float | None = None
+    internal_price_target: float | None = None
+    internal_upside_pct: float | None = None
+    floor_support_pct: float | None = None
     program_predictions: list[ModelPrediction] = field(default_factory=list)
 
     def to_record(self) -> dict[str, Any]:
@@ -193,6 +199,12 @@ class SignalArtifact:
             "thesis_horizon": self.thesis_horizon,
             "primary_event_type": self.primary_event_type,
             "primary_event_bucket": self.primary_event_bucket,
+            "company_state": self.company_state,
+            "setup_type": self.setup_type,
+            "internal_value": self.internal_value,
+            "internal_price_target": self.internal_price_target,
+            "internal_upside_pct": self.internal_upside_pct,
+            "floor_support_pct": self.floor_support_pct,
             "rationale": self.rationale,
             "supporting_evidence": [asdict(item) for item in self.supporting_evidence],
             "supporting_evidence_count": len(self.supporting_evidence),
@@ -211,6 +223,8 @@ class PortfolioRecommendation:
     scenario: str
     thesis_horizon: str
     primary_event_type: str | None = None
+    company_state: str | None = None
+    setup_type: str | None = None
     risk_flags: list[str] = field(default_factory=list)
 
     def to_record(self) -> dict[str, Any]:

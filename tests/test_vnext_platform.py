@@ -10,6 +10,7 @@ from biopharma_agent.vnext.entities import SignalArtifact
 from biopharma_agent.vnext.evaluation import WalkForwardEvaluator
 from biopharma_agent.vnext.features import FeatureEngineer
 from biopharma_agent.vnext.graph import build_company_snapshot
+from biopharma_agent.vnext.market_profile import build_expectation_lens, classify_company_state
 from biopharma_agent.vnext.portfolio import PortfolioConstructor, aggregate_signal
 from biopharma_agent.vnext.sources import IngestionService, enrich_snapshot_with_external_data
 from biopharma_agent.vnext.storage import LocalResearchStore
@@ -81,6 +82,23 @@ class TestVNextPlatform(unittest.TestCase):
         snapshot = build_company_snapshot(raw)
         self.assertTrue(snapshot.approved_products)
         self.assertEqual(snapshot.approved_products[0].name, "CASGEVY")
+
+    def test_market_profile_classifies_company_states(self):
+        pre = build_company_snapshot(make_raw_company() | {"finance": {**make_raw_company()["finance"], "totalRevenue": 0.0}})
+        launch_raw = make_raw_company()
+        launch_raw["ticker"] = "CRSP"
+        launch_raw["company_name"] = "CRISPR Therapeutics"
+        launch_raw["finance"]["totalRevenue"] = 50_000_000
+        launch = build_company_snapshot(launch_raw)
+        mature_raw = make_raw_company()
+        mature_raw["ticker"] = "MRNA"
+        mature_raw["company_name"] = "Moderna"
+        mature_raw["finance"]["totalRevenue"] = 1_500_000_000
+        mature = build_company_snapshot(mature_raw)
+
+        self.assertEqual(classify_company_state(pre), "pre_commercial")
+        self.assertEqual(classify_company_state(launch), "commercial_launch")
+        self.assertEqual(classify_company_state(mature), "commercialized")
 
     def test_feature_engineer_outputs_non_leaky_vectors(self):
         snapshot = build_company_snapshot(make_raw_company())
@@ -262,6 +280,39 @@ class TestVNextPlatform(unittest.TestCase):
         self.assertGreater(previous_recommendation.target_weight, 0.0)
         self.assertLess(abs(current_recommendation.target_weight - previous_recommendation.target_weight), 1.0)
 
+    def test_obesity_name_without_firm_event_is_treated_as_asymmetry_setup(self):
+        raw = make_raw_company()
+        raw["ticker"] = "VKTX"
+        raw["company_name"] = "Viking Therapeutics"
+        raw["finance"]["totalRevenue"] = 0.0
+        raw["finance"]["description"] = "Obesity company with an oral and injectable metabolic pipeline."
+        raw["trials"][0]["conditions"] = ["Obesity"]
+        raw["trials"][0]["interventions"] = ["VK2735"]
+        raw["trials"][1]["conditions"] = ["Obesity"]
+        raw["trials"][1]["interventions"] = ["VK2809"]
+        snapshot = build_company_snapshot(raw)
+        signal = SignalArtifact(
+            ticker="VKTX",
+            as_of=snapshot.as_of,
+            expected_return=0.18,
+            catalyst_success_prob=0.60,
+            confidence=0.70,
+            crowding_risk=0.55,
+            financing_risk=0.20,
+            thesis_horizon="90d",
+            primary_event_type="phase2_readout",
+            primary_event_bucket="clinical",
+            company_state="pre_commercial",
+            rationale=[],
+            supporting_evidence=[],
+        )
+        primary_event = snapshot.catalyst_events[0]
+        lens = build_expectation_lens(snapshot, signal, primary_event, {"valuation_posture": "discounted"})
+
+        self.assertEqual(lens["company_state"], "pre_commercial")
+        self.assertEqual(lens["setup_type"], "asymmetry_without_near_term_catalyst")
+        self.assertGreater(lens["competition_intensity"], 0.8)
+
     def test_walk_forward_leakage_audit_rejects_legacy_feature(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = LocalResearchStore(base_dir=tmpdir)
@@ -353,6 +404,10 @@ class TestVNextPlatform(unittest.TestCase):
             self.assertIn("why_now", analysis.metadata)
             self.assertIn("valuation_summary", analysis.metadata)
             self.assertIn("kill_points", analysis.metadata)
+            self.assertIn("company_state", analysis.metadata)
+            self.assertIn("setup_type", analysis.metadata)
+            self.assertIn("competitive_summary", analysis.metadata)
+            self.assertIn("asymmetry_summary", analysis.metadata)
             self.assertEqual(before_rows, after_rows)
 
     @patch("biopharma_agent.vnext.sources.fetch_legacy_snapshot")

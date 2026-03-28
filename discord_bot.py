@@ -247,11 +247,20 @@ def build_bot() -> commands.Bot:
         )
         net_cash = snapshot.cash - snapshot.debt
         source = analysis.metadata.get("analysis_source", "unknown")
+        company_state = (analysis.metadata.get("company_state") or "unknown").replace("_", " ")
+        setup_type = (analysis.metadata.get("setup_type") or "watchful").replace("_", " ")
+        internal_value = analysis.metadata.get("internal_value")
+        internal_price_target = analysis.metadata.get("internal_price_target")
+        internal_upside_pct = analysis.metadata.get("internal_upside_pct")
+        asymmetry_label = analysis.metadata.get("asymmetry_label", "unclear asymmetry")
         embed = discord.Embed(
             title=f"Tatetuck Analyst Tear Sheet: {snapshot.ticker}",
             description="Event-driven biopharma alpha profile",
             color=0x2ecc71 if analysis.signal.expected_return > 0 else 0xe74c3c,
         )
+        embed.add_field(name="Company State", value=company_state, inline=True)
+        embed.add_field(name="Setup Type", value=setup_type, inline=True)
+        embed.add_field(name="Asymmetry", value=asymmetry_label, inline=True)
         embed.add_field(name="Confidence", value=f"{round(analysis.signal.confidence * 100, 1)}%", inline=True)
         embed.add_field(name="Target Weight", value=f"{analysis.portfolio.target_weight}%", inline=True)
         embed.add_field(name="Scenario", value=analysis.portfolio.scenario, inline=True)
@@ -320,11 +329,49 @@ def build_bot() -> commands.Bot:
             inline=False,
         )
 
+        internal_value_text = (
+            f"Internal value: {format_money(internal_value)}"
+            if internal_value is not None
+            else "Internal value: unavailable"
+        )
+        if internal_price_target is not None:
+            internal_value_text += f" | PT: ${float(internal_price_target):.2f}"
+        if internal_upside_pct is not None:
+            internal_value_text += f" | Upside: {float(internal_upside_pct) * 100:+.1f}%"
+        embed.add_field(name="Tatetuck Value View", value=internal_value_text, inline=False)
+
         valuation_summary = analysis.metadata.get("valuation_summary", "Valuation context unavailable.")
         peer_tickers = analysis.metadata.get("peer_tickers") or []
         if peer_tickers:
             valuation_summary = f"{valuation_summary}\nClosest archived peers: {', '.join(peer_tickers)}"
         embed.add_field(name="Valuation Lens", value=valuation_summary, inline=False)
+
+        state_focus_name = {
+            "pre_commercial": "Pre-Commercial Lens",
+            "commercial_launch": "Launch Lens",
+            "commercialized": "Franchise Lens",
+        }.get(analysis.metadata.get("company_state"), "PM Lens")
+        state_focus_lines = [
+            analysis.metadata.get("state_focus", "State-specific PM framing unavailable."),
+            analysis.metadata.get("competitive_summary", "Competitive-landscape summary unavailable."),
+        ]
+        differentiation_focus = analysis.metadata.get("differentiation_focus")
+        if differentiation_focus:
+            state_focus_lines.append(f"Differentiation bar: {differentiation_focus}")
+        embed.add_field(name=state_focus_name, value="\n".join(state_focus_lines), inline=False)
+
+        market_view = analysis.metadata.get("market_view")
+        asymmetry_summary = analysis.metadata.get("asymmetry_summary")
+        if market_view or asymmetry_summary:
+            embed.add_field(
+                name="Expectation Gap",
+                value="\n".join(
+                    item
+                    for item in [market_view, asymmetry_summary]
+                    if item
+                ),
+                inline=False,
+            )
 
         kill_points = analysis.metadata.get("kill_points") or []
         embed.add_field(
@@ -362,6 +409,7 @@ def build_bot() -> commands.Bot:
                 if primary_event is not None
                 else "**Event**: none"
             )
+            state_line = f"**State**: {(analysis.metadata.get('company_state') or 'unknown').replace('_', ' ')} | **Setup**: {(analysis.metadata.get('setup_type') or 'watchful').replace('_', ' ')}"
             embed.add_field(
                 name=f"#{index} — {analysis.snapshot.ticker}",
                 value=(
@@ -369,6 +417,7 @@ def build_bot() -> commands.Bot:
                     f"**Target Weight**: {analysis.portfolio.target_weight:.1f}%\n"
                     f"**Expected Return**: {analysis.signal.expected_return * 100:+.1f}% | "
                     f"**Scenario**: {analysis.portfolio.scenario}\n"
+                    f"{state_line}\n"
                     f"{event_line}"
                 ),
                 inline=False,
