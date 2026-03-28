@@ -72,6 +72,9 @@ def main():
                 "exact_primary_event_rate": summary.exact_primary_event_rate,
                 "synthetic_primary_event_rate": summary.synthetic_primary_event_rate,
                 "institutional_blockers": summary.institutional_blockers,
+                "company_state_scorecards": summary.company_state_scorecards,
+                "setup_type_scorecards": summary.setup_type_scorecards,
+                "state_setup_scorecards": summary.state_setup_scorecards,
                 "factor_attribution": summary.factor_attribution,
                 "momentum_ablation": summary.momentum_ablation,
                 "latest_window_top_trades": summary.latest_window_top_trades,
@@ -101,6 +104,9 @@ def main():
                 "synthetic_primary_event_rate": summary.synthetic_primary_event_rate,
                 "institutional_blockers": summary.institutional_blockers,
                 "event_type_scorecards": summary.event_type_scorecards,
+                "company_state_scorecards": summary.company_state_scorecards,
+                "setup_type_scorecards": summary.setup_type_scorecards,
+                "state_setup_scorecards": summary.state_setup_scorecards,
                 "factor_attribution": summary.factor_attribution,
                 "momentum_ablation": summary.momentum_ablation,
             },
@@ -171,6 +177,34 @@ def main():
                 f"hit={metrics.get('hit_rate', 0.0):.3f} | "
                 f"spread={metrics.get('top_bottom_spread', 0.0):+.3f} | "
                 f"brier={metrics.get('calibrated_brier', 1.0):.3f}"
+            )
+    if summary.setup_type_scorecards:
+        print("\n[setup_scorecards]")
+        for setup_type, metrics in sorted(
+            summary.setup_type_scorecards.items(),
+            key=lambda item: item[1].get("top_bottom_spread", 0.0),
+            reverse=True,
+        ):
+            print(
+                f"{setup_type:28} | "
+                f"rows={int(metrics.get('rows', 0)):>4} | "
+                f"hit={metrics.get('hit_rate', 0.0):.3f} | "
+                f"spread={metrics.get('top_bottom_spread', 0.0):+.3f} | "
+                f"ic={metrics.get('rank_ic', 0.0):+.3f}"
+            )
+    if summary.company_state_scorecards:
+        print("\n[state_scorecards]")
+        for company_state, metrics in sorted(
+            summary.company_state_scorecards.items(),
+            key=lambda item: item[1].get("top_bottom_spread", 0.0),
+            reverse=True,
+        ):
+            print(
+                f"{company_state:28} | "
+                f"rows={int(metrics.get('rows', 0)):>4} | "
+                f"hit={metrics.get('hit_rate', 0.0):.3f} | "
+                f"spread={metrics.get('top_bottom_spread', 0.0):+.3f} | "
+                f"ic={metrics.get('rank_ic', 0.0):+.3f}"
             )
     if summary.factor_attribution:
         print("\n[factor_attribution]")

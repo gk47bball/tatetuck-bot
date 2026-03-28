@@ -738,6 +738,8 @@ class TestVNextHistory(unittest.TestCase):
             self.assertGreater(summary.synthetic_primary_event_rate, 0.0)
             self.assertTrue(summary.latest_window_top_trades)
             self.assertTrue(summary.institutional_blockers)
+            self.assertIn("pre_commercial", summary.company_state_scorecards)
+            self.assertTrue(summary.setup_type_scorecards)
 
 
 if __name__ == "__main__":

@@ -55,6 +55,9 @@ class WalkForwardSummary:
     institutional_blockers: list[str] = field(default_factory=list)
     latest_window_top_trades: list[dict[str, object]] = field(default_factory=list)
     event_type_scorecards: dict[str, dict[str, float]] = field(default_factory=dict)
+    company_state_scorecards: dict[str, dict[str, float]] = field(default_factory=dict)
+    setup_type_scorecards: dict[str, dict[str, float]] = field(default_factory=dict)
+    state_setup_scorecards: dict[str, dict[str, float]] = field(default_factory=dict)
     factor_attribution: dict[str, dict[str, float]] = field(default_factory=dict)
     momentum_ablation: dict[str, float] = field(default_factory=dict)
 
@@ -64,7 +67,7 @@ class WalkForwardEvaluator:
         self.store = store or LocalResearchStore()
         self.settings = settings or VNextSettings.from_env()
         self.labeler = PointInTimeLabeler(store=self.store)
-        self.portfolio = PortfolioConstructor()
+        self.portfolio = PortfolioConstructor(store=self.store, use_validation_priors=False)
         self.features = FeatureEngineer()
         self._snapshot_cache: dict[tuple[str, str], object] = {}
 
@@ -205,6 +208,9 @@ class WalkForwardEvaluator:
         previous_signals: dict[str, SignalArtifact] = {}
         num_windows = 0
         event_type_rows: dict[str, list[dict[str, float]]] = {}
+        company_state_rows: dict[str, list[dict[str, float]]] = {}
+        setup_type_rows: dict[str, list[dict[str, float]]] = {}
+        state_setup_rows: dict[str, list[dict[str, float]]] = {}
         factor_rows: dict[str, list[dict[str, float]]] = {}
         momentum_baseline_ics: list[float] = []
         momentum_only_ics: list[float] = []
@@ -342,21 +348,21 @@ class WalkForwardEvaluator:
 
             for event_type, group in company_frame.groupby("target_primary_event_type", dropna=False):
                 event_name = "none" if pd.isna(event_type) or event_type is None else str(event_type)
-                event_type_rows.setdefault(event_name, []).append(
-                    {
-                        "rank_ic": _spearman(group["expected_return"], group["target_return_90d"]),
-                        "hit_rate": float((np.sign(group["expected_return"]) == np.sign(group["target_return_90d"])).mean()),
-                        "beta_adjusted_return": float(group["target_return_90d"].mean()),
-                        "calibrated_brier": float(((group["catalyst_success_prob"] - group["target_catalyst_success"]) ** 2).mean()),
-                        "top_bottom_spread": float(
-                            group.nlargest(max(1, len(group) // 2), "expected_return")["target_return_90d"].mean()
-                            - group.nsmallest(max(1, len(group) // 2), "expected_return")["target_return_90d"].mean()
-                        )
-                        if len(group) > 1
-                        else 0.0,
-                        "rows": float(len(group)),
-                    }
-                )
+                event_type_rows.setdefault(event_name, []).append(self._group_metrics(group))
+            for company_state, group in company_frame.groupby("company_state", dropna=False):
+                state_name = "unknown" if pd.isna(company_state) or company_state is None else str(company_state)
+                company_state_rows.setdefault(state_name, []).append(self._group_metrics(group))
+            for setup_type, group in company_frame.groupby("setup_type", dropna=False):
+                setup_name = "unknown" if pd.isna(setup_type) or setup_type is None else str(setup_type)
+                setup_type_rows.setdefault(setup_name, []).append(self._group_metrics(group))
+            combo_frame = company_frame.copy()
+            combo_frame["state_setup_key"] = combo_frame.apply(
+                lambda row: f"{row.get('company_state') or 'unknown'}|{row.get('setup_type') or 'unknown'}",
+                axis=1,
+            )
+            for combo_key, group in combo_frame.groupby("state_setup_key", dropna=False):
+                combo_name = "unknown|unknown" if pd.isna(combo_key) or combo_key is None else str(combo_key)
+                state_setup_rows.setdefault(combo_name, []).append(self._group_metrics(group))
 
         if not num_windows:
             return WalkForwardSummary(
@@ -389,6 +395,18 @@ class WalkForwardEvaluator:
                 "event_bucket": event_type_bucket(event_type),
             }
             for event_type, rows in event_type_rows.items()
+        }
+        company_state_scorecards = {
+            company_state: self._aggregate_group_rows(rows)
+            for company_state, rows in company_state_rows.items()
+        }
+        setup_type_scorecards = {
+            setup_type: self._aggregate_group_rows(rows)
+            for setup_type, rows in setup_type_rows.items()
+        }
+        state_setup_scorecards = {
+            combo_key: self._aggregate_group_rows(rows)
+            for combo_key, rows in state_setup_rows.items()
         }
         factor_attribution = {
             family: {
@@ -453,9 +471,40 @@ class WalkForwardEvaluator:
             institutional_blockers=institutional_blockers,
             latest_window_top_trades=latest_window_top_trades,
             event_type_scorecards=event_type_scorecards,
+            company_state_scorecards=company_state_scorecards,
+            setup_type_scorecards=setup_type_scorecards,
+            state_setup_scorecards=state_setup_scorecards,
             factor_attribution=factor_attribution,
             momentum_ablation=momentum_ablation,
         )
+
+    @staticmethod
+    def _group_metrics(group: pd.DataFrame) -> dict[str, float]:
+        return {
+            "rank_ic": _spearman(group["expected_return"], group["target_return_90d"]),
+            "hit_rate": float((np.sign(group["expected_return"]) == np.sign(group["target_return_90d"])).mean()),
+            "beta_adjusted_return": float(group["target_return_90d"].mean()),
+            "calibrated_brier": float(((group["catalyst_success_prob"] - group["target_catalyst_success"]) ** 2).mean()),
+            "top_bottom_spread": float(
+                group.nlargest(max(1, len(group) // 2), "expected_return")["target_return_90d"].mean()
+                - group.nsmallest(max(1, len(group) // 2), "expected_return")["target_return_90d"].mean()
+            )
+            if len(group) > 1
+            else 0.0,
+            "rows": float(len(group)),
+        }
+
+    @staticmethod
+    def _aggregate_group_rows(rows: list[dict[str, float]]) -> dict[str, float]:
+        return {
+            "rows": float(sum(item["rows"] for item in rows)),
+            "windows": float(len(rows)),
+            "rank_ic": _safe_mean([item["rank_ic"] for item in rows]),
+            "hit_rate": _safe_mean([item["hit_rate"] for item in rows]),
+            "top_bottom_spread": _safe_mean([item["top_bottom_spread"] for item in rows]),
+            "beta_adjusted_return": _safe_mean([item["beta_adjusted_return"] for item in rows]),
+            "calibrated_brier": _safe_mean([item["calibrated_brier"] for item in rows]),
+        }
 
     def _rebalance_dates(self, unique_dates: list[pd.Timestamp]) -> list[pd.Timestamp]:
         spacing_days = max(int(self.settings.evaluation_rebalance_spacing_days), 1)

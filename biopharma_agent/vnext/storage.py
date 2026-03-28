@@ -289,7 +289,7 @@ class LocalResearchStore:
 
     @staticmethod
     def _write_parquet(path: Path, frame: pd.DataFrame) -> None:
-        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+        tmp_path = path.with_name(f"{path.stem}.tmp{path.suffix}")
         try:
             frame.to_parquet(tmp_path, index=False)
             os.replace(tmp_path, path)

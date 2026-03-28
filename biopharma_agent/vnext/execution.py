@@ -606,8 +606,8 @@ class PMExecutionPlanner:
         auto_eligible = sorted(
             auto_eligible,
             key=lambda analysis: (
-                profiles[analysis.snapshot.ticker].score,
                 analysis.portfolio.target_weight * analysis.portfolio.confidence,
+                profiles[analysis.snapshot.ticker].score,
                 analysis.signal.expected_return,
             ),
             reverse=True,
@@ -640,8 +640,8 @@ class PMExecutionPlanner:
         holdovers = sorted(
             holdovers,
             key=lambda analysis: (
-                profiles[analysis.snapshot.ticker].score,
                 analysis.portfolio.target_weight,
+                profiles[analysis.snapshot.ticker].score,
                 analysis.portfolio.confidence,
                 analysis.signal.expected_return,
             ),
@@ -927,6 +927,7 @@ class PMExecutionPlanner:
         return (
             max(signal.expected_return, 0.0) * 4.0
             + (analysis.portfolio.confidence * 1.5)
+            + (analysis.portfolio.target_weight * 0.22)
             + (max(signal.catalyst_success_prob - 0.50, 0.0) * 1.2)
             + (max(upside, 0.0) * 0.02)
             + (max(floor, 0.0) * 0.05)

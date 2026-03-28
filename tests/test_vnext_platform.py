@@ -252,6 +252,233 @@ class TestVNextPlatform(unittest.TestCase):
         self.assertGreater(high_rec.target_weight, medium_rec.target_weight)
         self.assertGreaterEqual(high_rec.target_weight, 3.0)
 
+    def test_portfolio_constructor_uses_empirical_priors_to_favor_stronger_archetypes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.write_raw_payload(
+                "validation_audits",
+                "latest_walkforward_audit",
+                {
+                    "company_state_scorecards": {
+                        "pre_commercial": {
+                            "rows": 48.0,
+                            "windows": 8.0,
+                            "rank_ic": 0.16,
+                            "hit_rate": 0.66,
+                            "top_bottom_spread": 0.10,
+                            "beta_adjusted_return": 0.06,
+                        },
+                        "commercialized": {
+                            "rows": 52.0,
+                            "windows": 8.0,
+                            "rank_ic": 0.01,
+                            "hit_rate": 0.49,
+                            "top_bottom_spread": -0.01,
+                            "beta_adjusted_return": 0.00,
+                        },
+                    },
+                    "setup_type_scorecards": {
+                        "hard_catalyst": {
+                            "rows": 44.0,
+                            "windows": 8.0,
+                            "rank_ic": 0.18,
+                            "hit_rate": 0.67,
+                            "top_bottom_spread": 0.12,
+                            "beta_adjusted_return": 0.08,
+                        },
+                        "capital_allocation": {
+                            "rows": 40.0,
+                            "windows": 8.0,
+                            "rank_ic": -0.04,
+                            "hit_rate": 0.46,
+                            "top_bottom_spread": -0.04,
+                            "beta_adjusted_return": -0.02,
+                        },
+                    },
+                    "state_setup_scorecards": {
+                        "pre_commercial|hard_catalyst": {
+                            "rows": 32.0,
+                            "windows": 8.0,
+                            "rank_ic": 0.19,
+                            "hit_rate": 0.69,
+                            "top_bottom_spread": 0.14,
+                            "beta_adjusted_return": 0.09,
+                        },
+                        "commercialized|capital_allocation": {
+                            "rows": 34.0,
+                            "windows": 8.0,
+                            "rank_ic": -0.05,
+                            "hit_rate": 0.45,
+                            "top_bottom_spread": -0.05,
+                            "beta_adjusted_return": -0.02,
+                        },
+                    },
+                },
+            )
+            constructor = PortfolioConstructor(store=store)
+            catalyst_signal = SignalArtifact(
+                ticker="CATA",
+                as_of="2025-01-01T00:00:00+00:00",
+                expected_return=0.15,
+                catalyst_success_prob=0.55,
+                confidence=0.76,
+                crowding_risk=0.25,
+                financing_risk=0.20,
+                thesis_horizon="90d",
+                primary_event_type="phase3_readout",
+                primary_event_bucket="clinical",
+                company_state="pre_commercial",
+                setup_type="hard_catalyst",
+                rationale=[],
+                supporting_evidence=[],
+            )
+            compounder_signal = SignalArtifact(
+                ticker="FRAN",
+                as_of="2025-01-01T00:00:00+00:00",
+                expected_return=0.15,
+                catalyst_success_prob=0.56,
+                confidence=0.76,
+                crowding_risk=0.25,
+                financing_risk=0.20,
+                thesis_horizon="90d",
+                primary_event_type="capital_allocation",
+                primary_event_bucket="commercial",
+                company_state="commercialized",
+                setup_type="capital_allocation",
+                rationale=[],
+                supporting_evidence=[],
+            )
+
+            catalyst_rec = constructor.recommend(catalyst_signal)
+            compounder_rec = constructor.recommend(compounder_signal)
+
+            self.assertEqual(catalyst_rec.scenario, "pre-catalyst long")
+            self.assertGreater(catalyst_rec.target_weight, compounder_rec.target_weight)
+            self.assertIn("strong historical archetype edge", catalyst_rec.risk_flags)
+            self.assertIn("weak historical archetype edge", compounder_rec.risk_flags)
+
+    def test_portfolio_constructor_can_derive_empirical_priors_from_signal_history(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.replace_table(
+                "signal_artifacts",
+                [
+                    {
+                        "ticker": "CATA",
+                        "as_of": "2025-01-01T00:00:00+00:00",
+                        "expected_return": 0.16,
+                        "catalyst_success_prob": 0.60,
+                        "confidence": 0.72,
+                        "crowding_risk": 0.20,
+                        "financing_risk": 0.18,
+                        "thesis_horizon": "90d",
+                        "primary_event_type": "phase3_readout",
+                        "primary_event_bucket": "clinical",
+                        "company_state": "pre_commercial",
+                        "setup_type": "hard_catalyst",
+                    },
+                    {
+                        "ticker": "CATA",
+                        "as_of": "2025-02-01T00:00:00+00:00",
+                        "expected_return": 0.18,
+                        "catalyst_success_prob": 0.62,
+                        "confidence": 0.74,
+                        "crowding_risk": 0.20,
+                        "financing_risk": 0.18,
+                        "thesis_horizon": "90d",
+                        "primary_event_type": "phase3_readout",
+                        "primary_event_bucket": "clinical",
+                        "company_state": "pre_commercial",
+                        "setup_type": "hard_catalyst",
+                    },
+                    {
+                        "ticker": "FRAN",
+                        "as_of": "2025-01-01T00:00:00+00:00",
+                        "expected_return": 0.14,
+                        "catalyst_success_prob": 0.56,
+                        "confidence": 0.74,
+                        "crowding_risk": 0.20,
+                        "financing_risk": 0.18,
+                        "thesis_horizon": "90d",
+                        "primary_event_type": "capital_allocation",
+                        "primary_event_bucket": "commercial",
+                        "company_state": "commercialized",
+                        "setup_type": "capital_allocation",
+                    },
+                    {
+                        "ticker": "FRAN",
+                        "as_of": "2025-02-01T00:00:00+00:00",
+                        "expected_return": 0.13,
+                        "catalyst_success_prob": 0.55,
+                        "confidence": 0.73,
+                        "crowding_risk": 0.20,
+                        "financing_risk": 0.18,
+                        "thesis_horizon": "90d",
+                        "primary_event_type": "capital_allocation",
+                        "primary_event_bucket": "commercial",
+                        "company_state": "commercialized",
+                        "setup_type": "capital_allocation",
+                    },
+                ],
+            )
+            store.replace_table(
+                "labels",
+                [
+                    {"ticker": "CATA", "as_of": "2025-01-01T00:00:00+00:00", "target_return_90d": 0.22, "target_catalyst_success": 1},
+                    {"ticker": "CATA", "as_of": "2025-02-01T00:00:00+00:00", "target_return_90d": 0.18, "target_catalyst_success": 1},
+                    {"ticker": "FRAN", "as_of": "2025-01-01T00:00:00+00:00", "target_return_90d": -0.04, "target_catalyst_success": 0},
+                    {"ticker": "FRAN", "as_of": "2025-02-01T00:00:00+00:00", "target_return_90d": -0.02, "target_catalyst_success": 0},
+                ],
+            )
+            constructor = PortfolioConstructor(store=store)
+            catalyst_signal = SignalArtifact(
+                ticker="CATA",
+                as_of="2025-03-01T00:00:00+00:00",
+                expected_return=0.15,
+                catalyst_success_prob=0.56,
+                confidence=0.76,
+                crowding_risk=0.25,
+                financing_risk=0.20,
+                thesis_horizon="90d",
+                primary_event_type="phase3_readout",
+                primary_event_bucket="clinical",
+                company_state="pre_commercial",
+                setup_type="hard_catalyst",
+                rationale=[],
+                supporting_evidence=[],
+            )
+            compounder_signal = SignalArtifact(
+                ticker="FRAN",
+                as_of="2025-03-01T00:00:00+00:00",
+                expected_return=0.15,
+                catalyst_success_prob=0.56,
+                confidence=0.76,
+                crowding_risk=0.25,
+                financing_risk=0.20,
+                thesis_horizon="90d",
+                primary_event_type="capital_allocation",
+                primary_event_bucket="commercial",
+                company_state="commercialized",
+                setup_type="capital_allocation",
+                rationale=[],
+                supporting_evidence=[],
+            )
+
+            priors = constructor._validation_priors()
+            catalyst_edge = constructor._empirical_edge(catalyst_signal)
+            compounder_edge = constructor._empirical_edge(compounder_signal)
+            catalyst_rec = constructor.recommend(catalyst_signal)
+            compounder_rec = constructor.recommend(compounder_signal)
+
+            self.assertIn("hard_catalyst", priors["setup_type_scorecards"])
+            self.assertIn("capital_allocation", priors["setup_type_scorecards"])
+            self.assertGreater(
+                priors["setup_type_scorecards"]["hard_catalyst"]["beta_adjusted_return"],
+                priors["setup_type_scorecards"]["capital_allocation"]["beta_adjusted_return"],
+            )
+            self.assertGreater(catalyst_edge["edge_score"], compounder_edge["edge_score"])
+            self.assertGreaterEqual(catalyst_rec.target_weight, compounder_rec.target_weight)
+
     def test_portfolio_constructor_smooths_small_weight_changes(self):
         constructor = PortfolioConstructor()
         previous_signal = SignalArtifact(
