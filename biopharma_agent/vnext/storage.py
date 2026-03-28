@@ -8,7 +8,7 @@ from typing import Any, Iterable
 
 import pandas as pd
 
-from .entities import CompanySnapshot, ExperimentRecord, FeatureVector, ModelPrediction
+from .entities import CompanySnapshot, ExperimentRecord, FeatureVector, ModelPrediction, PortfolioRecommendation, SignalArtifact
 
 try:
     import duckdb
@@ -195,6 +195,12 @@ class LocalResearchStore:
 
     def write_predictions(self, predictions: list[ModelPrediction]) -> None:
         self.append_records("predictions", [item.to_record() for item in predictions])
+
+    def write_signal_artifacts(self, signals: list[SignalArtifact]) -> None:
+        self.append_records("signal_artifacts", [item.to_record() for item in signals])
+
+    def write_portfolio_recommendations(self, recommendations: list[PortfolioRecommendation]) -> None:
+        self.append_records("portfolio_recommendations", [item.to_record() for item in recommendations])
 
     def write_labels(self, rows: Iterable[dict[str, Any]]) -> Path:
         return self.replace_table("labels", rows)

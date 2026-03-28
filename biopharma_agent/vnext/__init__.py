@@ -1,6 +1,7 @@
 """vNext event-driven biopharma alpha platform."""
 
 from .archive import ArchiveSummary, archive_universe
+from .audit import ResearchAudit, ResearchAuditBuilder
 from .execution import AlpacaPaperBroker, ExecutionPlan, ExecutionInstruction, OrderSubmission, PMExecutionPlanner
 from .facade import TatetuckPlatform
 from .labels import LabelSummary, PointInTimeLabeler
@@ -12,6 +13,8 @@ from .settings import VNextSettings
 __all__ = [
     "AlpacaPaperBroker",
     "ArchiveSummary",
+    "ResearchAudit",
+    "ResearchAuditBuilder",
     "ExecutionInstruction",
     "ExecutionPlan",
     "HistoricalReplayEngine",

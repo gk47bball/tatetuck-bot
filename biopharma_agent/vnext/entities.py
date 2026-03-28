@@ -179,6 +179,22 @@ class SignalArtifact:
     supporting_evidence: list[EvidenceSnippet]
     program_predictions: list[ModelPrediction] = field(default_factory=list)
 
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "ticker": self.ticker,
+            "as_of": self.as_of,
+            "expected_return": self.expected_return,
+            "catalyst_success_prob": self.catalyst_success_prob,
+            "confidence": self.confidence,
+            "crowding_risk": self.crowding_risk,
+            "financing_risk": self.financing_risk,
+            "thesis_horizon": self.thesis_horizon,
+            "rationale": self.rationale,
+            "supporting_evidence": [asdict(item) for item in self.supporting_evidence],
+            "supporting_evidence_count": len(self.supporting_evidence),
+            "program_prediction_count": len(self.program_predictions),
+        }
+
 
 @dataclass(slots=True)
 class PortfolioRecommendation:
@@ -191,6 +207,9 @@ class PortfolioRecommendation:
     scenario: str
     thesis_horizon: str
     risk_flags: list[str] = field(default_factory=list)
+
+    def to_record(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(slots=True)

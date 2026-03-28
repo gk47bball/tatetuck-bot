@@ -62,6 +62,8 @@ class TatetuckPlatform:
         program_predictions = self.ensemble.score(program_vectors)
         signal = self._aggregate_company_signal(snapshot, program_predictions)
         portfolio_rec = self.portfolio.recommend(signal)
+        self.store.write_signal_artifacts([signal])
+        self.store.write_portfolio_recommendations([portfolio_rec])
         literature_review = ""
         if include_literature:
             drug_names = [program.name for program in snapshot.programs[:3]]

@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from biopharma_agent.vnext import TatetuckPlatform, archive_universe
+from biopharma_agent.vnext.entities import SignalArtifact
 from biopharma_agent.vnext.evaluation import WalkForwardEvaluator
 from biopharma_agent.vnext.features import FeatureEngineer
 from biopharma_agent.vnext.graph import build_company_snapshot
@@ -162,6 +163,40 @@ class TestVNextPlatform(unittest.TestCase):
         recommendation = PortfolioConstructor().recommend(signal)
         self.assertEqual(recommendation.scenario, "avoid due to financing")
         self.assertEqual(recommendation.target_weight, 0.0)
+
+    def test_portfolio_constructor_expands_high_conviction_weights(self):
+        constructor = PortfolioConstructor()
+        high_signal = SignalArtifact(
+            ticker="HIGH",
+            as_of="2025-01-01T00:00:00+00:00",
+            expected_return=0.24,
+            catalyst_success_prob=0.72,
+            confidence=0.84,
+            crowding_risk=0.22,
+            financing_risk=0.18,
+            thesis_horizon="90d",
+            rationale=[],
+            supporting_evidence=[],
+        )
+        medium_signal = SignalArtifact(
+            ticker="MED",
+            as_of="2025-01-01T00:00:00+00:00",
+            expected_return=0.09,
+            catalyst_success_prob=0.55,
+            confidence=0.63,
+            crowding_risk=0.35,
+            financing_risk=0.30,
+            thesis_horizon="90d",
+            rationale=[],
+            supporting_evidence=[],
+        )
+
+        high_rec = constructor.recommend(high_signal)
+        medium_rec = constructor.recommend(medium_signal)
+
+        self.assertEqual(high_rec.scenario, "pre-catalyst long")
+        self.assertGreater(high_rec.target_weight, medium_rec.target_weight)
+        self.assertGreaterEqual(high_rec.target_weight, 3.0)
 
     def test_walk_forward_leakage_audit_rejects_legacy_feature(self):
         with tempfile.TemporaryDirectory() as tmpdir:

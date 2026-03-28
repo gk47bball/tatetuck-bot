@@ -10,16 +10,28 @@ class PortfolioConstructor:
         scenario = self._scenario(signal)
         risk_flags = self._risk_flags(signal)
 
-        gross_score = signal.expected_return * signal.confidence
-        risk_discount = (0.50 * signal.crowding_risk) + (0.75 * signal.financing_risk)
-        target_weight = max(0.0, gross_score * 12.0 - risk_discount * 4.0)
+        edge_score = max(signal.expected_return, 0.0)
+        base_weight = (edge_score * 18.0) + (signal.confidence * 2.5) - 1.0
+        scenario_bonus = {
+            "pre-catalyst long": 2.0,
+            "commercial compounder": 1.0,
+            "pairs candidate": 0.25,
+            "watchlist only": 0.0,
+            "avoid due to financing": 0.0,
+        }
+        risk_discount = (signal.crowding_risk * 2.0) + (signal.financing_risk * 3.5)
+        target_weight = max(0.0, base_weight + scenario_bonus.get(scenario, 0.0) - risk_discount)
 
         if scenario == "watchlist only":
             target_weight = min(target_weight, 1.0)
         elif scenario == "avoid due to financing":
             target_weight = 0.0
+        elif scenario == "pairs candidate":
+            target_weight = min(target_weight, 2.5)
+        elif scenario == "commercial compounder":
+            target_weight = min(target_weight, 5.0)
         elif scenario == "pre-catalyst long":
-            target_weight = min(target_weight + 1.5, 8.0)
+            target_weight = min(target_weight, 8.0)
 
         max_weight = 10.0
         if signal.crowding_risk > 0.75:
