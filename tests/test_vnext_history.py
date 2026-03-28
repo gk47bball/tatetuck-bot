@@ -1,11 +1,12 @@
 import json
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 import pandas as pd
 
 from biopharma_agent.vnext.evaluation import WalkForwardEvaluator
-from biopharma_agent.vnext.labels import PointInTimeLabeler
+from biopharma_agent.vnext.labels import EODHDHistoryProvider, PointInTimeLabeler
 from biopharma_agent.vnext.replay import HistoricalReplayEngine
 from biopharma_agent.vnext.storage import LocalResearchStore
 
@@ -29,6 +30,49 @@ def make_price_frame():
 
 
 class TestVNextHistory(unittest.TestCase):
+    def test_eodhd_provider_normalizes_symbol_and_uses_adjusted_close(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = [
+            {"date": "2025-01-02", "close": 101.0, "adjusted_close": 100.5},
+            {"date": "2025-01-03", "close": 102.0, "adjusted_close": 101.5},
+        ]
+        session = Mock()
+        session.get.return_value = response
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            provider = EODHDHistoryProvider(
+                store=store,
+                api_key="test-key",
+                session=session,
+            )
+            frame = provider.load_history("CRSP", "2025-01-01", "2025-01-31")
+
+            self.assertEqual(session.get.call_args.kwargs["params"]["from"], "2025-01-01")
+            self.assertIn("CRSP.US", session.get.call_args.args[0])
+            self.assertEqual(frame.iloc[0]["close"], 100.5)
+            self.assertEqual(len(frame), 2)
+
+    def test_eodhd_provider_reuses_cached_payload(self):
+        session = Mock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.write_raw_payload(
+                "market_prices_eodhd",
+                "CRSP_2025-01-01_2025-01-31",
+                [{"date": "2025-01-02", "close": 99.5}],
+            )
+            provider = EODHDHistoryProvider(
+                store=store,
+                api_key="test-key",
+                session=session,
+            )
+            frame = provider.load_history("CRSP", "2025-01-01", "2025-01-31")
+
+            session.get.assert_not_called()
+            self.assertEqual(frame.iloc[0]["close"], 99.5)
+
     def test_labeler_builds_forward_and_event_labels(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = LocalResearchStore(base_dir=tmpdir)

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
+import os
 from typing import Protocol
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
 from .storage import LocalResearchStore
@@ -23,6 +25,93 @@ class LabelSummary:
     matured_return_90d_rows: int
     matured_event_rows: int
     num_tickers: int
+
+
+class CompositeHistoryProvider:
+    def __init__(self, providers: list[PriceHistoryProvider]):
+        self.providers = providers
+
+    def load_history(self, ticker: str, start: str, end: str) -> pd.DataFrame:
+        for provider in self.providers:
+            history = provider.load_history(ticker, start, end)
+            if not history.empty:
+                return history
+        return pd.DataFrame(columns=["close"])
+
+
+class EODHDHistoryProvider:
+    BASE_URL = "https://eodhd.com/api/eod/{symbol}"
+
+    def __init__(
+        self,
+        store: LocalResearchStore | None = None,
+        api_key: str | None = None,
+        exchange_suffix: str = "US",
+        session: requests.Session | None = None,
+    ):
+        self.store = store or LocalResearchStore()
+        self.api_key = api_key or os.environ.get("EODHD_API_KEY")
+        self.exchange_suffix = exchange_suffix
+        self.session = session or requests.Session()
+
+    def load_history(self, ticker: str, start: str, end: str) -> pd.DataFrame:
+        cache_key = f"{ticker}_{start}_{end}"
+        cached = self.store.read_latest_raw_payload("market_prices_eodhd", cache_key)
+        if cached is not None:
+            return self._frame_from_payload(cached)
+        if not self.api_key:
+            return pd.DataFrame(columns=["close"])
+
+        symbol = self._normalize_symbol(ticker)
+        try:
+            response = self.session.get(
+                self.BASE_URL.format(symbol=symbol),
+                params={
+                    "api_token": self.api_key,
+                    "fmt": "json",
+                    "period": "d",
+                    "order": "a",
+                    "from": start,
+                    "to": end,
+                },
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError):
+            return pd.DataFrame(columns=["close"])
+
+        if not isinstance(payload, list):
+            return pd.DataFrame(columns=["close"])
+
+        normalized_payload = [
+            {
+                "date": item.get("date"),
+                "close": float(item["adjusted_close"] if item.get("adjusted_close") is not None else item.get("close")),
+            }
+            for item in payload
+            if item.get("date") and (item.get("adjusted_close") is not None or item.get("close") is not None)
+        ]
+        self.store.write_raw_payload("market_prices_eodhd", cache_key, normalized_payload)
+        return self._frame_from_payload(normalized_payload)
+
+    def _normalize_symbol(self, ticker: str) -> str:
+        if "." in ticker:
+            return ticker
+        return f"{ticker}.{self.exchange_suffix}"
+
+    @staticmethod
+    def _frame_from_payload(payload: list[dict[str, object]]) -> pd.DataFrame:
+        if not payload:
+            return pd.DataFrame(columns=["close"])
+        frame = pd.DataFrame(payload)
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+        frame = frame.dropna(subset=["date", "close"]).sort_values("date")
+        if frame.empty:
+            return pd.DataFrame(columns=["close"])
+        frame = frame.set_index("date")
+        return frame[["close"]]
 
 
 class YFinanceHistoryProvider:
@@ -64,7 +153,12 @@ class YFinanceHistoryProvider:
 class PointInTimeLabeler:
     def __init__(self, store: LocalResearchStore | None = None, history_provider: PriceHistoryProvider | None = None):
         self.store = store or LocalResearchStore()
-        self.history_provider = history_provider or YFinanceHistoryProvider(store=self.store)
+        self.history_provider = history_provider or CompositeHistoryProvider(
+            [
+                EODHDHistoryProvider(store=self.store),
+                YFinanceHistoryProvider(store=self.store),
+            ]
+        )
 
     def materialize_labels(self, snapshots: pd.DataFrame | None = None, catalysts: pd.DataFrame | None = None) -> LabelSummary:
         snapshot_labels, event_labels = self.build_label_frames(snapshots=snapshots, catalysts=catalysts)
