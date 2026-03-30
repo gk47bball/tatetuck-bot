@@ -312,7 +312,7 @@ class PortfolioConstructor:
         rank_ic = _clamp(_coerce_float(metrics.get("rank_ic"), 0.0), -0.50, 0.50)
         hit_adj = _clamp(_coerce_float(metrics.get("hit_rate"), 0.50) - 0.50, -0.35, 0.35)
         spread = _clamp(_coerce_float(metrics.get("top_bottom_spread"), 0.0), -0.60, 0.60)
-        beta = _clamp(_coerce_float(metrics.get("beta_adjusted_return"), 0.0), -0.35, 0.35)
+        beta = _clamp(_coerce_float(metrics.get("mean_return_90d"), 0.0), -0.35, 0.35)
         edge_score = (rank_ic * 0.45) + (hit_adj * 0.35) + (spread * 0.15) + (beta * 0.05)
         reliability = min(1.0, rows / 30.0) * min(1.0, windows / 6.0)
         if rows < 8.0:
@@ -358,7 +358,7 @@ class PortfolioConstructor:
                 "top_bottom_spread": float(top["target_return_90d"].mean() - bottom["target_return_90d"].mean())
                 if len(group) > 1
                 else 0.0,
-                "beta_adjusted_return": float(group["target_return_90d"].mean()),
+                "mean_return_90d": float(group["target_return_90d"].mean()),
                 "calibrated_brier": float(((group["catalyst_success_prob"] - group["target_catalyst_success"]) ** 2).mean())
                 if "target_catalyst_success" in group
                 else 1.0,

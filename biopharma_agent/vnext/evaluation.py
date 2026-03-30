@@ -154,7 +154,7 @@ class WalkForwardEvaluator:
             return False
         return True
 
-    def evaluate(self, min_train_rows: int = 24) -> WalkForwardSummary:
+    def evaluate(self, min_train_rows: int = 50) -> WalkForwardSummary:
         frame = self.build_training_frame()
         if frame.empty:
             return WalkForwardSummary(
@@ -392,7 +392,7 @@ class WalkForwardEvaluator:
                 "rank_ic": _safe_mean([item["rank_ic"] for item in rows]),
                 "hit_rate": _safe_mean([item["hit_rate"] for item in rows]),
                 "top_bottom_spread": _safe_mean([item["top_bottom_spread"] for item in rows]),
-                "beta_adjusted_return": _safe_mean([item["beta_adjusted_return"] for item in rows]),
+                "mean_return_90d": _safe_mean([item["mean_return_90d"] for item in rows]),
                 "calibrated_brier": _safe_mean([item["calibrated_brier"] for item in rows]),
                 "event_bucket": event_type_bucket(event_type),
             }
@@ -485,7 +485,7 @@ class WalkForwardEvaluator:
         return {
             "rank_ic": _spearman(group["expected_return"], group["target_return_90d"]),
             "hit_rate": float((np.sign(group["expected_return"]) == np.sign(group["target_return_90d"])).mean()),
-            "beta_adjusted_return": float(group["target_return_90d"].mean()),
+            "mean_return_90d": float(group["target_return_90d"].mean()),
             "calibrated_brier": float(((group["catalyst_success_prob"] - group["target_catalyst_success"]) ** 2).mean()),
             "top_bottom_spread": float(
                 group.nlargest(max(1, len(group) // 2), "expected_return")["target_return_90d"].mean()
@@ -504,7 +504,7 @@ class WalkForwardEvaluator:
             "rank_ic": _safe_mean([item["rank_ic"] for item in rows]),
             "hit_rate": _safe_mean([item["hit_rate"] for item in rows]),
             "top_bottom_spread": _safe_mean([item["top_bottom_spread"] for item in rows]),
-            "beta_adjusted_return": _safe_mean([item["beta_adjusted_return"] for item in rows]),
+            "mean_return_90d": _safe_mean([item["mean_return_90d"] for item in rows]),
             "calibrated_brier": _safe_mean([item["calibrated_brier"] for item in rows]),
         }
 

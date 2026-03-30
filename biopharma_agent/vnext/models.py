@@ -144,7 +144,7 @@ class EventDrivenEnsemble:
         if frame.empty or not required.issubset(frame.columns):
             return None
         usable = frame.dropna(subset=["target_return_90d", "target_catalyst_success"])
-        if len(usable) < 20:
+        if len(usable) < 30:
             return None
 
         feature_columns = self.feature_columns(usable)
@@ -152,7 +152,19 @@ class EventDrivenEnsemble:
         y_reg = usable["target_return_90d"].to_numpy(dtype=float)
         y_clf = usable["target_catalyst_success"].to_numpy(dtype=int)
 
-        reg_mean, reg_scale, reg_weights, reg_bias = self._ridge_fit(X, y_reg, alpha=1.5)
+        # Volatility-normalise the regression target so that a 20% expected return
+        # on a 150-vol name does not receive the same weight as 20% on a 50-vol name.
+        # The fitted signal then ranks on IR-per-unit-vol, which is more honest for
+        # cross-sectional ranking in biotech.  Fall back to raw y_reg if
+        # market_flow_volatility is not present in the feature columns.
+        if "market_flow_volatility" in feature_columns:
+            vol_idx = feature_columns.index("market_flow_volatility")
+            vol_col = X[:, vol_idx]
+            y_reg_adj = y_reg / np.where(vol_col > 0.01, vol_col, 1.0)
+        else:
+            y_reg_adj = y_reg
+
+        reg_mean, reg_scale, reg_weights, reg_bias = self._ridge_fit(X, y_reg_adj, alpha=1.5)
         clf_targets = np.where(y_clf > 0, 2.0, -2.0)
         clf_mean, clf_scale, clf_weights, clf_bias = self._ridge_fit(X, clf_targets, alpha=2.0)
 
