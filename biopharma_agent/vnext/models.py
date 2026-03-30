@@ -266,9 +266,15 @@ class EventDrivenEnsemble:
                 if self.bundle.calibrator is not None:
                     catalyst_success_prob = float(self.bundle.calibrator.predict([catalyst_success_prob])[0])
 
+            # Crowding risk is primarily the analyst/investor crowdedness score.
+            # Raw positive momentum only signals crowding when it is already elevated
+            # (e.g. >15% 3-month run into a catalyst) — modest momentum driven by
+            # fundamentals should not be penalised as crowding.
+            momentum_3mo = vector.feature_family.get("market_flow_momentum_3mo", 0.0)
+            momentum_crowding_signal = max(momentum_3mo - 0.15, 0.0) * 0.5
             crowding_risk = _sigmoid(
                 vector.feature_family.get("catalyst_timing_crowdedness", 0.30) * 2.4
-                + max(vector.feature_family.get("market_flow_momentum_3mo", 0.0), 0.0)
+                + momentum_crowding_signal
             )
             financing_risk = _sigmoid(
                 (0.9 * vector.feature_family.get("balance_sheet_financing_pressure", 0.0))

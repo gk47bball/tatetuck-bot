@@ -380,7 +380,9 @@ class WalkForwardEvaluator:
                 event_type_scorecards={},
             )
 
-        curve = pd.Series(cumulative_returns).cumsum()
+        # Compound returns properly: arithmetic cumsum understates drawdown for
+        # biotech where window returns routinely exceed ±20–30%.
+        curve = (1.0 + pd.Series(cumulative_returns)).cumprod() - 1.0
         peak = curve.cummax()
         drawdown = (curve - peak).min()
         event_type_scorecards = {

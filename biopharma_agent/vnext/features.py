@@ -202,15 +202,20 @@ class FeatureEngineer:
 
     @staticmethod
     def _modality_risk(modality: str) -> float:
+        # Risk scores calibrated to recent regulatory track record (2018-2024).
+        # "gene editing": reduced from 0.80 — CASGEVY approval demonstrates commercial
+        #   viability; primary risks now execution (manufacturing, delivery) not biology.
+        # "vaccine": reduced from 0.45 — mRNA platform has proven Phase 3 reliability;
+        #   traditional vaccine Phase 3 LoA is one of the highest across modalities.
         risk_map = {
-            "gene editing": 0.80,
-            "gene therapy": 0.70,
-            "cell therapy": 0.65,
-            "antibody": 0.30,
-            "small molecule": 0.25,
-            "vaccine": 0.45,
-            "rna": 0.55,
-            "platform": 0.60,
+            "gene editing": 0.65,   # post-CASGEVY; key risk is delivery & durability
+            "gene therapy": 0.70,   # AAV immunogenicity & redosing remain open issues
+            "cell therapy": 0.65,   # solid tumor penetration still uncertain; heme success high
+            "antibody": 0.30,       # well-characterised modality, high Phase 3 LoA
+            "small molecule": 0.25, # most predictable from Phase 2 data
+            "vaccine": 0.35,        # mRNA platform reliable; adjuvanted vaccines also strong
+            "rna": 0.55,            # siRNA/ASO successes offset CNS delivery challenges
+            "platform": 0.60,       # unknown modality — apply conservative prior
         }
         return risk_map.get(modality, 0.50)
 
