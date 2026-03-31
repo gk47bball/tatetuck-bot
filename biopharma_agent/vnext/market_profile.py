@@ -337,23 +337,44 @@ def build_expectation_lens(
         peer_multiple = float(peer_context.get("median_multiple") or 5.0)
         commercial_anchor = float(snapshot.revenue or 0.0) * _clamp(peer_multiple * (0.80 + (0.30 * launch_progress)), 2.5, 9.0)
         pipeline_anchor = risk_adjusted_sales * (1.9 + (0.2 * lifecycle_score))
-        internal_value = (
-            (0.55 * peer_anchor_value if peer_anchor_value > 0 else 0.0)
-            + (0.45 * commercial_anchor)
-            + (0.35 * pipeline_anchor)
-            + cash_floor_value
-        )
+        # Additive weights must sum to ≤ 1.0 across the main components to avoid
+        # double-counting: the peer multiple already reflects pipeline optionality
+        # for most commercial biotechs.  Old weights (0.55 + 0.45 + 0.35 = 1.35)
+        # inflated internal_value by ~20-30% for launch-stage names, causing the
+        # portfolio constructor to systematically overweight them.
+        if peer_anchor_value > 0:
+            internal_value = (
+                (0.50 * peer_anchor_value)
+                + (0.35 * commercial_anchor)
+                + (0.15 * pipeline_anchor)
+                + cash_floor_value
+            )
+        else:
+            internal_value = (
+                (0.65 * commercial_anchor)
+                + (0.35 * pipeline_anchor)
+                + cash_floor_value
+            )
         value_method = "peer EV/revenue anchored launch value with lifecycle and pipeline support"
     else:
         peer_multiple = float(peer_context.get("median_multiple") or 4.0)
         franchise_anchor = float(snapshot.revenue or 0.0) * _clamp(peer_multiple * (0.90 + (0.15 * capital_deployment)), 2.0, 8.0)
         pipeline_anchor = risk_adjusted_sales * (1.4 + (0.25 * pipeline_optionality))
-        internal_value = (
-            (0.70 * peer_anchor_value if peer_anchor_value > 0 else 0.0)
-            + (0.30 * franchise_anchor)
-            + (0.25 * pipeline_anchor)
-            + (0.75 * max(net_cash, 0.0))
-        )
+        # Same principle: peer anchor for commercialized names already prices in
+        # pipeline.  Old weights (0.70 + 0.30 + 0.25 = 1.25) overstated value.
+        if peer_anchor_value > 0:
+            internal_value = (
+                (0.65 * peer_anchor_value)
+                + (0.20 * franchise_anchor)
+                + (0.15 * pipeline_anchor)
+                + (0.75 * max(net_cash, 0.0))
+            )
+        else:
+            internal_value = (
+                (0.70 * franchise_anchor)
+                + (0.30 * pipeline_anchor)
+                + (0.75 * max(net_cash, 0.0))
+            )
         value_method = "franchise peer EV/revenue with pipeline and capital deployment optionality"
 
     internal_upside_pct = _clamp((internal_value / market_cap) - 1.0, -0.85, 2.50)
