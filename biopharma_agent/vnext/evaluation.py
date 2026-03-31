@@ -49,9 +49,11 @@ class WalkForwardSummary:
     strict_rank_ic: float = 0.0
     strict_hit_rate: float = 0.0
     strict_top_bottom_spread: float = 0.0
+    alpha_rank_ic: float = 0.0
     pm_context_coverage: float = 0.0
     exact_primary_event_rate: float = 0.0
     synthetic_primary_event_rate: float = 0.0
+    stale_catalyst_rate: float = 0.0
     institutional_blockers: list[str] = field(default_factory=list)
     latest_window_top_trades: list[dict[str, object]] = field(default_factory=list)
     event_type_scorecards: dict[str, dict[str, float]] = field(default_factory=dict)
@@ -192,6 +194,7 @@ class WalkForwardEvaluator:
 
         ensemble = EventDrivenEnsemble(store=self.store)
         rank_ics: list[float] = []
+        alpha_rank_ics: list[float] = []
         hit_rates: list[float] = []
         spreads: list[float] = []
         strict_rank_ics: list[float] = []
@@ -202,6 +205,7 @@ class WalkForwardEvaluator:
         cumulative_returns: list[float] = []
         exact_event_rates: list[float] = []
         synthetic_event_rates: list[float] = []
+        stale_event_rates: list[float] = []
         pm_context_coverages: list[float] = []
         previous_top: set[str] = set()
         previous_recommendations: dict[str, object] = {}
@@ -249,6 +253,12 @@ class WalkForwardEvaluator:
             num_windows += 1
             baseline_rank_ic = _spearman(company_frame["expected_return"], company_frame["target_return_90d"])
             rank_ics.append(baseline_rank_ic)
+            if (
+                "target_alpha_90d" in company_frame.columns
+                and company_frame["target_alpha_90d"].notna().sum() >= 3
+            ):
+                alpha_rank_ic_window = _spearman(company_frame["expected_return"], company_frame["target_alpha_90d"])
+                alpha_rank_ics.append(alpha_rank_ic_window)
             hit_rates.append(float((np.sign(company_frame["expected_return"]) == np.sign(company_frame["target_return_90d"])).mean()))
             top = company_frame.nlargest(max(1, len(company_frame) // 5), "expected_return")
             bottom = company_frame.nsmallest(max(1, len(company_frame) // 5), "expected_return")
@@ -256,6 +266,13 @@ class WalkForwardEvaluator:
             spreads.append(baseline_spread)
             exact_event_rates.append(float(company_frame["primary_event_exact"].fillna(False).mean()))
             synthetic_event_rates.append(float(company_frame["primary_event_synthetic"].fillna(False).mean()))
+            stale_event_rates.append(
+                float(
+                    (company_frame["primary_event_status"].fillna("") == "stale_synthetic").mean()
+                )
+                if "primary_event_status" in company_frame.columns
+                else 0.0
+            )
             pm_context_coverages.append(
                 float(
                     company_frame[
@@ -429,6 +446,7 @@ class WalkForwardEvaluator:
         pm_context_coverage = _safe_mean(pm_context_coverages)
         exact_primary_event_rate = _safe_mean(exact_event_rates)
         synthetic_primary_event_rate = _safe_mean(synthetic_event_rates)
+        stale_catalyst_rate = _safe_mean(stale_event_rates)
         if pm_context_coverage < 0.95:
             institutional_blockers.append(
                 f"Only {pm_context_coverage * 100:.1f}% of evaluated rows carry full PM context fields."
@@ -467,6 +485,7 @@ class WalkForwardEvaluator:
             strict_rank_ic=_safe_mean(strict_rank_ics),
             strict_hit_rate=_safe_mean(strict_hit_rates),
             strict_top_bottom_spread=_safe_mean(strict_spreads),
+            alpha_rank_ic=_safe_mean(alpha_rank_ics),
             pm_context_coverage=pm_context_coverage,
             exact_primary_event_rate=exact_primary_event_rate,
             synthetic_primary_event_rate=synthetic_primary_event_rate,
@@ -647,6 +666,11 @@ class WalkForwardEvaluator:
                     "primary_event_exact": primary_event_quality["exact"],
                     "primary_event_synthetic": primary_event_quality["synthetic"],
                     "target_return_90d": float(label["target_return_90d"]) if pd.notna(label["target_return_90d"]) else np.nan,
+                    "target_alpha_90d": (
+                        float(label["target_alpha_90d"])
+                        if "target_alpha_90d" in label.index and pd.notna(label["target_alpha_90d"])
+                        else np.nan
+                    ),
                     "target_catalyst_success": float(label["target_catalyst_success"]) if pd.notna(label["target_catalyst_success"]) else np.nan,
                     "target_primary_event_type": label.get("target_primary_event_type"),
                     "target_primary_event_bucket": label.get("target_primary_event_bucket"),

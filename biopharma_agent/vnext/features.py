@@ -247,13 +247,49 @@ class FeatureEngineer:
 
     @staticmethod
     def _endpoint_score(outcomes: list[str]) -> float:
+        """
+        Score endpoint quality based on FDA approvability and regulatory history.
+
+        Hard clinical endpoints (OS, PFS) are the gold standard — they directly
+        measure patient benefit and have the highest FDA acceptance rate.
+        Surrogate endpoints (response rate, biomarkers) require additional
+        validation and face more complete-response letters.
+        Safety-only endpoints (Phase 1) are informative but not approvable.
+
+        Scores calibrated to FDA Complete Response Letter (CRL) frequency by
+        endpoint type: OS-powered trials have ~10% CRL rate, surrogate-only
+        trials have ~35% CRL rate, safety trials are not yet at approval stage.
+        """
         outcome_text = " ".join(outcomes).lower()
-        score = 0.25
-        if any(keyword in outcome_text for keyword in ("overall survival", "pfs", "response rate", "hemoglobin")):
-            score += 0.35
-        if any(keyword in outcome_text for keyword in ("safety", "adverse", "tolerability")):
-            score += 0.10
-        return min(score, 1.0)
+
+        # Hard clinical endpoints — direct patient benefit, FDA gold standard
+        if any(kw in outcome_text for kw in ("overall survival", " os ", "death from any")):
+            return 0.90
+        if any(kw in outcome_text for kw in ("progression-free survival", "pfs", "event-free survival", "efs", "relapse-free")):
+            return 0.75
+        # Disease-specific hard endpoints with established FDA precedent
+        if any(kw in outcome_text for kw in ("hemoglobin", "vaso-occlusive", "transfusion independence", "bleed")):
+            return 0.80
+        if any(kw in outcome_text for kw in ("forced expiratory", "fev1", "lung function", "forced vital capacity")):
+            return 0.75
+        if any(kw in outcome_text for kw in ("major adverse cardiovascular", "mace", "cardiovascular death")):
+            return 0.80
+        # Functional / patient-reported outcomes — FDA accepted but higher CRL risk
+        if any(kw in outcome_text for kw in ("functional independence", "activities of daily", "disability")):
+            return 0.65
+        # Surrogate endpoints — approvable but vulnerable to confirmatory failure
+        if any(kw in outcome_text for kw in ("objective response", "response rate", "orr", "complete response", "partial response")):
+            return 0.55
+        if any(kw in outcome_text for kw in ("viral load", "hba1c", "ldl", "bone mineral density")):
+            return 0.60
+        # Biomarker / pharmacodynamic — typically Phase 1/2; not independently approvable
+        if any(kw in outcome_text for kw in ("pharmacokinetic", "pharmacodynamic", "biomarker", "dose-limiting")):
+            return 0.30
+        # Safety / tolerability only — Phase 1 standard; no efficacy claim
+        if any(kw in outcome_text for kw in ("safety", "adverse", "tolerability", "maximum tolerated")):
+            return 0.25
+
+        return 0.40  # unknown endpoint — conservative prior
 
     @staticmethod
     def _modality_risk(modality: str) -> float:

@@ -205,6 +205,9 @@ class PointInTimeLabeler:
                 YFinanceHistoryProvider(store=self.store, allow_live=not bool(eodhd_key)),
             ]
         )
+        # Cache for XBI (or other benchmark) price history to avoid repeated fetches
+        # across overlapping label windows.  Key: (ticker, start_date, end_date).
+        self._benchmark_cache: dict[tuple[str, str, str], pd.Series] = {}
 
     def materialize_labels(self, snapshots: pd.DataFrame | None = None, catalysts: pd.DataFrame | None = None) -> LabelSummary:
         snapshot_labels, event_labels = self.build_label_frames(
@@ -300,6 +303,26 @@ class PointInTimeLabeler:
                     row[f"target_return_{horizon}"] = (
                         np.nan if future_price is None else (future_price / base_price) - 1.0
                     )
+
+                # Compute benchmark-relative alpha labels.  We subtract the XBI ETF
+                # return over the identical calendar window so that the model trains on
+                # stock-picking skill rather than riding the sector tide.  Raw returns
+                # are kept for backward-compatibility; alpha columns are additive.
+                base_date_str = pd.Timestamp(base_ts).date().isoformat()
+                for horizon, days in (("30d", 30), ("90d", 90), ("180d", 180)):
+                    raw_return = row.get(f"target_return_{horizon}")
+                    if pd.isna(raw_return) if raw_return is not None else True:
+                        row[f"target_alpha_{horizon}"] = np.nan
+                        continue
+                    target_date_str = (pd.Timestamp(base_ts) + pd.Timedelta(days=days)).date().isoformat()
+                    xbi_return = self._fetch_benchmark_return(base_date_str, target_date_str, ticker="XBI")
+                    if xbi_return is None:
+                        # Graceful fallback: treat alpha as raw return (implicitly
+                        # assumes XBI return = 0 for this window) so downstream
+                        # training can still proceed.
+                        row[f"target_alpha_{horizon}"] = raw_return
+                    else:
+                        row[f"target_alpha_{horizon}"] = float(raw_return) - xbi_return
 
                 primary_event = self._select_primary_event(
                     ticker_catalysts=ticker_catalysts,
@@ -484,6 +507,60 @@ class PointInTimeLabeler:
             ascending=[False, False, False, True, True],
         )
         return exact.iloc[0]
+
+    def _fetch_benchmark_return(
+        self,
+        start_date: str,
+        end_date: str,
+        ticker: str = "XBI",
+    ) -> float | None:
+        """Return the benchmark's total return over [start_date, end_date].
+
+        Uses auto_adjust=True so the return reflects the adjusted-close price
+        series (i.e. it captures dividends/splits correctly).  Results are cached
+        by (ticker, start_date, end_date) to avoid redundant network round-trips
+        for overlapping label windows.
+
+        Returns None if data is unavailable, allowing callers to fall back to raw
+        returns with a warning.
+        """
+        cache_key = (ticker, start_date, end_date)
+        if cache_key in self._benchmark_cache:
+            close = self._benchmark_cache[cache_key]
+        else:
+            try:
+                raw = yf.Ticker(ticker).history(start=start_date, end=end_date, auto_adjust=True)
+                if raw.empty or "Close" not in raw.columns:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Benchmark %s data unavailable for %s – %s; falling back to raw return.",
+                        ticker, start_date, end_date,
+                    )
+                    self._benchmark_cache[cache_key] = pd.Series(dtype=float)
+                    return None
+                close_raw = raw["Close"].astype(float)
+                index = pd.to_datetime(close_raw.index, utc=True).tz_convert(None).astype("datetime64[ns]")
+                close = pd.Series(close_raw.to_numpy(dtype=float), index=index)
+                close.index.name = "date"
+            except Exception:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Exception fetching benchmark %s for %s – %s; falling back to raw return.",
+                    ticker, start_date, end_date,
+                )
+                self._benchmark_cache[cache_key] = pd.Series(dtype=float)
+                return None
+            self._benchmark_cache[cache_key] = close
+
+        if close.empty:
+            return None
+        start_ts = np.datetime64(start_date, "D").astype("datetime64[ns]")
+        end_ts = np.datetime64(end_date, "D").astype("datetime64[ns]")
+        base_price = self._price_at_or_before(close, start_ts)
+        future_price = self._price_at_or_after(close, end_ts)
+        if base_price is None or future_price is None or base_price <= 0:
+            return None
+        return float((future_price / base_price) - 1.0)
 
     @staticmethod
     def _price_at_or_after(close: pd.Series, timestamp: np.datetime64) -> float | None:

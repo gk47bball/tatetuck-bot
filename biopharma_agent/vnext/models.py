@@ -127,6 +127,9 @@ class EventDrivenEnsemble:
                 "target_return_30d",
                 "target_return_90d",
                 "target_return_180d",
+                "target_alpha_30d",
+                "target_alpha_90d",
+                "target_alpha_180d",
                 "target_catalyst_success",
             }
             and not column.startswith("target_")
@@ -147,9 +150,25 @@ class EventDrivenEnsemble:
         if len(usable) < 30:
             return None
 
+        # Prefer benchmark-relative alpha as the regression target when it is
+        # present with at least 80% non-null coverage.  Training on alpha rather
+        # than raw returns makes the signal cycle-stable: it captures genuine
+        # stock-picking skill rather than riding broad XBI moves, so the model
+        # generalises across bull and bear biotech regimes.
+        used_alpha_target = False
+        if (
+            "target_alpha_90d" in usable.columns
+            and usable["target_alpha_90d"].notna().sum() >= 0.80 * len(usable)
+        ):
+            usable = usable.dropna(subset=["target_alpha_90d"])
+            regression_target_col = "target_alpha_90d"
+            used_alpha_target = True
+        else:
+            regression_target_col = "target_return_90d"
+
         feature_columns = self.feature_columns(usable)
         X = usable[feature_columns].fillna(0.0).to_numpy(dtype=float)
-        y_reg = usable["target_return_90d"].to_numpy(dtype=float)
+        y_reg = usable[regression_target_col].to_numpy(dtype=float)
         y_clf = usable["target_catalyst_success"].to_numpy(dtype=int)
 
         # Volatility-normalise the regression target so that a 20% expected return
@@ -214,8 +233,10 @@ class EventDrivenEnsemble:
             holdout_window_end=None,
             metrics={
                 "num_rows": float(len(usable)),
-                "mean_target_return_90d": float(np.mean(y_reg)),
+                "mean_target_return_90d": float(np.mean(usable["target_return_90d"].to_numpy(dtype=float))),
+                "mean_regression_target": float(np.mean(y_reg)),
                 "base_event_rate": float(np.mean(y_clf)),
+                "used_alpha_target": used_alpha_target,
             },
             artifact_path=str(artifact_path) if artifact_path is not None else None,
         )
