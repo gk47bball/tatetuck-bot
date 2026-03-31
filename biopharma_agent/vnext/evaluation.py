@@ -459,6 +459,11 @@ class WalkForwardEvaluator:
             institutional_blockers.append(
                 f"{synthetic_primary_event_rate * 100:.1f}% of evaluated rows still rely on synthetic primary events."
             )
+        if stale_catalyst_rate > 0.10:
+            institutional_blockers.append(
+                f"{stale_catalyst_rate * 100:.1f}% of evaluated rows have a stale synthetic primary event "
+                "(CT.gov not updated after trial readout); these phantom catalysts corrupt near-term signal."
+            )
         if momentum_ablation["no_momentum_rank_ic"] > 0.0 and (
             momentum_ablation["baseline_rank_ic"] - momentum_ablation["no_momentum_rank_ic"]
         ) > 0.12:
@@ -489,6 +494,7 @@ class WalkForwardEvaluator:
             pm_context_coverage=pm_context_coverage,
             exact_primary_event_rate=exact_primary_event_rate,
             synthetic_primary_event_rate=synthetic_primary_event_rate,
+            stale_catalyst_rate=stale_catalyst_rate,
             institutional_blockers=institutional_blockers,
             latest_window_top_trades=latest_window_top_trades,
             event_type_scorecards=event_type_scorecards,

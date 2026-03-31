@@ -45,6 +45,10 @@ SYNTHETIC_EVENT_STATUSES = {
     "phase_timing_estimate",
     "calendar_estimate",
     "estimated_from_revenue",
+    # A synthetic event that has been flagged as stale because a recent SEC
+    # 8-K filing suggests the trial already read out.  Still treated as
+    # synthetic (not exact) so it does not inflate exact_primary_event_rate.
+    "stale_synthetic",
 }
 
 EXACT_EVENT_STATUSES = {

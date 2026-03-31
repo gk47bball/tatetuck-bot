@@ -20,6 +20,31 @@ from .market_profile import update_snapshot_profile
 from .taxonomy import program_event_type_for_phase
 
 
+READOUT_KEYWORDS = (
+    "results",
+    "data",
+    "met",
+    "failed",
+    "discontinued",
+    "topline",
+    "top-line",
+    "interim",
+    "readout",
+)
+
+# Stale synthetic: a catalyst the model believes is upcoming, but an 8-K
+# suggests the trial read out recently.  We keep the event but push horizon
+# out to 365 days so it does not pollute near-term catalyst signal.
+STALE_SYNTHETIC_HORIZON_DAYS = 365
+# An 8-K filed within this many days of as_of is considered "recent enough"
+# to indicate the trial has already read out.
+STALE_RECENCY_WINDOW_DAYS = 180
+# Only flag a catalyst as stale if the model currently thinks it is upcoming
+# (horizon_days > this threshold).  Events already placed far out are not
+# phantom catalysts.
+STALE_MIN_HORIZON_DAYS = 30
+
+
 MODALITY_KEYWORDS = {
     "gene editing": ("crispr", "editing", "base edit", "prime edit"),
     "gene therapy": ("aav", "gene therapy", "transgene"),
@@ -177,6 +202,111 @@ def _build_catalyst(
     )
 
 
+def _flag_stale_catalysts(
+    catalyst_events: list[CatalystEvent],
+    sec_events: list[dict],  # raw SEC event payloads; each dict must contain at least:
+    #   "title"    : str  — filing title (e.g. "Form 8-K: Results of Operations")
+    #   "summary"  : str  — short description / subject line
+    #   "filed_at" : str  — ISO-8601 date/datetime of the filing
+    as_of: str,
+    program_names: list[str],
+    conditions: list[str],
+) -> list[CatalystEvent]:
+    """Flag synthetic catalyst events that appear to have already occurred.
+
+    ClinicalTrials.gov registrants are notoriously slow to update trial status.
+    We cross-reference SEC 8-K filings: if a filing within the past
+    ``STALE_RECENCY_WINDOW_DAYS`` days contains readout-style keywords that
+    match a program name or condition, and the model still believes the catalyst
+    is upcoming (horizon_days > ``STALE_MIN_HORIZON_DAYS``), we mark the event
+    as ``status="stale_synthetic"`` and push ``horizon_days`` to
+    ``STALE_SYNTHETIC_HORIZON_DAYS``.
+
+    Stale events are *not* deleted so downstream diagnostics can inspect them.
+
+    Args:
+        catalyst_events: List of CatalystEvent objects to inspect.  Only events
+            whose status is not an exact-timing status are candidates.
+        sec_events: List of raw SEC filing dicts.  If empty or unavailable the
+            function returns the list unchanged (graceful skip).
+        as_of: ISO-8601 string representing the snapshot date.
+        program_names: Drug / program names for the company (used for keyword
+            matching against filing text).
+        conditions: Disease / indication strings for the company (also used for
+            keyword matching).
+
+    Returns:
+        The same list of CatalystEvent objects, potentially with some events
+        mutated to status="stale_synthetic" and horizon_days adjusted.
+    """
+    if not sec_events:
+        return catalyst_events
+
+    try:
+        as_of_dt = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return catalyst_events
+
+    recency_cutoff = as_of_dt - timedelta(days=STALE_RECENCY_WINDOW_DAYS)
+
+    # Build a normalised keyword set from program names + conditions.
+    # We use short, distinctive tokens (length >= 4) to avoid spurious matches
+    # on common English words.
+    match_tokens: set[str] = set()
+    for phrase in list(program_names) + list(conditions):
+        for token in phrase.lower().split():
+            token = token.strip("(),.-")
+            if len(token) >= 4:
+                match_tokens.add(token)
+
+    # Pre-filter: identify SEC filings that (a) are recent and (b) contain at
+    # least one readout keyword — these are the only filings that can trigger
+    # the staleness flag.
+    readout_filings: list[str] = []  # concatenated text of qualifying filings
+    for filing in sec_events:
+        filed_at_raw = filing.get("filed_at") or ""
+        try:
+            filed_dt = datetime.fromisoformat(str(filed_at_raw).replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+        if filed_dt < recency_cutoff or filed_dt > as_of_dt:
+            continue
+        filing_text = " ".join(
+            str(filing.get(key) or "")
+            for key in ("title", "summary")
+        ).lower()
+        if any(kw in filing_text for kw in READOUT_KEYWORDS):
+            readout_filings.append(filing_text)
+
+    if not readout_filings:
+        return catalyst_events
+
+    # For each synthetic catalyst that the model believes is still upcoming,
+    # check whether any recent readout filing mentions a matching token.
+    exact_statuses = {"exact_sec_filing", "exact_company_calendar", "exact_press_release"}
+    for event in catalyst_events:
+        if event.status in exact_statuses:
+            continue
+        if event.horizon_days <= STALE_MIN_HORIZON_DAYS:
+            continue
+        # Build tokens for this specific event (title + program-level conditions
+        # already covered by match_tokens, but also check the event title itself).
+        event_tokens = set(match_tokens)
+        for token in (event.title or "").lower().split():
+            token = token.strip("(),.-")
+            if len(token) >= 4:
+                event_tokens.add(token)
+        for filing_text in readout_filings:
+            if any(tok in filing_text for tok in event_tokens):
+                # Mutate in place — CatalystEvent uses dataclass(slots=True)
+                # but slots does not prevent attribute assignment.
+                object.__setattr__(event, "status", "stale_synthetic")
+                object.__setattr__(event, "horizon_days", STALE_SYNTHETIC_HORIZON_DAYS)
+                break  # one matching filing is enough
+
+    return catalyst_events
+
+
 def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -> CompanySnapshot:
     as_of = as_of or datetime.now(timezone.utc)
     finance = raw.get("finance", {})
@@ -291,6 +421,23 @@ def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -
                 summary=f"Estimated runway is {runway_months:.1f} months.",
             )
         )
+
+    # Staleness check: cross-reference synthetic catalyst events against SEC
+    # 8-K filings to detect phantom catalysts (trial read out but CT.gov not
+    # updated).  ``event_tape`` is an optional list of raw filing dicts in the
+    # raw payload.  If absent we skip gracefully.
+    sec_tape: list[dict] = list(raw.get("event_tape") or [])
+    all_program_names = [p.name for p in programs]
+    all_conditions: list[str] = []
+    for p in programs:
+        all_conditions.extend(p.conditions)
+    company_catalysts = _flag_stale_catalysts(
+        catalyst_events=company_catalysts,
+        sec_events=sec_tape,
+        as_of=as_of.isoformat(),
+        program_names=all_program_names,
+        conditions=all_conditions,
+    )
 
     snapshot_metadata = {
         "best_phase": raw.get("best_phase"),
