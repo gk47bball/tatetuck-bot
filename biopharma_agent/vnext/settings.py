@@ -67,6 +67,7 @@ class VNextSettings:
     evaluation_max_snapshot_staleness_days: int = 120
     allow_blocked_paper_trading: bool = False
     simulated_paper_equity: float = 100000.0
+    execution_adv_pct_cap: float = 0.05  # max 5% of 20-day dollar ADV per order
 
     @classmethod
     def from_env(cls) -> "VNextSettings":
@@ -136,6 +137,7 @@ class VNextSettings:
             evaluation_max_snapshot_staleness_days=_env_int("TATETUCK_EVAL_MAX_SNAPSHOT_STALENESS_DAYS", 120),
             allow_blocked_paper_trading=_env_flag("TATETUCK_ALLOW_BLOCKED_PAPER_TRADING", False),
             simulated_paper_equity=float(os.environ.get("TATETUCK_SIMULATED_PAPER_EQUITY", "100000.0")),
+            execution_adv_pct_cap=float(os.environ.get("TATETUCK_EXECUTION_ADV_PCT_CAP", "0.05")),
         )
 
     def public_metadata(self) -> dict[str, object]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import math
 import os
 from typing import Iterable
 from uuid import uuid4
@@ -397,6 +398,20 @@ class DiscordTradeNotifier:
         return response.json()
 
 
+def _fetch_dollar_adv(ticker: str, lookback_days: int = 20) -> float | None:
+    """Fetch 20-day average daily volume in dollars. Returns None on failure."""
+    try:
+        import yfinance as yf
+        hist = yf.Ticker(ticker).history(period=f"{lookback_days + 5}d", auto_adjust=True)
+        if hist.empty or len(hist) < 5:
+            return None
+        recent = hist.tail(lookback_days)
+        dollar_volume = (recent["Close"] * recent["Volume"]).mean()
+        return float(dollar_volume) if dollar_volume > 0 else None
+    except Exception:
+        return None
+
+
 class PMExecutionPlanner:
     def __init__(self, settings: VNextSettings):
         self.settings = settings
@@ -446,6 +461,8 @@ class PMExecutionPlanner:
         gross_cap = self.settings.max_gross_exposure_pct
         scale = 1.0 if total_weight <= gross_cap or total_weight <= 0 else gross_cap / total_weight
 
+        correlation_groups = self._catalyst_correlation_groups(selected, window_days=21)
+
         instructions: list[ExecutionInstruction] = []
         selected_symbols: list[str] = []
         for analysis in selected:
@@ -454,7 +471,10 @@ class PMExecutionPlanner:
             ticker = analysis.snapshot.ticker
             profile = profiles[ticker]
             selected_symbols.append(ticker)
-            scaled_target_weight = capped_weights[ticker] * scale
+            group_size = correlation_groups.get(ticker, 1)
+            # Kelly-style discount: scale by 1/sqrt(n_correlated) for n > 1
+            correlation_scale = 1.0 / max(math.sqrt(group_size), 1.0)
+            scaled_target_weight = capped_weights[ticker] * scale * correlation_scale
             target_notional = deployable_notional * (scaled_target_weight / max(gross_cap, 1e-9))
             position = positions_by_symbol.get(ticker)
             current_notional = position.market_value if position else 0.0
@@ -474,6 +494,8 @@ class PMExecutionPlanner:
                 f"scaled_target_weight={scaled_target_weight:.2f}%",
             ]
             rationale.extend(profile.rationale)
+            if group_size > 1:
+                rationale.append(f"correlation_discount: {group_size} catalysts in same 21d window, scaled by {correlation_scale:.2f}x")
             if position and weight_gap_pct < self.settings.execution_rebalance_band_pct:
                 rationale.append(
                     f"inside_rebalance_band={self.settings.execution_rebalance_band_pct:.2f}%"
@@ -482,15 +504,14 @@ class PMExecutionPlanner:
                 action = "buy"
                 side = "buy"
                 notional = round(delta_notional, 2)
-                # ADV GUARD (not yet implemented — roadmap item):
-                # For institutional-grade execution, orders >5% of the 20-day ADV
-                # should be flagged and potentially split over multiple sessions.
-                # Small-cap biotech can have ADV as low as $200k; a $15k order
-                # (~7.5% ADV) is material and will cause measurable slippage.
-                # TODO: Pull 20-day ADV from market data, compute adv_pct =
-                #   delta_notional / adv_20d, and add a rationale flag when >5%.
-                #   Consider reducing order size to min(delta_notional, adv_20d * 0.05)
-                #   or spreading over 2 sessions with a 0.5x first tranche.
+                # ADV guard: cap single-session order at adv_pct_cap of 20-day dollar ADV
+                adv = _fetch_dollar_adv(ticker)
+                if adv is not None and adv > 0:
+                    adv_cap = adv * self.settings.execution_adv_pct_cap
+                    if notional > adv_cap:
+                        original_notional = notional
+                        notional = round(adv_cap, 2)
+                        rationale.append(f"adv_capped: ${original_notional:,.0f} → ${notional:,.0f} ({self.settings.execution_adv_pct_cap*100:.0f}% of ${adv:,.0f} ADV)")
             elif delta_notional <= -self.settings.min_order_notional and position and position.current_price > 0:
                 action = "sell"
                 side = "sell"
@@ -670,6 +691,29 @@ class PMExecutionPlanner:
             and profile is not None
             and profile.mode in {"auto", "hold"}
         )
+
+    @staticmethod
+    def _catalyst_correlation_groups(analyses: list, window_days: int = 21) -> dict[str, int]:
+        """
+        Group analyses by catalyst timing window. Returns {ticker: group_size}.
+        Analyses with catalysts within window_days of each other are considered correlated.
+        Uses a simple greedy grouping: compare each pair and union overlapping windows.
+        """
+        ticker_horizons: list[tuple[str, float]] = []
+        for analysis in analyses:
+            events = getattr(analysis.snapshot, "catalyst_events", []) or []
+            horizon = min((e.horizon_days for e in events), default=365)
+            ticker_horizons.append((analysis.snapshot.ticker, float(horizon)))
+
+        # Build groups using union-find style: each pair within window_days gets same group
+        groups: dict[str, int] = {ticker: 1 for ticker, _ in ticker_horizons}
+        for i, (ticker_a, horizon_a) in enumerate(ticker_horizons):
+            count = 1
+            for j, (ticker_b, horizon_b) in enumerate(ticker_horizons):
+                if i != j and abs(horizon_a - horizon_b) <= window_days:
+                    count += 1
+            groups[ticker_a] = count
+        return groups
 
     def _execution_profile(
         self,
