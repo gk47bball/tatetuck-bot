@@ -101,6 +101,10 @@ class PortfolioConstructor:
             - risk_discount,
         )
 
+        # Per-scenario caps must not exceed the execution layer's hard limits
+        # (settings.max_single_position_pct = 4.0, execution_max_hard_catalyst = 4.0).
+        # Storing inflated target_weights (e.g. 8%) that can never execute creates
+        # a false picture in portfolio_recommendations and misleads scorecard feedback.
         if scenario == "watchlist only":
             target_weight = min(target_weight, 1.0)
         elif scenario == "avoid due to financing":
@@ -108,15 +112,17 @@ class PortfolioConstructor:
         elif scenario == "pairs candidate":
             target_weight = min(target_weight, 2.5)
         elif scenario == "commercial compounder":
-            target_weight = min(target_weight, 5.0)
+            target_weight = min(target_weight, 4.0)
         elif scenario == "pre-catalyst long":
-            target_weight = min(target_weight, 8.0)
+            target_weight = min(target_weight, 4.0)
 
-        max_weight = 10.0
+        # max_weight is the ceiling stored on the recommendation record.
+        # Align to execution-layer limits so downstream readers aren't misled.
+        max_weight = 4.0
         if signal.crowding_risk > 0.75:
-            max_weight = 5.0
+            max_weight = 2.5
         if signal.financing_risk > 0.75:
-            max_weight = min(max_weight, 3.0)
+            max_weight = min(max_weight, 2.0)
 
         target_weight = self._smooth_weight(
             raw_weight=min(target_weight, max_weight),

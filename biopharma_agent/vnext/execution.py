@@ -482,6 +482,15 @@ class PMExecutionPlanner:
                 action = "buy"
                 side = "buy"
                 notional = round(delta_notional, 2)
+                # ADV GUARD (not yet implemented — roadmap item):
+                # For institutional-grade execution, orders >5% of the 20-day ADV
+                # should be flagged and potentially split over multiple sessions.
+                # Small-cap biotech can have ADV as low as $200k; a $15k order
+                # (~7.5% ADV) is material and will cause measurable slippage.
+                # TODO: Pull 20-day ADV from market data, compute adv_pct =
+                #   delta_notional / adv_20d, and add a rationale flag when >5%.
+                #   Consider reducing order size to min(delta_notional, adv_20d * 0.05)
+                #   or spreading over 2 sessions with a 0.5x first tranche.
             elif delta_notional <= -self.settings.min_order_notional and position and position.current_price > 0:
                 action = "sell"
                 side = "sell"

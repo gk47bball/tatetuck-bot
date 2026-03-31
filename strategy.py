@@ -290,7 +290,12 @@ def _penetration_rate(conditions: list[str]) -> float:
     matched = _matched_categories(conditions)
     if not matched:
         return 0.15
-    return min(PENETRATION_BY_CATEGORY.get(category, 0.15) for category in matched)
+    rates = [PENETRATION_BY_CATEGORY.get(category, 0.15) for category in matched]
+    # Use the average of matched category penetration rates.
+    # The old min() was too conservative for hybrid indications: an orphan oncology
+    # drug (oncology 8%, rare disease 25%) would get 8%, but in practice orphan
+    # designations support 20-25% penetration of small patient populations.
+    return sum(rates) / len(rates)
 
 
 def _asset_name(trial: TrialData) -> str:
