@@ -99,6 +99,61 @@ class FeatureEngineer:
         features.update(self._event_type_features(top_event_type, prefix="catalyst_timing_event"))
         features.update(self._event_type_features(company_event_type, prefix="catalyst_timing_company_event"))
 
+        # ── Interaction features ───────────────────────────────────────────────
+        # Ridge regression is a linear model; it cannot discover non-linear
+        # relationships between features on its own.  These four interactions
+        # capture the most important product relationships in biotech alpha:
+        #
+        # 1. quality × timing  — high POS AND near-term catalyst is the
+        #    archetypal pre-catalyst long.  POS alone (far-away event) and
+        #    near-term alone (low-POS Phase 1) each have modest expected return;
+        #    their product identifies the genuine setup.
+        #
+        # 2. phase × competition  — a Phase 3 drug in a crowded indication is
+        #    worth far less than a Phase 3 drug with clear competitive moat.
+        #    The linear model gives credit to both independently; the product
+        #    captures the moat premium.
+        #
+        # 3. value_gap × catalyst  — a deep TAM/cap discount with a near-term
+        #    clinical event is the classic "catalyst to unlock value" trade.
+        #    Neither feature alone guarantees alpha; the combination does.
+        #
+        # 4. cash_stress × horizon  — financing pressure + short runway + near-
+        #    term event = a company that needs this catalyst to survive.
+        #    This triple-threat flag identifies high-risk binary outcomes that
+        #    should be sized very small regardless of headline expected_return.
+        horizon_days = float(top_catalyst.horizon_days if top_catalyst else 180.0)
+        phase_score = self._phase_score(program.phase)
+        competition = float(profile["competition_intensity"])
+        clinical_focus = 1.0 if is_clinical_event_type(top_event_type) else 0.0
+        tam_to_cap_raw = math.log10(max(tam / market_cap, 1e-6))
+        runway_score = _clamp(runway_months / 24.0, 0.0, 2.0)
+        financing_pressure = 1.0 if snapshot.financing_events else 0.0
+        near_term = 1.0 if horizon_days <= 90.0 else 0.0
+
+        features["interaction_quality_x_timing"] = (
+            program.pos_prior * max(1.0 - horizon_days / 365.0, 0.0)
+        )
+        features["interaction_phase_x_moat"] = phase_score * (1.0 - competition)
+        features["interaction_value_gap_x_catalyst"] = (
+            _clamp(tam_to_cap_raw, 0.0, 3.0) * clinical_focus
+        )
+        features["interaction_cash_stress_x_horizon"] = (
+            financing_pressure * max(1.0 - runway_score / 2.0, 0.0) * near_term
+        )
+
+        # ── Options IV implied move (best-effort) ─────────────────────────────
+        # The options market prices binary catalyst risk directly and in real
+        # time.  An ATM straddle price / spot gives the market-consensus expected
+        # move for the catalyst window.  When our model's expected_return exceeds
+        # the options-implied move, the setup is genuinely underpriced.  When it
+        # is below, we may be paying up for a catalyst the options market already
+        # fully reflects.
+        catalyst_date = top_catalyst.expected_date if top_catalyst else None
+        features["catalyst_timing_iv_implied_move"] = self._fetch_iv_implied_move(
+            snapshot.ticker, catalyst_date
+        )
+
         return FeatureVector(
             entity_id=program.program_id,
             ticker=snapshot.ticker,
@@ -246,6 +301,87 @@ class FeatureEngineer:
         if event_type in EVENT_TYPE_FEATURES:
             payload[f"{prefix}_{event_type}"] = 1.0
         return payload
+
+    @staticmethod
+    def _fetch_iv_implied_move(ticker: str, catalyst_date: str | None) -> float:
+        """
+        Estimate the options market's implied move for the catalyst window.
+
+        Returns straddle_price / spot_price as a fraction (e.g. 0.25 = ±25%
+        expected move).  Falls back to 0.0 on any data failure so it never
+        blocks snapshot building.
+
+        Method: find the listed expiry immediately after catalyst_date (or the
+        nearest front-month if no date is known), fetch the ATM call + put at
+        that expiry, return (call_ask + put_ask) / spot.  Using ask-side gives a
+        conservative (buy-side) implied move estimate — appropriate since we are
+        evaluating whether buying the catalyst is attractively priced.
+        """
+        try:
+            import yfinance as yf
+            from datetime import date, timedelta
+
+            tk = yf.Ticker(ticker)
+            spot_hist = tk.history(period="2d", auto_adjust=True)
+            if spot_hist.empty:
+                return 0.0
+            spot = float(spot_hist["Close"].iloc[-1])
+            if spot <= 0:
+                return 0.0
+
+            expiries = tk.options  # tuple of "YYYY-MM-DD" strings
+            if not expiries:
+                return 0.0
+
+            # Choose the expiry that best brackets the catalyst date
+            today = date.today()
+            if catalyst_date:
+                try:
+                    cat_dt = date.fromisoformat(catalyst_date[:10])
+                except ValueError:
+                    cat_dt = today + timedelta(days=90)
+            else:
+                cat_dt = today + timedelta(days=90)
+
+            # Prefer the first expiry ON OR AFTER the catalyst date; fall back
+            # to the nearest available expiry (front month) if none qualifies.
+            target = None
+            for exp in expiries:
+                try:
+                    exp_dt = date.fromisoformat(exp)
+                except ValueError:
+                    continue
+                if exp_dt >= cat_dt:
+                    target = exp
+                    break
+            if target is None:
+                target = expiries[-1]  # use furthest available
+
+            chain = tk.option_chain(target)
+            calls = chain.calls
+            puts = chain.puts
+            if calls.empty or puts.empty:
+                return 0.0
+
+            # Find ATM strike (closest to spot)
+            strikes = calls["strike"].values
+            atm_idx = int(abs(strikes - spot).argmin())
+            atm_strike = float(strikes[atm_idx])
+
+            call_row = calls[calls["strike"] == atm_strike]
+            put_row = puts[puts["strike"] == atm_strike]
+            if call_row.empty or put_row.empty:
+                return 0.0
+
+            call_ask = float(call_row["ask"].iloc[0])
+            put_ask = float(put_row["ask"].iloc[0])
+            if call_ask <= 0 or put_ask <= 0:
+                return 0.0
+
+            implied_move = (call_ask + put_ask) / spot
+            return float(_clamp(implied_move, 0.0, 2.0))
+        except Exception:
+            return 0.0
 
     @staticmethod
     def _primary_company_event(snapshot: CompanySnapshot):
