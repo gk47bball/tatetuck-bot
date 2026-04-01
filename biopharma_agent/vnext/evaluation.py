@@ -72,6 +72,7 @@ class WalkForwardEvaluator:
         self.portfolio = PortfolioConstructor(store=self.store, use_validation_priors=False)
         self.features = FeatureEngineer()
         self._snapshot_cache: dict[tuple[str, str], object] = {}
+        self._from_failure_universe_rate: float = 0.0
 
     def build_training_frame(self, refresh_labels: bool = False) -> pd.DataFrame:
         snapshots = self.store.read_table("company_snapshots")
@@ -114,6 +115,21 @@ class WalkForwardEvaluator:
                 else:
                     aggregate = aggregate.iloc[0:0].copy()
                 frame = pd.concat([non_aggregate, aggregate], ignore_index=True)
+
+        # Augment with failure universe to correct survivorship bias
+        try:
+            from .failure_universe import load_failure_frame
+            failure_frame = load_failure_frame()
+            if not failure_frame.empty:
+                frame = pd.concat([frame, failure_frame], ignore_index=True, sort=False)
+                frame = frame.fillna(0.0)  # fill missing feature columns with 0
+        except ImportError:
+            pass
+
+        self._from_failure_universe_rate = float(
+            frame["meta_from_failure_universe"].fillna(False).mean()
+        ) if "meta_from_failure_universe" in frame.columns else 0.0
+
         return frame
 
     def _feature_frame_from_archived_snapshots(self) -> pd.DataFrame:

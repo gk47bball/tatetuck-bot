@@ -59,6 +59,7 @@ def main():
 
         evaluator = WalkForwardEvaluator(store=platform.store, settings=settings)
         summary = evaluator.evaluate()
+        from_failure_universe_rate = evaluator._from_failure_universe_rate
         store.write_raw_payload(
             "validation_audits",
             "latest_walkforward_audit",
@@ -109,6 +110,7 @@ def main():
                 "state_setup_scorecards": summary.state_setup_scorecards,
                 "factor_attribution": summary.factor_attribution,
                 "momentum_ablation": summary.momentum_ablation,
+                "from_failure_universe_rate": from_failure_universe_rate,
             },
             config={
                 "store_dir": settings.store_dir,
