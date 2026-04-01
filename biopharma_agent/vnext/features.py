@@ -168,6 +168,24 @@ class FeatureEngineer:
             snapshot.ticker, catalyst_date
         )
 
+        # ── Black-Scholes straddle proxy for historical snapshots ─────────────
+        # Live options chains are unavailable for past dates, so
+        # catalyst_timing_iv_implied_move is 0.0 for all training rows.  An ATM
+        # straddle's fair value under log-normal assumptions equals:
+        #   straddle ≈ 2 × S × N(σ√T / 2) ≈ S × σ√T × 0.798
+        # where 0.798 ≈ 2/√(2π) (Brenner-Subrahmanyam 1988 approximation).
+        # Dividing by S gives the implied-move fraction: σ√T × 0.798.
+        # This is NOT the options-market signal (which reflects future realised
+        # vol + risk premium); it is a model-based lower bound that gives the
+        # ridge regression a meaningful non-zero training signal to learn from.
+        if features["catalyst_timing_iv_implied_move"] == 0.0:
+            horizon_days = top_catalyst.horizon_days if top_catalyst else 0
+            vol = float(snapshot.volatility or 0.0)
+            if vol > 0.0 and horizon_days > 0:
+                T = horizon_days / 252.0
+                bs_implied_move = vol * math.sqrt(T) * 0.798
+                features["catalyst_timing_iv_implied_move"] = _clamp(bs_implied_move, 0.0, 2.0)
+
         return FeatureVector(
             entity_id=program.program_id,
             ticker=snapshot.ticker,
