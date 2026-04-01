@@ -395,6 +395,17 @@ class EventDrivenEnsemble:
             - 0.08 * pre_commercial * competition_intensity * (1.0 - hard_catalyst_presence)
             - 0.03 * competition_intensity
         )
+
+        # IV implied-move discount: if the options market is pricing a larger move
+        # than our model's expected_return, the catalyst setup is already reflected
+        # in option premiums.  The edge exists only when our expected_return EXCEEDS
+        # the market-consensus binary move.  Discount by 25% of the overshoot.
+        # When iv_implied_move == 0 (no options data), this term has no effect.
+        iv_implied_move = _feature_value(features, "catalyst_timing_iv_implied_move", 0.0)
+        if iv_implied_move > 0.0:
+            iv_overshoot = max(iv_implied_move - abs(expected_return), 0.0)
+            expected_return -= 0.25 * iv_overshoot
+
         success_prob = _sigmoid(
             (1.4 * _feature_value(features, "program_quality_pos_prior", 0.15))
             + (0.7 * _feature_value(features, "program_quality_phase_score", 0.20))
