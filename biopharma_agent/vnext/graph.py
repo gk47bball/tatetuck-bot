@@ -338,6 +338,7 @@ def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -
             interventions=interventions,
             enrollment=int(trial.get("enrollment") or 0),
             primary_outcomes=list(trial.get("primary_outcomes", [])),
+            locations=list(trial.get("locations", [])),
         )
         if _is_low_signal_trial(trial_entity):
             continue

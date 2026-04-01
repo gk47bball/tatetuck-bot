@@ -34,6 +34,7 @@ class Trial:
     interventions: list[str]
     enrollment: int
     primary_outcomes: list[str] = field(default_factory=list)
+    locations: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

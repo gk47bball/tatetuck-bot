@@ -142,6 +142,20 @@ class FeatureEngineer:
             financing_pressure * max(1.0 - runway_score / 2.0, 0.0) * near_term
         )
 
+        # KOL proxy features — academic site quality as a public substitute for
+        # proprietary key opinion leader relationships
+        from .kol_proxy import program_site_quality
+        site_quality = program_site_quality(program.trials)
+        features["program_quality_amc_site_score"] = site_quality["amc_site_score"]
+        features["program_quality_site_diversity"] = site_quality["site_count_score"]
+        features["program_quality_international_reach"] = site_quality["international_score"]
+        # Composite KOL proxy: AMC presence × site diversity
+        features["program_quality_kol_proxy"] = (
+            site_quality["amc_site_score"] * 0.60
+            + site_quality["site_count_score"] * 0.25
+            + site_quality["international_score"] * 0.15
+        )
+
         # ── Options IV implied move (best-effort) ─────────────────────────────
         # The options market prices binary catalyst risk directly and in real
         # time.  An ATM straddle price / spot gives the market-consensus expected
