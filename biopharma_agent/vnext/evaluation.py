@@ -123,6 +123,11 @@ class WalkForwardEvaluator:
             if not failure_frame.empty:
                 frame = pd.concat([frame, failure_frame], ignore_index=True, sort=False)
                 frame = frame.fillna(0.0)  # fill missing feature columns with 0
+                # Normalize date columns to Timestamp so mixed str/Timestamp doesn't
+                # break downstream sort comparisons
+                for _dc in ("as_of", "evaluation_date"):
+                    if _dc in frame.columns:
+                        frame[_dc] = pd.to_datetime(frame[_dc], utc=False, errors="coerce")
         except ImportError:
             pass
 
@@ -190,6 +195,7 @@ class WalkForwardEvaluator:
                 event_type_scorecards={},
             )
 
+        frame["evaluation_date"] = pd.to_datetime(frame["evaluation_date"], utc=False, errors="coerce")
         frame = frame.sort_values(["evaluation_date", "as_of"])
         unique_dates = self._rebalance_dates(sorted(frame["evaluation_date"].drop_duplicates().tolist()))
         if len(unique_dates) < 3:
