@@ -12,6 +12,12 @@ import time
 from dataclasses import replace
 
 from biopharma_agent.vnext import TatetuckPlatform, VNextSettings, build_readiness_report
+from biopharma_agent.vnext.autonomy import (
+    record_portfolio_nav,
+    record_trade_decision_run,
+    reconcile_broker_state,
+    write_autonomy_health_snapshot,
+)
 from biopharma_agent.vnext.execution import (
     AlpacaPaperBroker,
     DiscordTradeNotifier,
@@ -79,6 +85,7 @@ def main() -> None:
     submissions = []
     plan = None
     notification = None
+    reconciliation = None
     try:
         if broker.is_configured():
             account = broker.account()
@@ -93,6 +100,7 @@ def main() -> None:
                     "Alpaca credentials are not configured. Using a simulated paper account and assuming no live positions."
                 ],
             )
+        record_portfolio_nav(store=store, account=account, captured_at=started_at)
 
         plan = planner.build_plan(
             analyses=analyses,
@@ -122,6 +130,40 @@ def main() -> None:
                 )
             except Exception as exc:
                 plan.warnings.append(f"Discord trade alert failed: {type(exc).__name__}: {exc}")
+        if broker.is_configured():
+            try:
+                reconciliation = reconcile_broker_state(
+                    store=store,
+                    broker=broker,
+                    plan=plan,
+                    submissions=submissions,
+                )
+                if submit and reconciliation.missing_symbols:
+                    plan.warnings.append(
+                        f"Broker is still missing {len(reconciliation.missing_symbols)} planned symbols after reconciliation."
+                    )
+                if reconciliation.unexpected_symbols:
+                    plan.warnings.append(
+                        f"Broker is carrying {len(reconciliation.unexpected_symbols)} unexpected symbols outside the current plan."
+                    )
+                if submit and reconciliation.rejected_order_count:
+                    plan.warnings.append(
+                        f"{reconciliation.rejected_order_count} broker orders were rejected or cancelled."
+                    )
+            except Exception as exc:
+                plan.warnings.append(f"Broker reconciliation failed: {type(exc).__name__}: {exc}")
+        record_trade_decision_run(
+            store=store,
+            plan=plan,
+            analyses=analyses,
+            readiness=readiness,
+            settings=settings,
+            account=account,
+            submit_requested=bool(args.submit),
+            submit_attempted=submit,
+            submissions=submissions,
+            reconciliation=reconciliation,
+        )
         record_trade_run(
             store=store,
             settings=settings,
@@ -133,6 +175,7 @@ def main() -> None:
             notes="paper trade run completed",
         )
         feedback_summary = materialize_execution_feedback(store=store)
+        write_autonomy_health_snapshot(store=store, settings=settings, readiness=readiness)
     except Exception as exc:
         if plan is None:
             from biopharma_agent.vnext.execution import ExecutionPlan
@@ -149,6 +192,22 @@ def main() -> None:
                 warnings=[],
                 readiness_status=readiness.status,
             )
+        if account is not None:
+            record_portfolio_nav(store=store, account=account)
+        if account is not None and plan is not None:
+            record_trade_decision_run(
+                store=store,
+                plan=plan,
+                analyses=analyses,
+                readiness=readiness,
+                settings=settings,
+                account=account,
+                submit_requested=bool(args.submit),
+                submit_attempted=bool(args.submit),
+                submissions=submissions,
+                reconciliation=reconciliation,
+                error=f"{type(exc).__name__}: {exc}",
+            )
         record_trade_run(
             store=store,
             settings=settings,
@@ -159,6 +218,7 @@ def main() -> None:
             status="failed",
             notes=f"{type(exc).__name__}: {exc}",
         )
+        write_autonomy_health_snapshot(store=store, settings=settings, readiness=readiness)
         raise
 
     print("=" * 72)

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tatetuck-vnext"
+version = "0.1.0"
+description = "Local-first event-driven biopharma research and paper-trading platform"
+requires-python = ">=3.12"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.mypy]
+python_version = "3.12"
+files = [
+  "biopharma_agent/vnext",
+  "discord_bot.py",
+  "evaluate_vnext.py",
+  "operate_vnext.py",
+  "readiness_vnext.py",
+  "research_audit_vnext.py",
+  "trade_vnext.py",
+]
+ignore_missing_imports = true
+follow_imports = "silent"
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = false
+no_implicit_optional = false

@@ -322,6 +322,54 @@ def _exact_sec_events_for_snapshot(snapshot: CompanySnapshot, sec_payload: dict[
     return exact_events
 
 
+def exact_sec_event_tape_rows(
+    ticker: str,
+    sec_payload: dict[str, Any],
+    *,
+    as_of: datetime,
+    lookback_days: int = EXACT_EVENT_LOOKBACK_DAYS,
+) -> list[dict[str, Any]]:
+    parsed = sec_payload.get("parsed", {}) if isinstance(sec_payload, dict) else {}
+    as_of_ts = pd.Timestamp(as_of)
+    if as_of_ts.tzinfo is not None:
+        as_of_ts = as_of_ts.tz_convert(None)
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for filing in parsed.get("recent_filings", []):
+        classified = _classify_sec_filing_event(ticker, filing)
+        if classified is None:
+            continue
+        filing_ts = classified["timestamp"]
+        days_old = (as_of_ts.normalize() - filing_ts.normalize()).days
+        if days_old < 0 or days_old > lookback_days:
+            continue
+        key = (
+            str(classified["event_id"]),
+            str(classified["expected_date"]),
+            str(classified["status"]),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "ticker": str(ticker).upper(),
+                "as_of": as_of.isoformat(),
+                "event_id": str(classified["event_id"]),
+                "event_type": str(classified["event_type"]),
+                "title": str(classified["title"]),
+                "event_timestamp": str(classified["expected_date"]),
+                "status": str(classified["status"]),
+                "timing_exact": True,
+                "timing_synthetic": False,
+                "source": str(classified.get("source") or "sec"),
+                "url": classified.get("url"),
+                "form": classified.get("form"),
+            }
+        )
+    return rows
+
+
 class SECXBRLClient:
     """Placeholder for future SEC/XBRL enrichment.
 

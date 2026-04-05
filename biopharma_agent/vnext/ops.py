@@ -9,6 +9,7 @@ import pandas as pd
 from .evaluation import WalkForwardEvaluator, WalkForwardSummary
 from .settings import VNextSettings
 from .storage import LocalResearchStore
+from .validation import load_best_validation_payload
 
 
 def utc_now_iso() -> str:
@@ -90,6 +91,7 @@ def build_readiness_report(
     store: LocalResearchStore | None = None,
     settings: VNextSettings | None = None,
     refresh_labels: bool = False,
+    prefer_cached_validation: bool = False,
 ) -> ReadinessReport:
     settings = settings or VNextSettings.from_env()
     store = store or LocalResearchStore(settings.store_dir)
@@ -97,20 +99,22 @@ def build_readiness_report(
     labels = store.read_table("labels")
     event_labels = store.read_table("event_labels")
     pipeline_runs = store.read_table("pipeline_runs")
-    evaluator = WalkForwardEvaluator(store=store, settings=settings)
-    evaluation = evaluator.evaluate() if (not snapshots.empty and not labels.empty) or refresh_labels else WalkForwardSummary(
-        num_rows=0,
-        num_windows=0,
-        rank_ic=0.0,
-        hit_rate=0.0,
-        top_bottom_spread=0.0,
-        turnover=0.0,
-        max_drawdown=0.0,
-        beta_adjusted_return=0.0,
-        calibrated_brier=1.0,
-        leakage_passed=False,
-        message="Need snapshots and labels before evaluation can run.",
-    )
+    evaluation = _cached_evaluation_summary(store) if prefer_cached_validation else None
+    if evaluation is None:
+        evaluator = WalkForwardEvaluator(store=store, settings=settings)
+        evaluation = evaluator.evaluate() if (not snapshots.empty and not labels.empty) or refresh_labels else WalkForwardSummary(
+            num_rows=0,
+            num_windows=0,
+            rank_ic=0.0,
+            hit_rate=0.0,
+            top_bottom_spread=0.0,
+            turnover=0.0,
+            max_drawdown=0.0,
+            beta_adjusted_return=0.0,
+            calibrated_brier=1.0,
+            leakage_passed=False,
+            message="Need snapshots and labels before evaluation can run.",
+        )
 
     snapshot_rows = len(snapshots)
     distinct_snapshot_dates = 0
@@ -210,3 +214,58 @@ def _run_counts(pipeline_runs: pd.DataFrame, job_name: str) -> tuple[int, int]:
         return 0, 0
     successes = int((subset["status"] == "success").sum()) if "status" in subset.columns else 0
     return len(subset), successes
+
+
+def _cached_evaluation_summary(store: LocalResearchStore) -> WalkForwardSummary | None:
+    payload = load_best_validation_payload(store)
+    if not isinstance(payload, dict) or not payload:
+        return None
+    rows = int(payload.get("rows") or payload.get("num_rows") or 0)
+    windows = int(payload.get("windows") or payload.get("num_windows") or 0)
+    leakage_passed = bool(payload.get("leakage_passed", False))
+    institutional_blockers = payload.get("institutional_blockers") or []
+    if not isinstance(institutional_blockers, list):
+        institutional_blockers = []
+    latest_trades = payload.get("latest_window_top_trades") or []
+    if not isinstance(latest_trades, list):
+        latest_trades = []
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+    return WalkForwardSummary(
+        num_rows=rows,
+        num_windows=windows,
+        rank_ic=_safe_float(payload.get("rank_ic")),
+        hit_rate=_safe_float(payload.get("hit_rate")),
+        top_bottom_spread=_safe_float(
+            payload.get("cost_adjusted_top_bottom_spread", payload.get("top_bottom_spread"))
+        ),
+        turnover=_safe_float(payload.get("turnover")),
+        max_drawdown=_safe_float(payload.get("max_drawdown")),
+        beta_adjusted_return=_safe_float(payload.get("beta_adjusted_return")),
+        calibrated_brier=_safe_float(payload.get("calibrated_brier"), 1.0),
+        leakage_passed=leakage_passed,
+        message=str(payload.get("message") or "Loaded cached validation summary."),
+        strict_rank_ic=_safe_float(payload.get("strict_rank_ic")),
+        strict_hit_rate=_safe_float(payload.get("strict_hit_rate")),
+        strict_top_bottom_spread=_safe_float(payload.get("strict_top_bottom_spread")),
+        alpha_rank_ic=_safe_float(payload.get("alpha_rank_ic")),
+        pm_context_coverage=_safe_float(payload.get("pm_context_coverage")),
+        exact_primary_event_rate=_safe_float(payload.get("exact_primary_event_rate")),
+        synthetic_primary_event_rate=_safe_float(payload.get("synthetic_primary_event_rate")),
+        stale_catalyst_rate=_safe_float(payload.get("stale_catalyst_rate")),
+        institutional_blockers=[str(item) for item in institutional_blockers if str(item).strip()],
+        latest_window_top_trades=latest_trades,
+        event_type_scorecards=payload.get("event_type_scorecards") or {},
+        company_state_scorecards=payload.get("company_state_scorecards") or {},
+        setup_type_scorecards=payload.get("setup_type_scorecards") or {},
+        state_setup_scorecards=payload.get("state_setup_scorecards") or {},
+        factor_attribution=payload.get("factor_attribution") or {},
+        momentum_ablation=payload.get("momentum_ablation") or {},
+        rank_ic_ci_low=_safe_float(payload.get("rank_ic_ci_low")),
+        rank_ic_ci_high=_safe_float(payload.get("rank_ic_ci_high")),
+        top_bottom_spread_ci_low=_safe_float(payload.get("top_bottom_spread_ci_low")),
+        top_bottom_spread_ci_high=_safe_float(payload.get("top_bottom_spread_ci_high")),
+    )

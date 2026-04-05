@@ -97,6 +97,13 @@ class VNextSettings:
     allow_blocked_paper_trading: bool = False
     simulated_paper_equity: float = 100000.0
     execution_adv_pct_cap: float = 0.05  # max 5% of 20-day dollar ADV per order
+    monitor_loop_interval_seconds: int = 300
+    monitor_event_trigger_lookback_hours: int = 24
+    monitor_event_trigger_forward_hours: int = 12
+    monitor_snapshot_stale_hours: int = 18
+    monitor_recent_decision_lookback_hours: int = 72
+    monitor_max_symbols_per_cycle: int = 8
+    monitor_event_watchlist_limit: int = 24
 
     @classmethod
     def from_env(cls) -> "VNextSettings":
@@ -207,6 +214,13 @@ class VNextSettings:
             allow_blocked_paper_trading=_env_flag("TATETUCK_ALLOW_BLOCKED_PAPER_TRADING", False),
             simulated_paper_equity=float(os.environ.get("TATETUCK_SIMULATED_PAPER_EQUITY", "100000.0")),
             execution_adv_pct_cap=float(os.environ.get("TATETUCK_EXECUTION_ADV_PCT_CAP", "0.05")),
+            monitor_loop_interval_seconds=_env_int("TATETUCK_MONITOR_LOOP_INTERVAL_SECONDS", 300),
+            monitor_event_trigger_lookback_hours=_env_int("TATETUCK_MONITOR_EVENT_TRIGGER_LOOKBACK_HOURS", 24),
+            monitor_event_trigger_forward_hours=_env_int("TATETUCK_MONITOR_EVENT_TRIGGER_FORWARD_HOURS", 12),
+            monitor_snapshot_stale_hours=_env_int("TATETUCK_MONITOR_SNAPSHOT_STALE_HOURS", 18),
+            monitor_recent_decision_lookback_hours=_env_int("TATETUCK_MONITOR_RECENT_DECISION_LOOKBACK_HOURS", 72),
+            monitor_max_symbols_per_cycle=_env_int("TATETUCK_MONITOR_MAX_SYMBOLS_PER_CYCLE", 8),
+            monitor_event_watchlist_limit=_env_int("TATETUCK_MONITOR_EVENT_WATCHLIST_LIMIT", 24),
         )
 
     def public_metadata(self) -> dict[str, object]:

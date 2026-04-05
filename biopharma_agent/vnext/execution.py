@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import math
 import os
-from typing import Iterable
+from typing import Any, Iterable
 from uuid import uuid4
 
 import pandas as pd
@@ -105,6 +105,21 @@ class ExecutionProfile:
 
 
 @dataclass(slots=True)
+class ExposureGovernor:
+    multiplier: float
+    gross_cap_pct: float
+    regime_label: str
+    benchmark_return_60d: float | None = None
+    median_momentum_3mo: float | None = None
+    median_volatility: float | None = None
+    validation_decision: str | None = None
+    reasons: list[str] = field(default_factory=list)
+
+    def to_payload(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class ExecutionPlan:
     generated_at: str
     account_id: str | None
@@ -116,6 +131,9 @@ class ExecutionPlan:
     blockers: list[str]
     warnings: list[str]
     readiness_status: str
+    gross_cap_pct: float = 0.0
+    gross_cap_multiplier: float = 1.0
+    exposure_governor: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -271,7 +289,26 @@ class AlpacaPaperBroker:
             raw_status=data.get("status"),
         )
 
-    def _request(self, method: str, path: str, json: dict | None = None):
+    def recent_orders(self, limit: int = 200) -> list[dict[str, Any]]:
+        data = self._request(
+            "GET",
+            "/v2/orders",
+            params={
+                "status": "all",
+                "limit": max(1, min(int(limit), 500)),
+                "direction": "desc",
+                "nested": "false",
+            },
+        )
+        return data if isinstance(data, list) else []
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        json: dict | None = None,
+        params: dict[str, object] | None = None,
+    ):
         if not self.is_configured():
             raise RuntimeError("Alpaca paper trading is not configured. Set APCA_API_KEY_ID and APCA_API_SECRET_KEY.")
         self.ensure_paper_only()
@@ -283,6 +320,7 @@ class AlpacaPaperBroker:
                 "APCA-API-SECRET-KEY": self.settings.alpaca_api_secret_key or "",
             },
             json=json,
+            params=params,
             timeout=20,
         )
         response.raise_for_status()
@@ -433,9 +471,15 @@ def _fetch_dollar_adv(ticker: str, lookback_days: int = 20) -> float | None:
 
 
 class PMExecutionPlanner:
-    def __init__(self, settings: VNextSettings, store: LocalResearchStore | None = None):
+    def __init__(
+        self,
+        settings: VNextSettings,
+        store: LocalResearchStore | None = None,
+        market_history_provider: PriceHistoryProvider | None = None,
+    ):
         self.settings = settings
         self.store = store
+        self.market_history_provider = market_history_provider
         self._validation_payload_cache: dict[str, object] | None = None
         self._rolling_validation_cache: dict[str, dict[str, float]] | None = None
 
@@ -460,15 +504,21 @@ class PMExecutionPlanner:
             for analysis in analyses
         }
         blockers: list[str] = []
-        warnings: list[str] = list(readiness.blockers)
+        warnings: list[str] = list(getattr(readiness, "warnings", []))
         validation_age_days = validation_payload_age_days(self._latest_validation_payload())
         if validation_age_days is not None and validation_age_days > int(self.settings.validation_max_age_days):
             warnings.append(
                 f"Validation audit is {validation_age_days} days old. Fresh entries stay blocked until evaluate_vnext is rerun."
             )
+        governor = self._exposure_governor(analyses=analyses)
+        if governor.reasons:
+            warnings.append(
+                f"Exposure governor trimmed max gross to {governor.gross_cap_pct:.1f}% ({governor.multiplier:.2f}x): "
+                + "; ".join(governor.reasons)
+            )
         selected = self._select_recommendations(analyses, positions_by_symbol, profiles)
         deployable_notional = min(
-            account.equity * (self.settings.max_gross_exposure_pct / 100.0),
+            account.equity * (governor.gross_cap_pct / 100.0),
             account.buying_power,
         )
 
@@ -490,7 +540,7 @@ class PMExecutionPlanner:
             for analysis in selected
         }
         total_weight = sum(capped_weights.values())
-        gross_cap = self.settings.max_gross_exposure_pct
+        gross_cap = max(governor.gross_cap_pct, 1e-9)
         scale = 1.0 if total_weight <= gross_cap or total_weight <= 0 else gross_cap / total_weight
 
         correlation_groups = self._catalyst_correlation_groups(selected, window_days=21)
@@ -506,7 +556,7 @@ class PMExecutionPlanner:
             group_size = correlation_groups.get(ticker, 1)
             # Kelly-style discount: scale by 1/sqrt(n_correlated) for n > 1
             correlation_scale = 1.0 / max(math.sqrt(group_size), 1.0)
-            scaled_target_weight = capped_weights[ticker] * scale * correlation_scale
+            scaled_target_weight = capped_weights[ticker] * scale * correlation_scale * governor.multiplier
             target_notional = deployable_notional * (scaled_target_weight / max(gross_cap, 1e-9))
             position = positions_by_symbol.get(ticker)
             current_notional = position.market_value if position else 0.0
@@ -528,6 +578,10 @@ class PMExecutionPlanner:
             rationale.extend(profile.rationale)
             if group_size > 1:
                 rationale.append(f"correlation_discount: {group_size} catalysts in same 21d window, scaled by {correlation_scale:.2f}x")
+            if governor.multiplier < 1.0:
+                rationale.append(
+                    f"regime_governor: {governor.regime_label} tape scaled targets by {governor.multiplier:.2f}x"
+                )
             if position and weight_gap_pct < self.settings.execution_rebalance_band_pct:
                 rationale.append(
                     f"inside_rebalance_band={self.settings.execution_rebalance_band_pct:.2f}%"
@@ -652,6 +706,9 @@ class PMExecutionPlanner:
             blockers=blockers,
             warnings=warnings,
             readiness_status=readiness.status,
+            gross_cap_pct=round(governor.gross_cap_pct, 2),
+            gross_cap_multiplier=round(governor.multiplier, 4),
+            exposure_governor=governor.to_payload(),
         )
 
     def _select_recommendations(
@@ -746,6 +803,115 @@ class PMExecutionPlanner:
                     count += 1
             groups[ticker_a] = count
         return groups
+
+    def _exposure_governor(self, analyses: list[CompanyAnalysis]) -> ExposureGovernor:
+        payload = self._latest_validation_payload()
+        validation_decision = None
+        if isinstance(payload, dict):
+            raw_decision = payload.get("promotion_decision") or payload.get("decision")
+            if isinstance(raw_decision, str) and raw_decision.strip():
+                validation_decision = raw_decision.strip()
+
+        momentum_values = [
+            _to_float(getattr(analysis.snapshot, "momentum_3mo", None), math.nan)
+            for analysis in analyses
+            if getattr(analysis.snapshot, "momentum_3mo", None) is not None
+        ]
+        momentum_values = [value for value in momentum_values if not math.isnan(value)]
+        volatility_values = [
+            _to_float(getattr(analysis.snapshot, "volatility", None), math.nan)
+            for analysis in analyses
+            if getattr(analysis.snapshot, "volatility", None) is not None
+        ]
+        volatility_values = [value for value in volatility_values if not math.isnan(value)]
+
+        median_momentum = float(pd.Series(momentum_values).median()) if momentum_values else None
+        median_volatility = float(pd.Series(volatility_values).median()) if volatility_values else None
+        benchmark_return = self._benchmark_return_60d()
+
+        multiplier = 1.0
+        reasons: list[str] = []
+
+        if validation_decision == "do_not_promote":
+            multiplier *= 0.65
+            reasons.append("validation gate is still do_not_promote")
+
+        if benchmark_return is not None:
+            if benchmark_return <= -0.15:
+                multiplier *= 0.55
+                reasons.append(f"XBI 60d return is {benchmark_return:+.1%}")
+            elif benchmark_return <= -0.08:
+                multiplier *= 0.75
+                reasons.append(f"XBI 60d return is {benchmark_return:+.1%}")
+
+        if median_momentum is not None:
+            if median_momentum <= -0.12:
+                multiplier *= 0.70
+                reasons.append(f"median universe momentum is {median_momentum:+.1%}")
+            elif median_momentum <= -0.05:
+                multiplier *= 0.85
+                reasons.append(f"median universe momentum is {median_momentum:+.1%}")
+
+        if median_volatility is not None:
+            if median_volatility >= 0.60:
+                multiplier *= 0.75
+                reasons.append(f"median realized volatility is {median_volatility:.2f}")
+            elif median_volatility >= 0.45:
+                multiplier *= 0.90
+                reasons.append(f"median realized volatility is {median_volatility:.2f}")
+
+        multiplier = min(max(multiplier, 0.25), 1.0)
+        gross_cap_pct = min(
+            float(self.settings.max_gross_exposure_pct),
+            max(float(self.settings.max_single_position_pct), float(self.settings.max_gross_exposure_pct) * multiplier),
+        )
+        if multiplier <= 0.60:
+            regime_label = "risk_off"
+        elif multiplier < 1.0:
+            regime_label = "caution"
+        else:
+            regime_label = "normal"
+        return ExposureGovernor(
+            multiplier=float(multiplier),
+            gross_cap_pct=float(gross_cap_pct),
+            regime_label=regime_label,
+            benchmark_return_60d=benchmark_return,
+            median_momentum_3mo=median_momentum,
+            median_volatility=median_volatility,
+            validation_decision=validation_decision,
+            reasons=reasons,
+        )
+
+    def _benchmark_return_60d(self) -> float | None:
+        provider = self.market_history_provider
+        if provider is None and self.store is not None:
+            eodhd_key = os.environ.get("EODHD_API_KEY") or self.settings.eodhd_api_key
+            provider = CompositeHistoryProvider(
+                [
+                    EODHDHistoryProvider(store=self.store, api_key=eodhd_key),
+                    YFinanceHistoryProvider(store=self.store, allow_live=not bool(eodhd_key)),
+                ]
+            )
+        if provider is None:
+            return None
+
+        end_ts = pd.Timestamp.now(tz="UTC").tz_convert(None)
+        start_ts = end_ts - pd.Timedelta(days=120)
+        history = provider.load_history("XBI", start=start_ts.date().isoformat(), end=end_ts.date().isoformat())
+        if history.empty or "close" not in history.columns:
+            return None
+        close = history["close"].astype(float).dropna().copy()
+        if close.empty:
+            return None
+        close.index = pd.to_datetime(close.index, errors="coerce")
+        close = close[~close.index.isna()]
+        if close.empty:
+            return None
+        latest_price = _price_at_or_before(close, close.index.max())
+        anchor_price = _price_at_or_before(close, close.index.max() - pd.Timedelta(days=60))
+        if latest_price is None or anchor_price is None or anchor_price <= 0:
+            return None
+        return float((latest_price / anchor_price) - 1.0)
 
     def _latest_validation_payload(self) -> dict[str, object]:
         if self._validation_payload_cache is not None:

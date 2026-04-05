@@ -4,6 +4,11 @@ from unittest.mock import Mock
 
 import pandas as pd
 
+from biopharma_agent.vnext.autonomy import (
+    record_trade_decision_run,
+    reconcile_broker_state,
+    write_autonomy_health_snapshot,
+)
 from biopharma_agent.vnext.entities import CompanyAnalysis, CompanySnapshot, PortfolioRecommendation, SignalArtifact
 from biopharma_agent.vnext.execution import (
     AlpacaPaperBroker,
@@ -15,6 +20,7 @@ from biopharma_agent.vnext.execution import (
     execute_plan,
     materialize_execution_feedback,
 )
+from biopharma_agent.vnext.ops import ReadinessReport
 from biopharma_agent.vnext.settings import VNextSettings
 from biopharma_agent.vnext.storage import LocalResearchStore
 
@@ -114,9 +120,10 @@ class DummyPosition:
 
 
 class DummyReadiness:
-    def __init__(self, blockers=None, status="needs_attention"):
+    def __init__(self, blockers=None, status="needs_attention", warnings=None):
         self.blockers = blockers or []
         self.status = status
+        self.warnings = warnings or []
 
 
 class StubHistoryProvider:
@@ -129,6 +136,35 @@ class PlannedAtPrecedenceHistoryProvider:
     def load_history(self, ticker: str, start: str, end: str) -> pd.DataFrame:
         dates = pd.to_datetime(["2024-01-01", "2025-01-01", "2025-01-11", "2025-01-31", "2025-04-01"])
         return pd.DataFrame({"close": [80.0, 100.0, 105.0, 115.0, 125.0]}, index=dates)
+
+
+class RiskOffBenchmarkProvider:
+    def load_history(self, ticker: str, start: str, end: str) -> pd.DataFrame:
+        dates = pd.to_datetime(["2026-01-01", "2026-02-15", "2026-04-01"])
+        return pd.DataFrame({"close": [100.0, 88.0, 80.0]}, index=dates)
+
+
+class FakeReconcileBroker:
+    def account(self) -> DummyAccount:
+        return DummyAccount()
+
+    def positions(self) -> list[DummyPosition]:
+        return [DummyPosition("CRSP", qty=50.0, market_value=1500.0, current_price=30.0)]
+
+    def recent_orders(self, limit: int = 200) -> list[dict[str, object]]:
+        return [
+            {
+                "id": "order-1",
+                "client_order_id": "coid-1",
+                "symbol": "CRSP",
+                "status": "filled",
+                "filled_qty": "50",
+                "filled_avg_price": "30",
+                "submitted_at": "2025-01-01T10:00:00+00:00",
+                "updated_at": "2025-01-01T10:01:00+00:00",
+                "filled_at": "2025-01-01T10:01:00+00:00",
+            }
+        ]
 
 
 class TestVNextExecution(unittest.TestCase):
@@ -445,6 +481,31 @@ class TestVNextExecution(unittest.TestCase):
             self.assertIn("No recommendations cleared the PM execution thresholds.", plan.blockers)
             self.assertTrue(any("Validation audit is" in warning for warning in plan.warnings))
 
+    def test_exposure_governor_scales_book_in_risk_off_biotech_tape(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.write_raw_payload(
+                "validation_audits",
+                "latest_walkforward_audit",
+                {"generated_at": "2026-04-05T00:00:00+00:00", "promotion_decision": "paper_trade_ready"},
+            )
+            planner = PMExecutionPlanner(
+                self.make_settings(),
+                store=store,
+                market_history_provider=RiskOffBenchmarkProvider(),
+            )
+            analysis = make_analysis("CRSP", "pre-catalyst long", 4.0, 0.82)
+            analysis.snapshot.momentum_3mo = -0.18
+            analysis.snapshot.volatility = 0.65
+
+            plan = planner.build_plan([analysis], DummyAccount(), [], DummyReadiness(blockers=[]))
+
+            instruction = next(item for item in plan.instructions if item.symbol == "CRSP")
+            self.assertLess(plan.gross_cap_multiplier, 1.0)
+            self.assertLess(instruction.scaled_target_weight, instruction.target_weight)
+            self.assertTrue(any("Exposure governor trimmed max gross" in warning for warning in plan.warnings))
+            self.assertTrue(any("regime_governor" in item for item in instruction.rationale))
+
     def test_execution_feedback_materializes_profile_scorecards(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = LocalResearchStore(base_dir=tmpdir)
@@ -658,6 +719,192 @@ class TestVNextExecution(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.channel_id, "general-channel")
         self.assertTrue(result.fallback_used)
+
+    def test_reconcile_broker_state_persists_summary_and_nav(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            plan = ExecutionPlan(
+                generated_at="2025-01-01T00:00:00+00:00",
+                account_id="PA3ZUXE6OCWI",
+                equity=100000.0,
+                buying_power=100000.0,
+                deployable_notional=18000.0,
+                selected_symbols=["CRSP"],
+                instructions=[
+                    ExecutionInstruction(
+                        symbol="CRSP",
+                        company_name="CRSP Therapeutics",
+                        action="buy",
+                        side="buy",
+                        scenario="pre-catalyst long",
+                        company_state="pre_commercial",
+                        setup_type="hard_catalyst",
+                        execution_profile="hard_catalyst",
+                        confidence=0.72,
+                        target_weight=4.0,
+                        scaled_target_weight=4.0,
+                        target_notional=4000.0,
+                        current_notional=0.0,
+                        delta_notional=1500.0,
+                        internal_upside_pct=0.25,
+                        floor_support_pct=0.14,
+                        notional=1500.0,
+                        rationale=[],
+                    )
+                ],
+                blockers=[],
+                warnings=[],
+                readiness_status="production_ready",
+            )
+            submissions = [
+                OrderSubmission(
+                    symbol="CRSP",
+                    action="buy_notional",
+                    status="submitted",
+                    client_order_id="coid-1",
+                    order_id="order-1",
+                    submitted_notional=1500.0,
+                    submitted_qty=None,
+                    raw_status="accepted",
+                )
+            ]
+
+            summary = reconcile_broker_state(
+                store=store,
+                broker=FakeReconcileBroker(),
+                plan=plan,
+                submissions=submissions,
+            )
+
+            reconciliations = store.read_table("broker_reconciliations")
+            nav = store.read_table("portfolio_nav")
+            order_updates = store.read_table("broker_order_updates")
+
+            self.assertEqual(summary.filled_order_count, 1)
+            self.assertEqual(len(reconciliations), 1)
+            self.assertEqual(len(nav), 1)
+            self.assertEqual(len(order_updates), 1)
+
+    def test_record_trade_decision_run_persists_audit_bundle(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.write_raw_payload(
+                "validation_audits",
+                "latest_walkforward_audit",
+                {"generated_at": "2026-04-05T00:00:00+00:00", "promotion_decision": "paper_trade_ready"},
+            )
+            analysis = make_analysis("CRSP", "pre-catalyst long", 4.0, 0.72)
+            plan = ExecutionPlan(
+                generated_at="2025-01-01T00:00:00+00:00",
+                account_id="PA3ZUXE6OCWI",
+                equity=100000.0,
+                buying_power=100000.0,
+                deployable_notional=18000.0,
+                selected_symbols=["CRSP"],
+                instructions=[
+                    ExecutionInstruction(
+                        symbol="CRSP",
+                        company_name="CRSP Therapeutics",
+                        action="buy",
+                        side="buy",
+                        scenario="pre-catalyst long",
+                        company_state="pre_commercial",
+                        setup_type="hard_catalyst",
+                        execution_profile="hard_catalyst",
+                        confidence=0.72,
+                        target_weight=4.0,
+                        scaled_target_weight=3.0,
+                        target_notional=3000.0,
+                        current_notional=0.0,
+                        delta_notional=3000.0,
+                        as_of="2025-01-01T00:00:00+00:00",
+                        internal_upside_pct=0.25,
+                        floor_support_pct=0.14,
+                        notional=3000.0,
+                        rationale=["alpha thesis"],
+                    )
+                ],
+                blockers=[],
+                warnings=[],
+                readiness_status="production_ready",
+                gross_cap_pct=12.0,
+                gross_cap_multiplier=0.75,
+                exposure_governor={"validation_decision": "paper_trade_ready"},
+            )
+
+            record_trade_decision_run(
+                store=store,
+                plan=plan,
+                analyses=[analysis],
+                readiness=DummyReadiness(blockers=[], status="production_ready"),
+                settings=self.make_settings(),
+                account=DummyAccount(),
+                submit_requested=False,
+                submit_attempted=False,
+                submissions=[],
+                reconciliation=None,
+            )
+
+            decisions = store.read_table("trade_decisions")
+            payload = store.read_latest_raw_payload("trade_decision_runs", "trade_decision_run_")
+
+            self.assertEqual(len(decisions), 1)
+            self.assertEqual(decisions.iloc[0]["validation_decision"], "paper_trade_ready")
+            self.assertIsInstance(payload, dict)
+            self.assertEqual(payload["plan"]["gross_cap_multiplier"], 0.75)
+
+    def test_write_autonomy_health_snapshot_flags_failed_trade_run(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.append_records(
+                "company_snapshots",
+                [{"ticker": "BROKEN", "as_of": "2026-04-05T00:00:00+00:00", "market_cap": 0.0}],
+            )
+            store.write_pipeline_run(
+                {
+                    "job_name": "trade_vnext",
+                    "status": "failed",
+                    "started_at": "2026-04-05T09:00:00+00:00",
+                    "finished_at": "2026-04-05T09:01:00+00:00",
+                    "duration_seconds": 60.0,
+                    "metrics": {},
+                    "config": {},
+                    "notes": "simulated failure",
+                }
+            )
+            readiness = ReadinessReport(
+                status="production_ready",
+                generated_at="2026-04-05T10:00:00+00:00",
+                store_dir=tmpdir,
+                eodhd_configured=True,
+                sec_user_agent_configured=True,
+                snapshot_rows=1,
+                distinct_snapshot_dates=12,
+                latest_snapshot_age_hours=1.0,
+                label_rows=120,
+                event_label_rows=60,
+                matured_return_90d_rows=120,
+                matured_event_rows=20,
+                archive_run_count=5,
+                successful_archive_runs=5,
+                backfill_run_count=2,
+                successful_backfill_runs=2,
+                evaluate_run_count=3,
+                successful_evaluate_runs=3,
+                eodhd_cache_files=10,
+                walkforward_rows=120,
+                walkforward_windows=6,
+                leakage_passed=True,
+                blockers=[],
+                warnings=[],
+                evaluation_message="ok",
+            )
+
+            payload = write_autonomy_health_snapshot(store=store, settings=self.make_settings(), readiness=readiness)
+
+            self.assertEqual(payload["status"], "blocked")
+            self.assertEqual(payload["zero_market_cap_active"], 1)
+            self.assertEqual(payload["latest_trade_run"]["status"], "failed")
 
 
 if __name__ == "__main__":
