@@ -37,11 +37,16 @@ def archive_universe(
     top_ideas = [
         {
             "ticker": analysis.snapshot.ticker,
+            "stance": analysis.portfolio.stance,
             "target_weight": round(float(analysis.portfolio.target_weight), 2),
             "scenario": analysis.portfolio.scenario,
             "thesis_horizon": analysis.portfolio.thesis_horizon,
         }
-        for analysis in sorted(analyses, key=lambda item: item.portfolio.target_weight, reverse=True)[:5]
+        for analysis in sorted(
+            analyses,
+            key=lambda item: (item.portfolio.target_weight, item.portfolio.stance == "short"),
+            reverse=True,
+        )[:5]
     ]
     summary = ArchiveSummary(
         archived_companies=len(analyses),

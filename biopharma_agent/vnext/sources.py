@@ -9,10 +9,16 @@ import requests
 
 from .eodhd import EODHDEventTapeClient
 from .entities import CatalystEvent, CompanySnapshot, EvidenceSnippet, FinancingEvent
-from .graph import build_company_snapshot, fetch_legacy_snapshot, infer_runway_months
+from .graph import (
+    apply_curated_company_overrides,
+    build_company_snapshot,
+    fetch_legacy_snapshot,
+    infer_runway_months,
+    refresh_snapshot_evidence,
+)
 from .market_profile import update_snapshot_profile
 from .storage import LocalResearchStore
-from .taxonomy import event_timing_priority
+from .taxonomy import event_timing_priority, normalized_event_type
 
 
 def _has_finance_data(payload: dict[str, Any]) -> bool:
@@ -98,11 +104,71 @@ def _recover_calendar_payload(primary: dict[str, Any], fallback: dict[str, Any] 
 SEC_EXACT_EVENT_FORMS = {"8-K", "10-Q", "10-K", "20-F", "6-K", "S-3", "424B5", "424B3", "F-3", "S-1"}
 SEC_FINANCING_FORMS = {"S-3", "424B5", "424B3", "F-3", "S-1"}
 SEC_EARNINGS_FORMS = {"10-Q", "10-K", "20-F"}
+SEC_STRATEGIC_KEYWORDS = ("acquisition", "acquire", "merger", "definitive agreement", "combination", "m&a")
+SEC_PORTFOLIO_REPOSITIONING_KEYWORDS = (
+    "withdraw",
+    "withdrawal",
+    "discontinue",
+    "discontinuation",
+    "divest",
+    "divestiture",
+    "strategic review",
+    "out-license",
+    "outlicense",
+    "deprioritize",
+)
+SEC_LABEL_EXPANSION_KEYWORDS = ("label expansion", "supplemental nda", "snda", "expanded indication", "new indication")
+SEC_CAPITAL_ALLOCATION_KEYWORDS = (
+    "share repurchase",
+    "buyback",
+    "repurchase",
+    "capital allocation",
+    "special dividend",
+    "dividend increase",
+    "deleveraging",
+)
 SEC_RESULTS_KEYWORDS = ("financial results", "earnings", "quarterly results", "annual results", "business updates")
 SEC_CLINICAL_KEYWORDS = ("topline", "top-line", "data", "readout", "phase 1", "phase 2", "phase 3", "trial")
 SEC_REGULATORY_KEYWORDS = ("approval", "pdufa", "adcom", "complete response", "bla", "nda")
-SEC_COMMERCIAL_KEYWORDS = ("launch", "uptake", "commercial", "label expansion", "sales")
+SEC_COMMERCIAL_KEYWORDS = ("launch", "uptake", "commercial", "sales")
 EXACT_EVENT_LOOKBACK_DAYS = 7
+EVENT_TAPE_FALLBACK_MAX_AGE_DAYS = 7
+
+SEC_EVENT_IMPORTANCE = {
+    "phase3_readout": 0.84,
+    "phase2_readout": 0.81,
+    "phase1_readout": 0.74,
+    "clinical_readout": 0.78,
+    "pdufa": 0.85,
+    "adcom": 0.83,
+    "regulatory_update": 0.80,
+    "commercial_update": 0.60,
+    "earnings": 0.55,
+}
+
+SEC_EVENT_CROWDEDNESS = {
+    "phase3_readout": 0.34,
+    "phase2_readout": 0.33,
+    "phase1_readout": 0.30,
+    "clinical_readout": 0.35,
+    "pdufa": 0.40,
+    "adcom": 0.36,
+    "regulatory_update": 0.38,
+    "commercial_update": 0.45,
+    "earnings": 0.35,
+}
+
+SEC_EVENT_TITLES = {
+    "phase3_readout": "{ticker} phase 3 filing update",
+    "phase2_readout": "{ticker} phase 2 filing update",
+    "phase1_readout": "{ticker} phase 1 filing update",
+    "clinical_readout": "{ticker} clinical filing update",
+    "pdufa": "{ticker} PDUFA filing update",
+    "adcom": "{ticker} advisory committee filing update",
+    "regulatory_update": "{ticker} regulatory filing update",
+    "commercial_update": "{ticker} commercial filing update",
+    "earnings": "{ticker} filed {form} financial update",
+}
 
 
 def _filing_timestamp(filing: dict[str, Any]) -> pd.Timestamp | None:
@@ -117,6 +183,30 @@ def _filing_timestamp(filing: dict[str, Any]) -> pd.Timestamp | None:
         if not pd.isna(ts):
             return ts.tz_convert(None)
     return None
+
+
+def _payload_timestamp(payload: dict[str, Any] | None) -> pd.Timestamp | None:
+    if not isinstance(payload, dict):
+        return None
+    ts = pd.to_datetime(payload.get("as_of"), errors="coerce", utc=True, format="mixed")
+    if pd.isna(ts):
+        return None
+    return ts.tz_convert(None)
+
+
+def _cached_event_payload_is_fresh(
+    payload: dict[str, Any] | None,
+    as_of: datetime,
+    max_age_days: int = EVENT_TAPE_FALLBACK_MAX_AGE_DAYS,
+) -> bool:
+    payload_ts = _payload_timestamp(payload)
+    if payload_ts is None:
+        return False
+    reference_ts = pd.Timestamp(as_of)
+    if reference_ts.tzinfo is not None:
+        reference_ts = reference_ts.tz_convert(None)
+    age_days = (reference_ts.normalize() - payload_ts.normalize()).days
+    return 0 <= age_days <= max_age_days
 
 
 def _classify_sec_filing_event(ticker: str, filing: dict[str, Any]) -> dict[str, Any] | None:
@@ -136,33 +226,46 @@ def _classify_sec_filing_event(ticker: str, filing: dict[str, Any]) -> dict[str,
         importance = 0.55
         crowdedness = 0.20
         title = f"{ticker} filed {form} financing update"
+    elif any(keyword in filing_text for keyword in SEC_STRATEGIC_KEYWORDS):
+        event_type = "strategic_transaction"
+        importance = 0.82
+        crowdedness = 0.30
+        title = f"{ticker} strategic transaction update"
+    elif any(keyword in filing_text for keyword in SEC_PORTFOLIO_REPOSITIONING_KEYWORDS):
+        event_type = "portfolio_repositioning"
+        importance = 0.76
+        crowdedness = 0.28
+        title = f"{ticker} portfolio repositioning update"
+    elif any(keyword in filing_text for keyword in SEC_LABEL_EXPANSION_KEYWORDS):
+        event_type = "label_expansion"
+        importance = 0.78
+        crowdedness = 0.33
+        title = f"{ticker} lifecycle expansion update"
+    elif any(keyword in filing_text for keyword in SEC_CAPITAL_ALLOCATION_KEYWORDS):
+        event_type = "capital_allocation"
+        importance = 0.68
+        crowdedness = 0.25
+        title = f"{ticker} capital allocation update"
     elif form in SEC_EARNINGS_FORMS or any(keyword in filing_text for keyword in SEC_RESULTS_KEYWORDS):
         event_type = "earnings"
         importance = 0.55
         crowdedness = 0.35
         title = f"{ticker} filed {form} financial update"
-    elif any(keyword in filing_text for keyword in SEC_REGULATORY_KEYWORDS):
-        event_type = "pdufa"
-        importance = 0.85
-        crowdedness = 0.40
-        title = f"{ticker} regulatory filing update"
-    elif any(keyword in filing_text for keyword in SEC_CLINICAL_KEYWORDS):
-        event_type = "clinical_readout"
-        importance = 0.80
-        crowdedness = 0.35
-        title = f"{ticker} clinical filing update"
-    elif any(keyword in filing_text for keyword in SEC_COMMERCIAL_KEYWORDS):
-        event_type = "commercial_update"
-        importance = 0.60
-        crowdedness = 0.45
-        title = f"{ticker} commercial filing update"
     elif form in {"8-K", "6-K"}:
-        event_type = "commercial_update"
-        importance = 0.45
-        crowdedness = 0.35
-        title = f"{ticker} corporate filing update"
+        inferred_event_type = normalized_event_type(None, str(filing.get("primary_doc_description") or ""), filing_text)
+        event_type = str(inferred_event_type or "commercial_update")
+        importance = float(SEC_EVENT_IMPORTANCE.get(event_type, 0.45))
+        crowdedness = float(SEC_EVENT_CROWDEDNESS.get(event_type, 0.35))
+        title_template = SEC_EVENT_TITLES.get(event_type, "{ticker} corporate filing update")
+        title = title_template.format(ticker=ticker, form=form)
     else:
-        return None
+        inferred_event_type = normalized_event_type(None, str(filing.get("primary_doc_description") or ""), filing_text)
+        if inferred_event_type not in SEC_EVENT_IMPORTANCE:
+            return None
+        event_type = str(inferred_event_type)
+        importance = float(SEC_EVENT_IMPORTANCE[event_type])
+        crowdedness = float(SEC_EVENT_CROWDEDNESS[event_type])
+        title = SEC_EVENT_TITLES[event_type].format(ticker=ticker, form=form)
 
     return {
         "event_id": f"{ticker}:sec:{form}:{filing_ts.isoformat()}",
@@ -567,6 +670,8 @@ def enrich_snapshot_with_external_data(
     else:
         snapshot.metadata["recent_offering_signal"] = 0.0
 
+    snapshot = refresh_snapshot_evidence(snapshot)
+    snapshot = apply_curated_company_overrides(snapshot)
     return update_snapshot_profile(snapshot)
 
 
@@ -614,13 +719,18 @@ class IngestionService:
             fallback_sources.append("corp_calendar")
 
         event_payload = self.eodhd_events.fetch_event_payload(ticker, as_of=as_of)
+        stale_event_payload_skipped = False
         if not event_payload.get("events"):
             cached_events = self.store.read_latest_raw_payload("eodhd_event_tape", f"{ticker}_")
-            if isinstance(cached_events, dict):
+            if _cached_event_payload_is_fresh(cached_events, as_of=as_of):
                 event_payload = cached_events
+            elif isinstance(cached_events, dict):
+                stale_event_payload_skipped = True
         snapshot = enrich_snapshot_with_external_data(snapshot, sec_payload, calendar_payload, event_payload=event_payload)
         if fallback_sources:
             snapshot.metadata["fallback_sources"] = sorted(set(fallback_sources))
+        if stale_event_payload_skipped:
+            snapshot.metadata["stale_event_tape_skipped"] = True
 
         if persist:
             raw_key = f"{ticker}_{as_of.isoformat().replace(':', '-')}"

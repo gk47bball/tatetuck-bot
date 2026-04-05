@@ -13,6 +13,7 @@ from biopharma_agent.vnext.evaluation import WalkForwardEvaluator
 from biopharma_agent.vnext.ops import utc_now_iso
 from biopharma_agent.vnext.storage import LocalResearchStore
 from biopharma_agent.vnext.universe import UniverseResolver
+from biopharma_agent.vnext.validation import derive_promotion_record, write_model_promotion
 
 
 def parse_args():
@@ -60,26 +61,94 @@ def main():
         evaluator = WalkForwardEvaluator(store=platform.store, settings=settings)
         summary = evaluator.evaluate()
         from_failure_universe_rate = evaluator._from_failure_universe_rate
-        store.write_raw_payload(
-            "validation_audits",
-            "latest_walkforward_audit",
+        validation_generated_at = utc_now_iso()
+        promotion = derive_promotion_record(
             {
-                "generated_at": utc_now_iso(),
+                "generated_at": validation_generated_at,
+                "source_job": "evaluate_vnext",
                 "rows": summary.num_rows,
                 "windows": summary.num_windows,
                 "rank_ic": summary.rank_ic,
                 "strict_rank_ic": summary.strict_rank_ic,
+                "hit_rate": summary.hit_rate,
+                "cost_adjusted_top_bottom_spread": summary.top_bottom_spread,
                 "pm_context_coverage": summary.pm_context_coverage,
                 "exact_primary_event_rate": summary.exact_primary_event_rate,
                 "synthetic_primary_event_rate": summary.synthetic_primary_event_rate,
                 "institutional_blockers": summary.institutional_blockers,
+                "leakage_passed": summary.leakage_passed,
+                "rank_ic_ci_low": summary.rank_ic_ci_low,
+                "rank_ic_ci_high": summary.rank_ic_ci_high,
+                "top_bottom_spread_ci_low": summary.top_bottom_spread_ci_low,
+                "top_bottom_spread_ci_high": summary.top_bottom_spread_ci_high,
+            },
+            settings=settings,
+        )
+        store.write_raw_payload(
+            "validation_audits",
+            "latest_walkforward_audit",
+            {
+                "generated_at": validation_generated_at,
+                "created_at": validation_generated_at,
+                "evaluated_at": validation_generated_at,
+                "source_job": "evaluate_vnext",
+                "rows": summary.num_rows,
+                "windows": summary.num_windows,
+                "rank_ic": summary.rank_ic,
+                "hit_rate": summary.hit_rate,
+                "top_bottom_spread": summary.top_bottom_spread,
+                "cost_adjusted_top_bottom_spread": summary.top_bottom_spread,
+                "turnover": summary.turnover,
+                "beta_adjusted_return": summary.beta_adjusted_return,
+                "calibrated_brier": summary.calibrated_brier,
+                "leakage_passed": summary.leakage_passed,
+                "message": summary.message,
+                "strict_rank_ic": summary.strict_rank_ic,
+                "strict_hit_rate": summary.strict_hit_rate,
+                "strict_top_bottom_spread": summary.strict_top_bottom_spread,
+                "pm_context_coverage": summary.pm_context_coverage,
+                "exact_primary_event_rate": summary.exact_primary_event_rate,
+                "synthetic_primary_event_rate": summary.synthetic_primary_event_rate,
+                "rank_ic_ci_low": summary.rank_ic_ci_low,
+                "rank_ic_ci_high": summary.rank_ic_ci_high,
+                "top_bottom_spread_ci_low": summary.top_bottom_spread_ci_low,
+                "top_bottom_spread_ci_high": summary.top_bottom_spread_ci_high,
+                "institutional_blockers": summary.institutional_blockers,
+                "event_type_scorecards": summary.event_type_scorecards,
                 "company_state_scorecards": summary.company_state_scorecards,
                 "setup_type_scorecards": summary.setup_type_scorecards,
                 "state_setup_scorecards": summary.state_setup_scorecards,
                 "factor_attribution": summary.factor_attribution,
                 "momentum_ablation": summary.momentum_ablation,
                 "latest_window_top_trades": summary.latest_window_top_trades,
+                "a_grade_gates": promotion.get("a_grade_gates"),
+                "promotion_decision": promotion.get("decision"),
+                "promotion_rationale": promotion.get("rationale"),
+                "promotion_blockers": promotion.get("blockers"),
             },
+        )
+        write_model_promotion(
+            store=store,
+            payload={
+                "generated_at": validation_generated_at,
+                "source_job": "evaluate_vnext",
+                "rows": summary.num_rows,
+                "windows": summary.num_windows,
+                "rank_ic": summary.rank_ic,
+                "strict_rank_ic": summary.strict_rank_ic,
+                "hit_rate": summary.hit_rate,
+                "cost_adjusted_top_bottom_spread": summary.top_bottom_spread,
+                "pm_context_coverage": summary.pm_context_coverage,
+                "exact_primary_event_rate": summary.exact_primary_event_rate,
+                "synthetic_primary_event_rate": summary.synthetic_primary_event_rate,
+                "institutional_blockers": summary.institutional_blockers,
+                "leakage_passed": summary.leakage_passed,
+                "rank_ic_ci_low": summary.rank_ic_ci_low,
+                "rank_ic_ci_high": summary.rank_ic_ci_high,
+                "top_bottom_spread_ci_low": summary.top_bottom_spread_ci_low,
+                "top_bottom_spread_ci_high": summary.top_bottom_spread_ci_high,
+            },
+            settings=settings,
         )
         finished_at = utc_now_iso()
         record_pipeline_run(
@@ -97,6 +166,10 @@ def main():
                 "strict_hit_rate": summary.strict_hit_rate,
                 "top_bottom_spread": summary.top_bottom_spread,
                 "strict_top_bottom_spread": summary.strict_top_bottom_spread,
+                "rank_ic_ci_low": summary.rank_ic_ci_low,
+                "rank_ic_ci_high": summary.rank_ic_ci_high,
+                "top_bottom_spread_ci_low": summary.top_bottom_spread_ci_low,
+                "top_bottom_spread_ci_high": summary.top_bottom_spread_ci_high,
                 "turnover": summary.turnover,
                 "brier": summary.calibrated_brier,
                 "leakage_passed": summary.leakage_passed,
@@ -111,6 +184,9 @@ def main():
                 "factor_attribution": summary.factor_attribution,
                 "momentum_ablation": summary.momentum_ablation,
                 "from_failure_universe_rate": from_failure_universe_rate,
+                "a_grade_gates": promotion.get("a_grade_gates"),
+                "promotion_decision": promotion.get("decision"),
+                "promotion_blockers": promotion.get("blockers"),
             },
             config={
                 "store_dir": settings.store_dir,

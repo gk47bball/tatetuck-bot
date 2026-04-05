@@ -212,6 +212,38 @@ class TestVNextHistory(unittest.TestCase):
             self.assertEqual(labels.iloc[0]["target_catalyst_success_source"], "exact_event_outcome_positive")
             self.assertEqual(int(event_labels.iloc[0]["target_event_success"]), 1)
 
+    def test_labeler_treats_primary_endpoint_win_with_safety_problem_as_negative(self):
+        inferred = PointInTimeLabeler._infer_outcome_from_text(
+            event_type="phase3_readout",
+            title="TEST met the primary endpoint in phase 3",
+            status="exact_press_release",
+            details="The company also reported serious adverse events and a treatment-related death.",
+        )
+
+        self.assertIsNotNone(inferred)
+        self.assertEqual(int(inferred["success"]), 0)
+
+    def test_labeler_does_not_treat_priority_review_as_pdufa_success(self):
+        inferred = PointInTimeLabeler._infer_outcome_from_text(
+            event_type="pdufa",
+            title="FDA accepts NDA and grants priority review for TEST-101",
+            status="exact_press_release",
+            details="The filing was accepted for review with a target action date later this year.",
+        )
+
+        self.assertIsNone(inferred)
+
+    def test_labeler_treats_acceptance_as_positive_for_regulatory_update_events(self):
+        inferred = PointInTimeLabeler._infer_outcome_from_text(
+            event_type="regulatory_update",
+            title="FDA accepts NDA and grants priority review for TEST-101",
+            status="exact_press_release",
+            details="The filing was accepted for review with priority review designation.",
+        )
+
+        self.assertIsNotNone(inferred)
+        self.assertEqual(int(inferred["success"]), 1)
+
     def test_labeler_prioritizes_clinical_events_over_earnings_noise(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = LocalResearchStore(base_dir=tmpdir)

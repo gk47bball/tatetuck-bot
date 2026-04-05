@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tatetuck PM Dashboard</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Biotech PM cockpit</p>
+        <h1>Tatetuck PM Dashboard</h1>
+        <p class="hero-text">
+          Track the live paper-trading book, surface the best long and short ideas,
+          and keep the catalyst tape, risk posture, and model health in the same frame.
+        </p>
+      </div>
+      <div class="hero-actions">
+        <button class="refresh-button" id="refreshButton" type="button">Refresh</button>
+        <div class="freshness-pill" id="freshnessPill">Waiting for store</div>
+      </div>
+    </header>
+
+    <section class="system-banner-shell" id="systemBanner"></section>
+
+    <section class="summary-grid" id="summaryGrid"></section>
+
+    <div class="main-layout">
+      <main class="main-stack">
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Current PM book</p>
+              <h2>Live trade actions</h2>
+            </div>
+            <p class="panel-note" id="currentPlanNote"></p>
+          </div>
+          <div class="book-grid">
+            <div>
+              <div class="section-label">Buy sleeve</div>
+              <div class="idea-grid" id="buySleeve"></div>
+            </div>
+            <div>
+              <div class="section-label">Exit and hold queue</div>
+              <div class="idea-grid" id="sellSleeve"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Research inventory</p>
+              <h2>Top longs and short watch</h2>
+            </div>
+            <p class="panel-note" id="researchNote"></p>
+          </div>
+          <div class="book-grid">
+            <div>
+              <div class="section-label">Long deck</div>
+              <div class="idea-grid" id="researchLongs"></div>
+            </div>
+            <div>
+              <div class="section-label">Short watch</div>
+              <div class="idea-grid" id="researchShorts"></div>
+            </div>
+          </div>
+        </section>
+
+        <div class="two-panel-grid">
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="panel-kicker">Catalyst timing</p>
+                <h2>Radar</h2>
+              </div>
+            </div>
+            <div class="timeline-list" id="catalystRadar"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="panel-kicker">Execution truth</p>
+                <h2>Trade blotter</h2>
+              </div>
+              <p class="panel-note" id="tradeBlotterNote"></p>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Symbol</th>
+                    <th>Action</th>
+                    <th>Scenario</th>
+                    <th>Target</th>
+                    <th>Status</th>
+                    <th>Costs</th>
+                    <th>P&amp;L</th>
+                  </tr>
+                </thead>
+                <tbody id="tradeBlotter"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+
+        <div class="two-panel-grid">
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="panel-kicker">Model health</p>
+                <h2>Validation</h2>
+              </div>
+            </div>
+            <div id="validationPanel"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="panel-kicker">Execution score</p>
+                <h2>Profile scorecards</h2>
+              </div>
+            </div>
+            <div id="executionPanel"></div>
+          </section>
+        </div>
+      </main>
+
+      <aside class="detail-panel">
+        <div class="detail-panel-header">
+          <p class="panel-kicker">Selected idea</p>
+          <h2 id="detailTitle">No idea selected</h2>
+          <p class="detail-subtitle" id="detailSubtitle">Choose a card to inspect the thesis, catalyst, and risk frame.</p>
+        </div>
+        <div id="detailBody" class="detail-body"></div>
+      </aside>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

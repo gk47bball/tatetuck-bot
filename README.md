@@ -130,6 +130,12 @@ Paper trading:
 python trade_vnext.py --submit
 ```
 
+PM dashboard:
+
+```bash
+python dashboard_vnext.py --port 8765
+```
+
 When paper orders are submitted to Alpaca, Tatetuck now posts a Discord trade
 alert to `DISCORD_TRADE_LOG_CHANNEL_ID` when available, and falls back to
 `DISCORD_CHANNEL_ID` if the trade-log channel is permission-blocked.

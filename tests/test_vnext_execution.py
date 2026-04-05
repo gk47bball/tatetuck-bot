@@ -125,6 +125,12 @@ class StubHistoryProvider:
         return pd.DataFrame({"close": [100.0, 105.0, 115.0, 125.0]}, index=dates)
 
 
+class PlannedAtPrecedenceHistoryProvider:
+    def load_history(self, ticker: str, start: str, end: str) -> pd.DataFrame:
+        dates = pd.to_datetime(["2024-01-01", "2025-01-01", "2025-01-11", "2025-01-31", "2025-04-01"])
+        return pd.DataFrame({"close": [80.0, 100.0, 105.0, 115.0, 125.0]}, index=dates)
+
+
 class TestVNextExecution(unittest.TestCase):
     def make_settings(self) -> VNextSettings:
         return VNextSettings(
@@ -303,6 +309,142 @@ class TestVNextExecution(unittest.TestCase):
         self.assertFalse(plan.selected_symbols)
         self.assertIn("No recommendations cleared the PM execution thresholds.", plan.blockers)
 
+    def test_pending_transaction_is_not_auto_deployed(self):
+        settings = self.make_settings()
+        planner = PMExecutionPlanner(settings)
+        analysis = make_analysis(
+            "APLS",
+            "commercial compounder",
+            3.0,
+            0.82,
+            expected_return=0.18,
+            company_state="commercialized",
+            setup_type="pipeline_optionality",
+            internal_upside_pct=0.16,
+            floor_support_pct=0.15,
+            primary_event_type="strategic_transaction",
+            primary_event_bucket="strategic",
+        )
+        analysis.snapshot.metadata["special_situation"] = "pending_transaction"
+        analysis.snapshot.metadata["special_situation_reason"] = (
+            "Announced Biogen acquisition caps standalone upside largely to the cash consideration, CVR, and deal spread."
+        )
+
+        plan = planner.build_plan([analysis], DummyAccount(), [], DummyReadiness(blockers=[]))
+
+        self.assertFalse(plan.selected_symbols)
+        self.assertIn("No recommendations cleared the PM execution thresholds.", plan.blockers)
+
+    def test_validation_overlay_blocks_negative_setup_regime_for_new_entries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.write_raw_payload(
+                "validation_audits",
+                "latest_walkforward_audit",
+                {
+                    "rolling_setup_regime_scorecards": {
+                        "launch_asymmetry|negative_momentum": {
+                            "rows": 41.0,
+                            "windows": 6.0,
+                            "rank_ic": -0.31,
+                            "hit_rate": 0.50,
+                            "beta_adjusted_return": -0.17,
+                            "cost_adjusted_top_bottom_spread": -0.18,
+                        }
+                    }
+                },
+            )
+            planner = PMExecutionPlanner(self.make_settings(), store=store)
+            analysis = make_analysis(
+                "ARVN",
+                "commercial compounder",
+                4.0,
+                0.72,
+                expected_return=0.14,
+                company_state="commercial_launch",
+                setup_type="launch_asymmetry",
+                internal_upside_pct=0.18,
+                floor_support_pct=0.16,
+                primary_event_type="commercial_update",
+                primary_event_bucket="commercial",
+            )
+            analysis.snapshot.momentum_3mo = -0.20
+
+            plan = planner.build_plan([analysis], DummyAccount(), [], DummyReadiness(blockers=[]))
+
+            self.assertFalse(plan.selected_symbols)
+            self.assertIn("No recommendations cleared the PM execution thresholds.", plan.blockers)
+
+    def test_validation_overlay_scales_down_weak_but_positive_combo(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.write_raw_payload(
+                "validation_audits",
+                "latest_walkforward_audit",
+                {
+                    "rolling_setup_regime_scorecards": {
+                        "capital_allocation|neutral_momentum": {
+                            "rows": 16.0,
+                            "windows": 6.0,
+                            "rank_ic": 0.13,
+                            "hit_rate": 0.4167,
+                            "beta_adjusted_return": 0.05,
+                            "cost_adjusted_top_bottom_spread": 0.045,
+                        }
+                    }
+                },
+            )
+            planner = PMExecutionPlanner(self.make_settings(), store=store)
+            analysis = make_analysis(
+                "REGN",
+                "commercial compounder",
+                4.0,
+                0.72,
+                expected_return=0.12,
+                company_state="commercialized",
+                setup_type="capital_allocation",
+                internal_upside_pct=0.16,
+                floor_support_pct=0.18,
+                primary_event_type="capital_allocation",
+                primary_event_bucket="commercial",
+            )
+            analysis.snapshot.momentum_3mo = 0.0
+
+            plan = planner.build_plan([analysis], DummyAccount(), [], DummyReadiness(blockers=[]))
+
+            instruction = next(item for item in plan.instructions if item.symbol == "REGN")
+            self.assertEqual(instruction.action, "buy")
+            self.assertLessEqual(instruction.scaled_target_weight, self.make_settings().execution_max_floor_weight_pct)
+
+    def test_stale_validation_blocks_new_entries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.write_raw_payload(
+                "validation_audits",
+                "latest_walkforward_audit",
+                {
+                    "generated_at": "2024-01-01T00:00:00+00:00",
+                    "rolling_setup_regime_scorecards": {
+                        "hard_catalyst|positive_momentum": {
+                            "rows": 48.0,
+                            "windows": 8.0,
+                            "rank_ic": 0.24,
+                            "hit_rate": 0.64,
+                            "beta_adjusted_return": 0.11,
+                            "cost_adjusted_top_bottom_spread": 0.18,
+                        }
+                    },
+                },
+            )
+            planner = PMExecutionPlanner(self.make_settings(), store=store)
+            analysis = make_analysis("ARVN", "pre-catalyst long", 4.0, 0.82)
+
+            plan = planner.build_plan([analysis], DummyAccount(), [], DummyReadiness(blockers=[]))
+
+            self.assertFalse(plan.selected_symbols)
+            self.assertIn("No recommendations cleared the PM execution thresholds.", plan.blockers)
+            self.assertTrue(any("Validation audit is" in warning for warning in plan.warnings))
+
     def test_execution_feedback_materializes_profile_scorecards(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = LocalResearchStore(base_dir=tmpdir)
@@ -337,6 +479,48 @@ class TestVNextExecution(unittest.TestCase):
             self.assertEqual(len(feedback), 1)
             self.assertEqual(scorecards.iloc[0]["execution_profile"], "hard_catalyst")
             self.assertGreater(float(scorecards.iloc[0]["avg_return_30d"]), 0.0)
+
+    def test_execution_feedback_prefers_planned_at_and_records_net_returns(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalResearchStore(base_dir=tmpdir)
+            store.append_records(
+                "order_plans",
+                [
+                    {
+                        "symbol": "CRSP",
+                        "company_name": "CRSP Therapeutics",
+                        "action": "buy",
+                        "side": "buy",
+                        "scenario": "pre-catalyst long",
+                        "company_state": "pre_commercial",
+                        "setup_type": "hard_catalyst",
+                        "execution_profile": "hard_catalyst",
+                        "confidence": 0.72,
+                        "target_weight": 4.0,
+                        "scaled_target_weight": 4.0,
+                        "target_notional": 1_000.0,
+                        "current_notional": 0.0,
+                        "delta_notional": 1_000.0,
+                        "as_of": "2024-01-01T00:00:00",
+                        "planned_at": "2025-01-01T00:00:00",
+                    }
+                ],
+            )
+
+            materialize_execution_feedback(store=store, history_provider=PlannedAtPrecedenceHistoryProvider())
+            feedback = store.read_table("execution_feedback")
+            scorecards = store.read_table("execution_profile_scorecards")
+
+            self.assertEqual(feedback.iloc[0]["entry_anchor_source"], "planned_at")
+            self.assertAlmostEqual(float(feedback.iloc[0]["entry_price"]), 100.0)
+            self.assertLess(
+                float(feedback.iloc[0]["return_10d_net"]),
+                float(feedback.iloc[0]["return_10d"]),
+            )
+            self.assertLess(
+                float(scorecards.iloc[0]["avg_net_return_30d"]),
+                float(scorecards.iloc[0]["avg_return_30d"]),
+            )
 
     def test_alpaca_broker_uses_paper_headers(self):
         settings = self.make_settings()

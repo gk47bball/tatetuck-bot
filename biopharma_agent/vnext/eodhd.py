@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import json
 import os
+import re
 from typing import Any
 
 import pandas as pd
 import requests
 
 from .storage import LocalResearchStore
+from .taxonomy import normalized_event_type
 
 
 def _coerce_iso_timestamp(value: str | None, fallback_hour: int = 12, fallback_minute: int = 0) -> str | None:
@@ -32,6 +35,100 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _normalize_guidance_year(token: str) -> int | None:
+    try:
+        value = int(token)
+    except (TypeError, ValueError):
+        return None
+    if value < 100:
+        return 2000 + value
+    if value < 2000:
+        return None
+    return value
+
+
+def _period_end_timestamp(year: int, month: int) -> str | None:
+    try:
+        ts = pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)
+    except ValueError:
+        return None
+    return ts.isoformat()
+
+
+def _future_guidance_timestamp(text: str, published_at: str | None) -> str | None:
+    published_ts = pd.to_datetime(published_at, errors="coerce", utc=True, format="mixed")
+    if not pd.isna(published_ts):
+        published_ts = published_ts.tz_convert(None)
+
+    quarter_map = {
+        "first": 1,
+        "1st": 1,
+        "second": 2,
+        "2nd": 2,
+        "third": 3,
+        "3rd": 3,
+        "fourth": 4,
+        "4th": 4,
+    }
+    half_map = {
+        "first": 1,
+        "1st": 1,
+        "second": 2,
+        "2nd": 2,
+    }
+
+    patterns: list[tuple[re.Pattern[str], str]] = [
+        (re.compile(r"\bq([1-4])[\s'-]*(\d{2,4})\b", flags=re.IGNORECASE), "quarter"),
+        (
+            re.compile(
+                r"\b(first|1st|second|2nd|third|3rd|fourth|4th)\s+quarter(?:\s+of)?\s+(\d{2,4})\b",
+                flags=re.IGNORECASE,
+            ),
+            "quarter_named",
+        ),
+        (re.compile(r"\b([12])h[\s'-]*(\d{2,4})\b", flags=re.IGNORECASE), "half"),
+        (
+            re.compile(r"\b(first|1st|second|2nd)\s+half(?:\s+of)?\s+(\d{2,4})\b", flags=re.IGNORECASE),
+            "half_named",
+        ),
+    ]
+
+    for pattern, pattern_type in patterns:
+        match = pattern.search(text)
+        if not match:
+            continue
+        year = _normalize_guidance_year(match.group(2))
+        if year is None:
+            continue
+        if pattern_type == "quarter":
+            quarter = int(match.group(1))
+            month = quarter * 3
+        elif pattern_type == "quarter_named":
+            quarter = quarter_map.get(match.group(1).lower())
+            if quarter is None:
+                continue
+            month = quarter * 3
+        elif pattern_type == "half":
+            half = int(match.group(1))
+            month = 6 if half == 1 else 12
+        else:
+            half = half_map.get(match.group(1).lower())
+            if half is None:
+                continue
+            month = 6 if half == 1 else 12
+        candidate = _period_end_timestamp(year, month)
+        if candidate is None:
+            continue
+        candidate_ts = pd.to_datetime(candidate, errors="coerce", utc=True, format="mixed")
+        if pd.isna(candidate_ts):
+            continue
+        candidate_ts = candidate_ts.tz_convert(None)
+        if not pd.isna(published_ts) and candidate_ts.normalize() < published_ts.normalize():
+            continue
+        return candidate_ts.isoformat()
+    return None
+
+
 @dataclass(slots=True)
 class UniverseSyncSummary:
     exchanges_requested: int
@@ -48,7 +145,7 @@ class EODHDClientBase:
         session: requests.Session | None = None,
     ):
         self.store = store or LocalResearchStore()
-        self.api_key = api_key or os.environ.get("EODHD_API_KEY")
+        self.api_key = os.environ.get("EODHD_API_KEY") if api_key is None else api_key
         self.session = session or requests.Session()
 
     @staticmethod
@@ -208,14 +305,85 @@ class EODHDEventTapeClient(EODHDClientBase):
                 "limit": 100,
             },
         )
+        events = self._normalize_earnings_events(earnings_payload, normalized_symbol) + self._normalize_news_events(news_payload, normalized_symbol)
+        events = self._merge_events(
+            events,
+            self._cached_news_fallback_events(
+                ticker=ticker,
+                as_of=as_of,
+                lookahead_days=lookahead_days,
+            ),
+        )
         return {
             "ticker": ticker.upper(),
             "symbol": normalized_symbol,
             "as_of": as_of.isoformat(),
-            "events": self._normalize_earnings_events(earnings_payload, normalized_symbol)
-            + self._normalize_news_events(news_payload, normalized_symbol),
+            "events": events,
             "source": "eodhd_event_tape",
         }
+
+    @staticmethod
+    def _merge_events(*event_lists: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[tuple[str, str | None, str | None, str | None]] = set()
+        for event_list in event_lists:
+            for event in event_list:
+                key = (
+                    str(event.get("event_type") or ""),
+                    event.get("expected_date"),
+                    event.get("status"),
+                    str(event.get("title") or ""),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(event)
+        return merged
+
+    def _cached_news_fallback_events(
+        self,
+        ticker: str,
+        as_of: datetime,
+        lookahead_days: int = 120,
+        max_history_days: int = 180,
+        recent_exact_grace_days: int = 30,
+    ) -> list[dict[str, Any]]:
+        symbol = self.normalize_symbol(ticker)
+        reference_end = (as_of + timedelta(days=lookahead_days)).date()
+        exact_grace_cutoff = (as_of - timedelta(days=recent_exact_grace_days)).date()
+        history_cutoff = (as_of - timedelta(days=max_history_days)).date()
+        collected: list[dict[str, Any]] = []
+        paths = sorted(
+            self.store.list_raw_payload_paths("eodhd_news", f"{ticker.upper()}_"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for path in paths:
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, list):
+                continue
+            for row in payload:
+                published_ts = pd.to_datetime(row.get("date"), errors="coerce", utc=True, format="mixed")
+                if not pd.isna(published_ts) and published_ts.tz_convert(None).date() < history_cutoff:
+                    continue
+                classified = self._classify_news_item(row, symbol)
+                if classified is None:
+                    continue
+                expected_ts = pd.to_datetime(classified.get("expected_date"), errors="coerce", utc=True, format="mixed")
+                if pd.isna(expected_ts):
+                    continue
+                expected_date = expected_ts.tz_convert(None).date()
+                if expected_date > reference_end:
+                    continue
+                status = str(classified.get("status") or "")
+                if status.startswith("exact") and expected_date < exact_grace_cutoff:
+                    continue
+                collected.append(classified)
+        return self._merge_events(collected)
 
     def _normalize_earnings_events(self, payload: Any, symbol: str) -> list[dict[str, Any]]:
         if not isinstance(payload, dict):
@@ -259,44 +427,126 @@ class EODHDEventTapeClient(EODHDClientBase):
 
     @staticmethod
     def _classify_news_item(row: dict[str, Any], symbol: str) -> dict[str, Any] | None:
+        raw_symbols = {
+            str(item).upper()
+            for item in (row.get("symbols") or [])
+            if item not in (None, "")
+        }
+        # Vendor news queries can still return industry-adjacent headlines. If
+        # the row declares explicit symbols and the requested one is absent,
+        # discard it rather than polluting the catalyst tape with another
+        # company's press release.
+        if raw_symbols and symbol.upper() not in raw_symbols:
+            return None
+
         title = str(row.get("title") or "")
         content = str(row.get("content") or "")
         tags = [str(tag).lower() for tag in row.get("tags", []) if tag]
         headline = f"{title} {content[:400]}".lower()
-        if not any(verb in headline for verb in ("announce", "announces", "reported", "reports", "provide", "provides", "receive", "receives", "filed", "files", "granted")):
+        if not any(
+            verb in headline
+            for verb in (
+                "announce",
+                "announces",
+                "reported",
+                "reports",
+                "provide",
+                "provides",
+                "receive",
+                "receives",
+                "filed",
+                "files",
+                "granted",
+                "vote",
+                "votes",
+                "voted",
+                "recommend",
+                "recommends",
+                "acquire",
+                "acquires",
+                "withdraw",
+                "withdraws",
+                "discontinue",
+                "divest",
+                "expand",
+                "repurchase",
+            )
+        ):
             return None
 
-        if any(keyword in headline for keyword in ("phase 3", "phase iii", "phase 2", "phase ii", "phase 1", "phase i", "topline", "top-line", "readout", "data")):
-            event_type = "clinical_readout"
-            importance = 0.82
-        elif any(keyword in headline for keyword in ("pdufa", "fda", "approval", "complete response", "crl", "bla", "nda", "adcom")):
-            event_type = "pdufa"
-            importance = 0.88
+        if any(keyword in headline for keyword in ("acquisition", "acquire ", "acquires", "acquiring", "merger", "definitive agreement", "buyout", "m&a")):
+            event_type = "strategic_transaction"
+            importance = 0.84
+        elif any(
+            keyword in headline
+            for keyword in (
+                "withdraw",
+                "withdrawal",
+                "withdraws",
+                "discontinue",
+                "discontinuation",
+                "divest",
+                "divestiture",
+                "strategic review",
+                "out-license",
+                "outlicense",
+                "reprioritize",
+                "deprioritize",
+            )
+        ):
+            event_type = "portfolio_repositioning"
+            importance = 0.76
+        elif any(keyword in headline for keyword in ("label expansion", "expanded indication", "supplemental nda", "snda", "new indication")):
+            event_type = "label_expansion"
+            importance = 0.79
+        elif any(keyword in headline for keyword in ("share repurchase", "buyback", "repurchase", "capital allocation", "special dividend", "deleveraging")):
+            event_type = "capital_allocation"
+            importance = 0.68
+        elif any(keyword in headline for keyword in ("offering", "atm", "shelf", "registered direct", "private placement")):
+            event_type = "recent_offering_filing"
+            importance = 0.57
         elif any(keyword in headline for keyword in ("earnings", "financial results", "quarterly results", "annual results")) or any(
             tag in tags for tag in ("financial results", "quarterly results", "earnings release", "earnings results")
         ):
             event_type = "earnings"
             importance = 0.58
-        elif any(keyword in headline for keyword in ("launch", "commercial", "sales", "uptake", "label expansion")):
-            event_type = "commercial_update"
-            importance = 0.62
-        elif any(keyword in headline for keyword in ("offering", "atm", "shelf", "registered direct", "private placement")):
-            event_type = "recent_offering_filing"
-            importance = 0.57
         else:
-            return None
+            inferred_event_type = normalized_event_type(None, title, content)
+            importance_map = {
+                "phase3_readout": 0.84,
+                "phase2_readout": 0.81,
+                "phase1_readout": 0.74,
+                "clinical_readout": 0.78,
+                "pdufa": 0.88,
+                "adcom": 0.85,
+                "regulatory_update": 0.80,
+                "commercial_update": 0.62,
+            }
+            if inferred_event_type not in importance_map:
+                return None
+            event_type = str(inferred_event_type)
+            importance = float(importance_map[event_type])
 
         event_at = _coerce_iso_timestamp(row.get("date"))
         if not event_at:
             return None
+        guided_at = _future_guidance_timestamp(headline, event_at) if event_type in {
+            "strategic_transaction",
+            "portfolio_repositioning",
+            "label_expansion",
+            "capital_allocation",
+        } else None
+        expected_at = guided_at or event_at
+        status = "guided_company_event" if guided_at else "exact_press_release"
         return {
-            "event_id": f"{symbol}:news:{event_type}:{event_at}",
+            "event_id": f"{symbol}:news:{event_type}:{expected_at}",
             "event_type": event_type,
             "title": title[:180] or f"{symbol} press release",
-            "expected_date": event_at,
-            "status": "exact_press_release",
+            "expected_date": expected_at,
+            "status": status,
             "importance": importance,
             "crowdedness": 0.35,
             "source": "eodhd_news",
             "url": row.get("link"),
+            "details": content[:2000],
         }

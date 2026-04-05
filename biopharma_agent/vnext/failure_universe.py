@@ -611,6 +611,65 @@ def _phase_score(phase_at_failure: str) -> float:
     return _PHASE_SCORE.get(phase_at_failure.upper(), 0.50)
 
 
+def _failure_company_state(phase_at_failure: str) -> str:
+    phase = str(phase_at_failure or "").upper()
+    if phase == "APPROVED":
+        return "commercial_launch"
+    return "pre_commercial"
+
+
+def _failure_setup_type(failure_type: str, phase_at_failure: str) -> str:
+    failure_type_lc = str(failure_type or "").lower()
+    phase = str(phase_at_failure or "").upper()
+    if phase in {"PHASE3", "NDA_BLA"} or failure_type_lc in {"phase3_failure", "crl", "clinical_hold"}:
+        return "hard_catalyst"
+    if phase == "APPROVED":
+        if failure_type_lc == "bankruptcy":
+            return "capital_allocation"
+        return "launch_asymmetry"
+    return "asymmetry_without_near_term_catalyst"
+
+
+def _failure_internal_upside_pct(phase_at_failure: str) -> float:
+    phase = str(phase_at_failure or "").upper()
+    return {
+        "APPROVED": 0.18,
+        "NDA_BLA": 0.26,
+        "PHASE3": 0.34,
+        "PHASE2_3": 0.24,
+        "PHASE2": 0.18,
+        "PHASE1_2": 0.12,
+        "PHASE1": 0.08,
+    }.get(phase, 0.10)
+
+
+def _failure_floor_support_pct(phase_at_failure: str) -> float:
+    phase = str(phase_at_failure or "").upper()
+    return {
+        "APPROVED": 0.20,
+        "NDA_BLA": 0.12,
+        "PHASE3": 0.08,
+        "PHASE2_3": 0.06,
+        "PHASE2": 0.05,
+        "PHASE1_2": 0.04,
+        "PHASE1": 0.03,
+    }.get(phase, 0.04)
+
+
+def _failure_primary_event_type(failure_type: str, phase_at_failure: str) -> str:
+    failure_type_lc = str(failure_type or "").lower()
+    phase = str(phase_at_failure or "").upper()
+    if failure_type_lc == "crl" or phase == "NDA_BLA":
+        return "pdufa"
+    if failure_type_lc == "clinical_hold":
+        return "regulatory_update"
+    if failure_type_lc in {"commercial_failure", "bankruptcy"} or phase == "APPROVED":
+        return "commercial_update"
+    if phase == "PHASE2":
+        return "phase2_readout"
+    return "phase3_readout"
+
+
 # ---------------------------------------------------------------------------
 # Row builders
 # ---------------------------------------------------------------------------
@@ -628,7 +687,13 @@ def failure_label_rows(failure: dict) -> list[dict]:
     as_of_str = snapshot_dt.isoformat()
 
     phase = failure.get("phase_at_failure", "PHASE3")
+    company_state = _failure_company_state(phase)
+    setup_type = _failure_setup_type(failure.get("failure_type", ""), phase)
+    internal_upside_pct = _failure_internal_upside_pct(phase)
+    floor_support_pct = _failure_floor_support_pct(phase)
+    primary_event_type = _failure_primary_event_type(failure.get("failure_type", ""), phase)
     is_pre_commercial = 1.0 if phase.upper() not in {"APPROVED"} else 0.0
+    is_commercial_launch = 1.0 if company_state == "commercial_launch" else 0.0
     post_return = float(failure["post_failure_return"])
 
     row: dict = {
@@ -644,7 +709,24 @@ def failure_label_rows(failure: dict) -> list[dict]:
         # --- key features inferred from failure metadata ---
         "program_quality_phase_score": _phase_score(phase),
         "state_profile_pre_commercial": is_pre_commercial,
+        "state_profile_commercial_launch": is_commercial_launch,
+        "state_profile_commercialized": 0.0,
+        "state_profile_floor_support_pct": floor_support_pct,
+        "balance_sheet_floor_support_pct": floor_support_pct,
+        "state_profile_precommercial_value_gap": internal_upside_pct if company_state == "pre_commercial" else 0.0,
         "market_flow_volatility": 0.08,           # conservative biotech default
+        "catalyst_timing_horizon_days": 90.0,
+        "catalyst_timing_probability": 0.55 if primary_event_type == "commercial_update" else 0.65,
+        "catalyst_timing_importance": 0.70,
+        "catalyst_timing_expected_value": internal_upside_pct * 0.35,
+        f"catalyst_timing_event_{primary_event_type}": 1.0,
+        "meta_company_state": company_state,
+        "meta_setup_type": setup_type,
+        "meta_internal_upside_pct": internal_upside_pct,
+        "meta_floor_support_pct": floor_support_pct,
+        "meta_event_type": primary_event_type,
+        "meta_event_status": "failure_universe_backfill",
+        "meta_event_expected_date": failure["failure_date"],
         # --- audit tag ---
         "meta_from_failure_universe": True,
     }

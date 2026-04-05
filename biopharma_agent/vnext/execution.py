@@ -11,10 +11,12 @@ import pandas as pd
 import requests
 
 from .entities import CompanyAnalysis, PortfolioRecommendation
+from .execution_model import estimated_round_trip_cost_bps, snapshot_microstructure
 from .labels import CompositeHistoryProvider, EODHDHistoryProvider, PriceHistoryProvider, YFinanceHistoryProvider
 from .ops import ReadinessReport, record_pipeline_run, utc_now_iso
 from .settings import VNextSettings
 from .storage import LocalResearchStore
+from .validation import load_best_validation_payload, validation_payload_age_days
 
 
 def _to_float(value: object, default: float = 0.0) -> float:
@@ -22,6 +24,24 @@ def _to_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _momentum_regime_label(momentum: object) -> str:
+    momentum_value = _to_float(momentum, 0.0)
+    if momentum_value > 0.05:
+        return "positive_momentum"
+    if momentum_value < -0.05:
+        return "negative_momentum"
+    return "neutral_momentum"
+
+
+def _spearman(a: pd.Series, b: pd.Series) -> float:
+    if len(a) < 3:
+        return 0.0
+    corr = a.rank().corr(b.rank(), method="pearson")
+    if corr is None or pd.isna(corr):
+        return 0.0
+    return float(corr)
 
 
 @dataclass(slots=True)
@@ -413,8 +433,11 @@ def _fetch_dollar_adv(ticker: str, lookback_days: int = 20) -> float | None:
 
 
 class PMExecutionPlanner:
-    def __init__(self, settings: VNextSettings):
+    def __init__(self, settings: VNextSettings, store: LocalResearchStore | None = None):
         self.settings = settings
+        self.store = store
+        self._validation_payload_cache: dict[str, object] | None = None
+        self._rolling_validation_cache: dict[str, dict[str, float]] | None = None
 
     def build_plan(
         self,
@@ -426,14 +449,23 @@ class PMExecutionPlanner:
         analyses = list(analyses)
         positions_by_symbol = {position.symbol: position for position in positions}
         profiles = {
-            analysis.snapshot.ticker: self._execution_profile(
-                analysis,
+            analysis.snapshot.ticker: self._apply_validation_overlay(
+                self._execution_profile(
+                    analysis,
+                    has_position=analysis.snapshot.ticker in positions_by_symbol,
+                ),
+                analysis=analysis,
                 has_position=analysis.snapshot.ticker in positions_by_symbol,
             )
             for analysis in analyses
         }
         blockers: list[str] = []
         warnings: list[str] = list(readiness.blockers)
+        validation_age_days = validation_payload_age_days(self._latest_validation_payload())
+        if validation_age_days is not None and validation_age_days > int(self.settings.validation_max_age_days):
+            warnings.append(
+                f"Validation audit is {validation_age_days} days old. Fresh entries stay blocked until evaluate_vnext is rerun."
+            )
         selected = self._select_recommendations(analyses, positions_by_symbol, profiles)
         deployable_notional = min(
             account.equity * (self.settings.max_gross_exposure_pct / 100.0),
@@ -715,6 +747,205 @@ class PMExecutionPlanner:
             groups[ticker_a] = count
         return groups
 
+    def _latest_validation_payload(self) -> dict[str, object]:
+        if self._validation_payload_cache is not None:
+            return self._validation_payload_cache
+        if self.store is None:
+            self._validation_payload_cache = {}
+            return self._validation_payload_cache
+        payload = load_best_validation_payload(self.store)
+        self._validation_payload_cache = payload if isinstance(payload, dict) else {}
+        return self._validation_payload_cache
+
+    def _derive_rolling_setup_regime_scorecards(self) -> dict[str, dict[str, float]]:
+        if self._rolling_validation_cache is not None:
+            return self._rolling_validation_cache
+        if self.store is None:
+            self._rolling_validation_cache = {}
+            return self._rolling_validation_cache
+        signals = self.store.read_table("signal_artifacts")
+        labels = self.store.read_table("labels")
+        if signals.empty or labels.empty:
+            self._rolling_validation_cache = {}
+            return self._rolling_validation_cache
+        frame = signals.merge(labels, on=["ticker", "as_of"], how="inner")
+        frame = frame.dropna(subset=["target_return_90d"]).copy()
+        if frame.empty:
+            self._rolling_validation_cache = {}
+            return self._rolling_validation_cache
+        frame["setup_type"] = frame["setup_type"].fillna("watchful").astype(str)
+        if "momentum_3mo" in frame.columns:
+            frame["regime"] = frame["momentum_3mo"].map(_momentum_regime_label)
+        else:
+            frame["regime"] = "neutral_momentum"
+        frame["combo_key"] = frame["setup_type"] + "|" + frame["regime"]
+        frame["as_of_ts"] = pd.to_datetime(frame["as_of"], errors="coerce", utc=True, format="mixed").dt.tz_convert(None)
+        frame = frame.dropna(subset=["as_of_ts"]).copy()
+        if frame.empty:
+            self._rolling_validation_cache = {}
+            return self._rolling_validation_cache
+        rebalance_dates = sorted(frame["as_of_ts"].dt.normalize().dropna().unique().tolist())
+        keep_count = max(int(self.settings.rolling_validation_windows), 1)
+        keep_dates = set(rebalance_dates[-keep_count:])
+        rolling = frame[frame["as_of_ts"].dt.normalize().isin(keep_dates)].copy()
+        scorecards: dict[str, dict[str, float]] = {}
+        for combo_key, group in rolling.groupby("combo_key", dropna=False):
+            label = str(combo_key or "watchful|neutral_momentum")
+            top = group.nlargest(max(1, len(group) // 2), "expected_return")
+            bottom = group.nsmallest(max(1, len(group) // 2), "expected_return")
+            spread = (
+                float(top["target_return_90d"].mean() - bottom["target_return_90d"].mean())
+                if len(group) > 1
+                else 0.0
+            )
+            scorecards[label] = {
+                "rows": float(len(group)),
+                "windows": float(group["as_of_ts"].dt.normalize().nunique()),
+                "rank_ic": _spearman(group["expected_return"], group["target_return_90d"]),
+                "hit_rate": float((group["target_return_90d"] > 0.0).mean()),
+                "beta_adjusted_return": float(group["target_return_90d"].mean()),
+                "cost_adjusted_top_bottom_spread": spread,
+                "top_bottom_spread": spread,
+            }
+        self._rolling_validation_cache = scorecards
+        return self._rolling_validation_cache
+
+    def _rolling_setup_regime_metrics(self, analysis: CompanyAnalysis) -> tuple[str | None, dict[str, object] | None]:
+        payload = self._latest_validation_payload()
+        scorecards = payload.get("rolling_setup_regime_scorecards")
+        if not isinstance(scorecards, dict) or not scorecards:
+            scorecards = self._derive_rolling_setup_regime_scorecards()
+        if not isinstance(scorecards, dict) or not scorecards:
+            return None, None
+        setup = str(analysis.signal.setup_type or analysis.portfolio.setup_type or "watchful")
+        regime = _momentum_regime_label(getattr(analysis.snapshot, "momentum_3mo", 0.0))
+        combo_key = f"{setup}|{regime}"
+        metrics = scorecards.get(combo_key)
+        return combo_key, metrics if isinstance(metrics, dict) else None
+
+    def _apply_validation_overlay(
+        self,
+        profile: ExecutionProfile,
+        analysis: CompanyAnalysis,
+        has_position: bool,
+    ) -> ExecutionProfile:
+        if profile.mode == "block":
+            return profile
+        payload = self._latest_validation_payload()
+        if not payload:
+            return profile
+        validation_age_days = validation_payload_age_days(payload)
+        if validation_age_days is not None and validation_age_days > int(self.settings.validation_max_age_days):
+            reason = (
+                f"Validation audit is {validation_age_days}d old and no longer reflects the current research book."
+            )
+            rationale = list(profile.rationale)
+            if has_position:
+                return ExecutionProfile(
+                    name=f"{profile.name}_stale_validation_hold",
+                    mode="hold",
+                    weight_cap_pct=min(profile.weight_cap_pct, self.settings.execution_max_floor_weight_pct),
+                    score=profile.score - 0.35,
+                    rationale=rationale + [f"validation_hold: {reason}"],
+                )
+            return ExecutionProfile(
+                name=f"{profile.name}_stale_validation_blocked",
+                mode="block",
+                weight_cap_pct=0.0,
+                score=profile.score - 1.0,
+                rationale=rationale + [f"validation_block: {reason}"],
+            )
+
+        setup = str(analysis.signal.setup_type or analysis.portfolio.setup_type or "watchful")
+        rationale = list(profile.rationale)
+        a_grade_gates = payload.get("a_grade_gates")
+        if setup == "hard_catalyst" and isinstance(a_grade_gates, dict):
+            hard_catalyst_gate = a_grade_gates.get("hard_catalyst")
+            if isinstance(hard_catalyst_gate, dict) and hard_catalyst_gate.get("passed") is False and profile.mode == "auto":
+                reason = str(hard_catalyst_gate.get("reason") or "Hard-catalyst sleeve is still validation-gated.")
+                if has_position:
+                    return ExecutionProfile(
+                        name=f"{profile.name}_validation_hold",
+                        mode="hold",
+                        weight_cap_pct=min(profile.weight_cap_pct, self.settings.execution_max_floor_weight_pct),
+                        score=profile.score - 0.35,
+                        rationale=rationale + [f"validation_hold: {reason}"],
+                    )
+                return ExecutionProfile(
+                    name=f"{profile.name}_validation_blocked",
+                    mode="block",
+                    weight_cap_pct=0.0,
+                    score=profile.score - 1.0,
+                    rationale=rationale + [f"validation_block: {reason}"],
+                )
+
+        combo_key, metrics = self._rolling_setup_regime_metrics(analysis)
+        if combo_key is None or metrics is None:
+            return profile
+
+        rows = _to_float(metrics.get("rows"), 0.0)
+        windows = _to_float(metrics.get("windows"), 0.0)
+        if (
+            rows < float(self.settings.execution_validation_min_rows)
+            or windows < float(self.settings.execution_validation_min_windows)
+        ):
+            return profile
+
+        spread = _to_float(metrics.get("cost_adjusted_top_bottom_spread"), 0.0)
+        hit_rate = _to_float(metrics.get("hit_rate"), 0.5)
+        rank_ic = _to_float(metrics.get("rank_ic"), 0.0)
+        beta_adj = _to_float(metrics.get("beta_adjusted_return"), 0.0)
+        summary = (
+            f"rolling_validation[{combo_key}]: rows={rows:.0f}, windows={windows:.0f}, "
+            f"spread={spread:+.3f}, hit={hit_rate:.3f}, ic={rank_ic:+.3f}, beta_adj={beta_adj:+.3f}"
+        )
+
+        severe_negative = (
+            spread <= float(self.settings.execution_validation_block_spread)
+            or beta_adj < float(self.settings.execution_validation_block_spread)
+            or (hit_rate < float(self.settings.execution_validation_min_hit_rate) and rank_ic < 0.0)
+            or rank_ic < -0.05
+        )
+        if severe_negative and profile.mode == "auto":
+            if has_position:
+                return ExecutionProfile(
+                    name=f"{profile.name}_validation_hold",
+                    mode="hold",
+                    weight_cap_pct=min(profile.weight_cap_pct, self.settings.execution_max_floor_weight_pct),
+                    score=profile.score - 0.35,
+                    rationale=rationale + [f"validation_hold: {summary}"],
+                )
+            return ExecutionProfile(
+                name=f"{profile.name}_validation_blocked",
+                mode="block",
+                weight_cap_pct=0.0,
+                score=profile.score - 1.0,
+                rationale=rationale + [f"validation_block: {summary}"],
+            )
+
+        caution = (
+            spread < float(self.settings.execution_validation_caution_spread)
+            or hit_rate < 0.50
+            or rank_ic < 0.0
+        )
+        if caution and profile.mode == "auto":
+            reduced_cap = min(
+                profile.weight_cap_pct,
+                max(
+                    self.settings.execution_max_floor_weight_pct,
+                    profile.weight_cap_pct * float(self.settings.execution_validation_caution_weight_scale),
+                ),
+            )
+            if reduced_cap < profile.weight_cap_pct:
+                return ExecutionProfile(
+                    name=profile.name,
+                    mode=profile.mode,
+                    weight_cap_pct=reduced_cap,
+                    score=profile.score - 0.15,
+                    rationale=rationale + [f"validation_caution: {summary}"],
+                )
+        return profile
+
     def _execution_profile(
         self,
         analysis: CompanyAnalysis,
@@ -722,6 +953,8 @@ class PMExecutionPlanner:
     ) -> ExecutionProfile:
         rec = analysis.portfolio
         signal = analysis.signal
+        special_situation = str((analysis.snapshot.metadata or {}).get("special_situation") or "")
+        special_reason = str((analysis.snapshot.metadata or {}).get("special_situation_reason") or "")
         state = signal.company_state or rec.company_state or "pre_commercial"
         setup = signal.setup_type or rec.setup_type or "watchful"
         expected_return = signal.expected_return
@@ -733,6 +966,18 @@ class PMExecutionPlanner:
         upside = signal.internal_upside_pct if signal.internal_upside_pct is not None else 0.0
         floor = signal.floor_support_pct if signal.floor_support_pct is not None else 0.0
 
+        if special_situation == "pending_transaction":
+            return self._blocked_profile(
+                "pending_transaction",
+                analysis,
+                special_reason or "Pending transaction caps standalone upside to the deal spread, so the name is not deployable as a fresh PM idea.",
+            )
+        if rec.stance == "short":
+            return self._blocked_profile(
+                "short_research_only",
+                analysis,
+                "Recommendation is a short idea. Auto-execution remains long-only until borrow- and margin-aware short routing is enabled.",
+            )
         if rec.stance != "long":
             return self._blocked_profile("not_long", analysis, "Recommendation stance is not long.")
         if rec.scenario == "avoid due to financing" or financing_risk > 0.82:
@@ -1065,13 +1310,37 @@ def materialize_execution_feedback(
     for column in ("as_of", "planned_at", "company_state", "setup_type", "execution_profile", "scenario", "company_name"):
         if column not in actionable.columns:
             actionable[column] = None
-    entry_anchor = actionable["as_of"].fillna(actionable["planned_at"])
-    actionable["entry_ts"] = pd.to_datetime(
-        entry_anchor,
+    snapshots = store.read_table("company_snapshots")
+    if not snapshots.empty and "as_of" in snapshots.columns:
+        snapshots = snapshots.copy()
+        snapshots["as_of_ts"] = pd.to_datetime(
+            snapshots["as_of"],
+            errors="coerce",
+            utc=True,
+            format="mixed",
+        ).dt.tz_convert(None)
+        snapshots = snapshots.dropna(subset=["as_of_ts"])
+
+    actionable["planned_at_ts"] = pd.to_datetime(
+        actionable["planned_at"],
         errors="coerce",
         utc=True,
         format="mixed",
     ).dt.tz_convert(None)
+    actionable["as_of_ts"] = pd.to_datetime(
+        actionable["as_of"],
+        errors="coerce",
+        utc=True,
+        format="mixed",
+    ).dt.tz_convert(None)
+    actionable["entry_anchor_source"] = actionable["planned_at_ts"].notna().map(
+        lambda value: "planned_at" if value else "as_of"
+    )
+    entry_anchor = actionable["planned_at_ts"].fillna(actionable["as_of_ts"])
+    actionable["entry_ts"] = pd.to_datetime(
+        entry_anchor,
+        errors="coerce",
+    )
     actionable = actionable.dropna(subset=["entry_ts"])
     if actionable.empty:
         return ExecutionFeedbackSummary(
@@ -1103,6 +1372,7 @@ def materialize_execution_feedback(
                 "as_of": row.as_of,
                 "planned_at": row.planned_at,
                 "entry_ts": entry_ts.isoformat(),
+                "entry_anchor_source": row.entry_anchor_source,
                 "entry_price": float(entry_price),
                 "direction": direction,
                 "action": row.action,
@@ -1111,16 +1381,28 @@ def materialize_execution_feedback(
                 "setup_type": row.setup_type,
                 "execution_profile": row.execution_profile,
             }
+            market_cap = volatility = None
+            if not snapshots.empty:
+                market_cap, volatility = snapshot_microstructure(snapshots=snapshots, symbol=row.symbol, entry_ts=entry_ts)
+            round_trip_cost_bps = estimated_round_trip_cost_bps(market_cap, volatility, row.setup_type)
+            entry_cost = round_trip_cost_bps / 20_000.0
+            round_trip_cost = round_trip_cost_bps / 10_000.0
+            record["estimated_round_trip_cost_bps"] = float(round_trip_cost_bps)
             latest_price = _price_at_or_before(close, close.index.max())
-            record["mark_to_market_return"] = (
+            raw_mark_to_market = (
                 float(direction * ((latest_price / entry_price) - 1.0))
                 if latest_price is not None
                 else None
+            )
+            record["mark_to_market_return"] = raw_mark_to_market
+            record["mark_to_market_net_return"] = (
+                None if raw_mark_to_market is None else float(raw_mark_to_market - entry_cost)
             )
             for horizon in (10, 30, 90):
                 exit_price = _price_at_or_after(close, entry_ts + pd.Timedelta(days=horizon))
                 realized = None if exit_price is None else float(direction * ((exit_price / entry_price) - 1.0))
                 record[f"return_{horizon}d"] = realized
+                record[f"return_{horizon}d_net"] = None if realized is None else float(realized - round_trip_cost)
                 record[f"matured_{horizon}d"] = realized is not None
             feedback_rows.append(record)
 
@@ -1143,6 +1425,7 @@ def materialize_execution_feedback(
             "trades": int(len(group)),
             "company_states": ",".join(sorted(set(group["company_state"].dropna().astype(str).tolist()))),
             "setup_types": ",".join(sorted(set(group["setup_type"].dropna().astype(str).tolist()))),
+            "avg_estimated_round_trip_cost_bps": float(group["estimated_round_trip_cost_bps"].mean()),
         }
         for horizon in (10, 30, 90):
             matured = group[group[f"matured_{horizon}d"].fillna(False)].copy()
@@ -1157,7 +1440,18 @@ def materialize_execution_feedback(
                 if not matured.empty
                 else None
             )
+            row[f"net_hit_rate_{horizon}d"] = (
+                float((matured[f"return_{horizon}d_net"] > 0.0).mean())
+                if not matured.empty
+                else None
+            )
+            row[f"avg_net_return_{horizon}d"] = (
+                float(matured[f"return_{horizon}d_net"].mean())
+                if not matured.empty
+                else None
+            )
         row["avg_mark_to_market_return"] = float(group["mark_to_market_return"].mean())
+        row["avg_mark_to_market_net_return"] = float(group["mark_to_market_net_return"].mean())
         scorecards.append(row)
     store.replace_table("execution_profile_scorecards", scorecards)
     return ExecutionFeedbackSummary(

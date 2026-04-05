@@ -63,7 +63,7 @@ def main() -> None:
     store = LocalResearchStore(settings.store_dir)
     platform = TatetuckPlatform(store=store)
     broker = AlpacaPaperBroker(settings=settings)
-    planner = PMExecutionPlanner(settings=settings)
+    planner = PMExecutionPlanner(settings=settings, store=store)
     started_at = utc_now_iso()
     start = time.time()
 

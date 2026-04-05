@@ -11,39 +11,99 @@ import requests
 import yfinance as yf
 
 from .storage import LocalResearchStore
-from .taxonomy import event_timing_priority, event_type_bucket, event_type_priority
+from .taxonomy import event_timing_priority, event_type_bucket, event_type_priority, is_exact_timing_event, normalized_event_type
 
-POSITIVE_OUTCOME_KEYWORDS = (
-    "approved",
-    "approval",
-    "acceptance",
-    "accepted",
+POSITIVE_CLINICAL_OUTCOME_KEYWORDS = (
     "positive topline",
     "positive top-line",
     "met the primary endpoint",
     "met primary endpoint",
     "met its primary endpoint",
-    "met endpoint",
+    "achieved the primary endpoint",
     "achieved primary endpoint",
-    "priority review",
-    "breakthrough therapy",
+    "achieved its primary endpoint",
+    "statistically significant improvement in the primary endpoint",
+    "statistically significant improvement on the primary endpoint",
 )
 
-NEGATIVE_OUTCOME_KEYWORDS = (
-    "complete response",
-    "crl",
-    "clinical hold",
-    "terminated",
-    "terminate",
-    "discontinue",
-    "discontinued",
-    "failed",
-    "failure",
+NEGATIVE_CLINICAL_OUTCOME_KEYWORDS = (
     "missed the primary endpoint",
-    "did not meet",
+    "did not meet the primary endpoint",
+    "did not meet its primary endpoint",
+    "failed to meet the primary endpoint",
+    "failed to meet its primary endpoint",
+    "failed one of two primary endpoints",
+    "missed one of two primary endpoints",
+    "missed a co-primary endpoint",
+    "failed a co-primary endpoint",
+    "did not meet the co-primary endpoint",
+    "not statistically significant on the primary endpoint",
+)
+
+NEGATIVE_SAFETY_OUTCOME_KEYWORDS = (
+    "clinical hold",
+    "dose limiting toxicity",
+    "dose-limiting toxicity",
+    "serious adverse event",
+    "serious adverse events",
+    "safety signal",
+    "safety concern",
+    "treatment-related death",
+    "treatment related death",
+    "fatal adverse event",
+    "fatal adverse events",
+    "hepatotoxicity",
+)
+
+POSITIVE_REGULATORY_DECISION_KEYWORDS = (
+    "received fda approval",
+    "fda approved",
+    "approved by the fda",
+    "granted approval",
+    "approval granted",
+    "marketing authorization granted",
+)
+
+NEGATIVE_REGULATORY_DECISION_KEYWORDS = (
+    "complete response",
+    "complete response letter",
+    "crl",
+    "refuse to file",
+    "rtf letter",
     "not approve",
     "rejected",
-    "withdrawn",
+)
+
+POSITIVE_REGULATORY_PROGRESS_KEYWORDS = (
+    "accepted for review",
+    "filing accepted",
+    "acceptance for review",
+    "priority review",
+    "breakthrough therapy designation",
+    "fast track designation",
+)
+
+POSITIVE_ADCOM_OUTCOME_KEYWORDS = (
+    "advisory committee voted in favor",
+    "advisory committee recommends approval",
+    "panel voted in favor",
+    "votes in favor",
+    "voted in favor",
+)
+
+NEGATIVE_ADCOM_OUTCOME_KEYWORDS = (
+    "advisory committee voted against",
+    "advisory committee recommends against approval",
+    "panel voted against",
+    "votes against",
+    "voted against",
+)
+
+SOFT_SIGNAL_ONLY_KEYWORDS = (
+    "secondary endpoint",
+    "exploratory endpoint",
+    "trend toward significance",
+    "trend toward improvement",
 )
 
 MIXED_OUTCOME_KEYWORDS = (
@@ -157,9 +217,16 @@ class EODHDHistoryProvider:
 
 
 class YFinanceHistoryProvider:
-    def __init__(self, store: LocalResearchStore | None = None, allow_live: bool = True):
+    def __init__(self, store: LocalResearchStore | None = None, allow_live: bool | None = None):
         self.store = store or LocalResearchStore()
-        self.allow_live = allow_live
+        if allow_live is None:
+            allow_live = os.environ.get("TATETUCK_ENABLE_LIVE_MARKET_DATA", "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        self.allow_live = bool(allow_live)
 
     def load_history(self, ticker: str, start: str, end: str) -> pd.DataFrame:
         cache_key = f"{ticker}_{start}_{end}"
@@ -426,7 +493,10 @@ class PointInTimeLabeler:
         ].copy()
         if candidates.empty:
             return None
-        candidates["event_bucket"] = candidates["event_type"].map(event_type_bucket)
+        candidates["event_bucket"] = candidates.apply(
+            lambda row: event_type_bucket(row.get("event_type"), row.get("title"), row.get("details")),
+            axis=1,
+        )
         candidates = candidates[candidates["event_bucket"] == primary_bucket].copy()
         if candidates.empty:
             return None
@@ -449,6 +519,7 @@ class PointInTimeLabeler:
                 event_type=str(row.get("event_type") or ""),
                 title=str(row.get("title") or ""),
                 status=str(row.get("status") or ""),
+                details=str(row.get("details") or ""),
             )
             if inferred is not None:
                 return inferred
@@ -459,18 +530,146 @@ class PointInTimeLabeler:
         event_type: str,
         title: str,
         status: str,
+        details: str = "",
     ) -> dict[str, object] | None:
-        bucket = event_type_bucket(event_type)
+        normalized = normalized_event_type(event_type, title, details)
+        bucket = event_type_bucket(event_type, title, details)
         if bucket not in {"clinical", "regulatory"}:
             return None
-        text = f"{title} {status}".lower()
-        if any(keyword in text for keyword in MIXED_OUTCOME_KEYWORDS):
+        text = f"{title} {status} {details}".lower()
+        if any(keyword in text for keyword in MIXED_OUTCOME_KEYWORDS) and not any(
+            keyword in text
+            for keyword in (
+                *POSITIVE_CLINICAL_OUTCOME_KEYWORDS,
+                *NEGATIVE_CLINICAL_OUTCOME_KEYWORDS,
+                *NEGATIVE_SAFETY_OUTCOME_KEYWORDS,
+                *POSITIVE_REGULATORY_DECISION_KEYWORDS,
+                *NEGATIVE_REGULATORY_DECISION_KEYWORDS,
+                *POSITIVE_REGULATORY_PROGRESS_KEYWORDS,
+                *POSITIVE_ADCOM_OUTCOME_KEYWORDS,
+                *NEGATIVE_ADCOM_OUTCOME_KEYWORDS,
+            )
+        ):
             return None
-        if any(keyword in text for keyword in NEGATIVE_OUTCOME_KEYWORDS):
+        if any(keyword in text for keyword in NEGATIVE_SAFETY_OUTCOME_KEYWORDS):
             return {"success": 0, "source": "exact_event_outcome_negative"}
-        if any(keyword in text for keyword in POSITIVE_OUTCOME_KEYWORDS):
+        if bucket == "clinical":
+            if any(keyword in text for keyword in NEGATIVE_CLINICAL_OUTCOME_KEYWORDS):
+                return {"success": 0, "source": "exact_event_outcome_negative"}
+            if any(keyword in text for keyword in POSITIVE_CLINICAL_OUTCOME_KEYWORDS):
+                return {"success": 1, "source": "exact_event_outcome_positive"}
+            if any(keyword in text for keyword in SOFT_SIGNAL_ONLY_KEYWORDS):
+                return None
+            return None
+
+        if normalized == "adcom":
+            if any(keyword in text for keyword in NEGATIVE_ADCOM_OUTCOME_KEYWORDS):
+                return {"success": 0, "source": "exact_event_outcome_negative"}
+            if any(keyword in text for keyword in POSITIVE_ADCOM_OUTCOME_KEYWORDS):
+                return {"success": 1, "source": "exact_event_outcome_positive"}
+            return None
+
+        if any(keyword in text for keyword in NEGATIVE_REGULATORY_DECISION_KEYWORDS):
+            return {"success": 0, "source": "exact_event_outcome_negative"}
+        if any(keyword in text for keyword in POSITIVE_REGULATORY_DECISION_KEYWORDS):
+            return {"success": 1, "source": "exact_event_outcome_positive"}
+        if normalized == "pdufa" and any(keyword in text for keyword in POSITIVE_REGULATORY_PROGRESS_KEYWORDS):
+            return None
+        if normalized == "regulatory_update" and any(keyword in text for keyword in POSITIVE_REGULATORY_PROGRESS_KEYWORDS):
             return {"success": 1, "source": "exact_event_outcome_positive"}
         return None
+
+    def _build_ticker_event_outcome_tape(self, ticker: str, ticker_event_tape: pd.DataFrame) -> pd.DataFrame:
+        if ticker_event_tape.empty:
+            return pd.DataFrame()
+        frame = ticker_event_tape.copy()
+        frame["ticker"] = frame.get("ticker", ticker)
+        if "details" not in frame.columns:
+            frame["details"] = None
+        if "source_url" not in frame.columns:
+            frame["source_url"] = None
+        frame["event_timestamp_ts"] = pd.to_datetime(
+            frame["event_timestamp"],
+            errors="coerce",
+            utc=True,
+            format="mixed",
+        ).dt.tz_convert(None)
+        frame = frame.dropna(subset=["event_timestamp_ts"]).copy()
+        if frame.empty:
+            return frame
+        if "timing_exact" not in frame.columns:
+            frame["timing_exact"] = frame.apply(
+                lambda row: is_exact_timing_event(row.get("status"), row.get("event_timestamp"), row.get("title")),
+                axis=1,
+            )
+        if "timing_synthetic" not in frame.columns:
+            frame["timing_synthetic"] = ~frame["timing_exact"].fillna(False).astype(bool)
+        return frame.sort_values(["event_timestamp_ts", "source"], ascending=[True, True])
+
+    @staticmethod
+    def _strict_matching_windows(primary_event: pd.Series) -> list[tuple[str, int, int]]:
+        exact = is_exact_timing_event(
+            primary_event.get("status"),
+            primary_event.get("expected_date"),
+            primary_event.get("title"),
+        )
+        if exact:
+            return [
+                ("tight", 2, 10),
+                ("standard", 5, 21),
+            ]
+        return [
+            ("standard", 5, 21),
+            ("wide", 14, 30),
+        ]
+
+    def _strict_window_candidates(
+        self,
+        candidates: pd.DataFrame,
+        primary_event: pd.Series,
+        as_of_ts: pd.Timestamp,
+        lookback_days: int,
+        lookahead_days: int,
+    ) -> pd.DataFrame:
+        if candidates.empty:
+            return candidates
+        expected_date_ts = primary_event.get("expected_date_ts")
+        if expected_date_ts is None or pd.isna(expected_date_ts):
+            return pd.DataFrame()
+        window_start = max(pd.Timestamp(as_of_ts), pd.Timestamp(expected_date_ts) - timedelta(days=lookback_days))
+        window_end = pd.Timestamp(expected_date_ts) + timedelta(days=lookahead_days)
+        frame = candidates.copy()
+        frame = frame[
+            (frame["event_timestamp_ts"] >= window_start)
+            & (frame["event_timestamp_ts"] <= window_end)
+        ].copy()
+        if frame.empty:
+            return frame
+        primary_bucket = event_type_bucket(
+            primary_event.get("event_type"),
+            primary_event.get("title"),
+            primary_event.get("details"),
+        )
+        frame["event_bucket"] = frame.apply(
+            lambda row: event_type_bucket(row.get("event_type"), row.get("title"), row.get("details")),
+            axis=1,
+        )
+        frame = frame[frame["event_bucket"] == primary_bucket].copy()
+        if frame.empty:
+            return frame
+        target_type = str(primary_event.get("event_type") or "")
+        frame["type_match"] = (frame["event_type"].astype(str) == target_type).astype(int)
+        frame["days_from_expected"] = (
+            (frame["event_timestamp_ts"] - pd.Timestamp(expected_date_ts)).abs().dt.total_seconds() / 86400.0
+        )
+        frame["timing_priority"] = frame.apply(
+            lambda row: event_timing_priority(row.get("status"), row.get("event_timestamp"), row.get("title")),
+            axis=1,
+        )
+        return frame.sort_values(
+            ["type_match", "timing_priority", "days_from_expected"],
+            ascending=[False, False, True],
+        )
 
     @staticmethod
     def _select_primary_event(
@@ -528,6 +727,15 @@ class PointInTimeLabeler:
         if cache_key in self._benchmark_cache:
             close = self._benchmark_cache[cache_key]
         else:
+            live_market_data_enabled = os.environ.get("TATETUCK_ENABLE_LIVE_MARKET_DATA", "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if not live_market_data_enabled:
+                self._benchmark_cache[cache_key] = pd.Series(dtype=float)
+                return None
             try:
                 raw = yf.Ticker(ticker).history(start=start_date, end=end_date, auto_adjust=True)
                 if raw.empty or "Close" not in raw.columns:

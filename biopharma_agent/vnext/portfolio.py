@@ -6,8 +6,16 @@ import json
 import pandas as pd
 
 from .entities import ModelPrediction, PortfolioRecommendation, SignalArtifact
+from .settings import VNextSettings
 from .storage import LocalResearchStore
 from .taxonomy import event_type_bucket
+from .validation import load_best_validation_payload, validation_payload_age_days
+
+SHORT_SCENARIOS = {
+    "pre-catalyst short",
+    "science-vs-street short",
+    "franchise de-rating short",
+}
 
 
 def _coerce_json(value):
@@ -45,6 +53,36 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
+def _horizon_rank(label: str | None) -> int:
+    order = {"30d": 0, "90d": 1, "180d": 2}
+    return order.get(str(label), 3)
+
+
+def _horizon_from_days(days: int | float | None) -> str:
+    try:
+        horizon_days = float(days)
+    except (TypeError, ValueError):
+        return "180d"
+    if horizon_days <= 45.0:
+        return "30d"
+    if horizon_days <= 120.0:
+        return "90d"
+    return "180d"
+
+
+def _days_to_event(as_of: str | None, event_date: str | None) -> int | None:
+    if not as_of or not event_date:
+        return None
+    try:
+        as_of_ts = pd.to_datetime(as_of, errors="coerce", utc=True, format="mixed")
+        event_ts = pd.to_datetime(event_date, errors="coerce", utc=True, format="mixed")
+        if pd.isna(as_of_ts) or pd.isna(event_ts):
+            return None
+        return max(int((event_ts - as_of_ts).total_seconds() // 86400), 0)
+    except Exception:
+        return None
+
+
 def _spearman(a: pd.Series, b: pd.Series) -> float:
     if len(a) < 3:
         return 0.0
@@ -55,8 +93,14 @@ def _spearman(a: pd.Series, b: pd.Series) -> float:
 
 
 class PortfolioConstructor:
-    def __init__(self, store: LocalResearchStore | None = None, use_validation_priors: bool = True):
+    def __init__(
+        self,
+        store: LocalResearchStore | None = None,
+        use_validation_priors: bool = True,
+        settings: VNextSettings | None = None,
+    ):
         self.store = store
+        self.settings = settings or VNextSettings.from_env()
         self.use_validation_priors = bool(store is not None and use_validation_priors)
 
     def recommend(
@@ -73,24 +117,37 @@ class PortfolioConstructor:
         empirical_edge = self._empirical_edge(signal)
         scenario = self._scenario(signal, empirical_edge)
         risk_flags = self._risk_flags(signal, empirical_edge)
+        short_scenario = scenario in SHORT_SCENARIOS
+        directional_expected_return = max(-signal.expected_return, 0.0) if short_scenario else max(signal.expected_return, 0.0)
+        valuation_gap = max(-(signal.internal_upside_pct or 0.0), 0.0) if short_scenario else 0.0
 
-        pm_edge = max(signal.expected_return, 0.0) * (0.70 + signal.confidence)
+        pm_edge = directional_expected_return * (0.70 + signal.confidence)
         clinical_bonus = 0.75 if signal.primary_event_bucket in {"clinical", "regulatory"} else 0.0
         persistence_bonus = 0.0
-        if previous_signal is not None and previous_signal.expected_return > 0.08:
+        previous_directional_edge = 0.0
+        if previous_signal is not None:
+            previous_directional_edge = (
+                max(-previous_signal.expected_return, 0.0) if short_scenario else max(previous_signal.expected_return, 0.0)
+            )
+        if previous_signal is not None and previous_directional_edge > 0.08:
             if previous_signal.primary_event_bucket == signal.primary_event_bucket:
                 persistence_bonus = 0.60
             else:
                 persistence_bonus = 0.25
-        base_weight = (pm_edge * 16.0) + (signal.confidence * 2.0) + clinical_bonus + persistence_bonus - 0.75
+        valuation_bonus = valuation_gap * 3.0
+        base_weight = (pm_edge * 16.0) + (signal.confidence * 2.0) + clinical_bonus + persistence_bonus + valuation_bonus - 0.75
         scenario_bonus = {
             "pre-catalyst long": 2.0,
             "commercial compounder": 1.0,
             "pairs candidate": 0.25,
+            "pre-catalyst short": 1.75,
+            "science-vs-street short": 1.0,
+            "franchise de-rating short": 0.75,
             "watchlist only": 0.0,
             "avoid due to financing": 0.0,
         }
-        risk_discount = (signal.crowding_risk * 1.8) + (signal.financing_risk * 3.5)
+        crowding_penalty = signal.crowding_risk * (0.9 if short_scenario else 1.8)
+        risk_discount = crowding_penalty + (signal.financing_risk * 3.5)
         if signal.primary_event_bucket == "earnings":
             risk_discount += 0.75
         target_weight = max(
@@ -115,27 +172,33 @@ class PortfolioConstructor:
             target_weight = min(target_weight, 4.0)
         elif scenario == "pre-catalyst long":
             target_weight = min(target_weight, 4.0)
+        elif scenario == "pre-catalyst short":
+            target_weight = min(target_weight, 3.5)
+        elif scenario in {"science-vs-street short", "franchise de-rating short"}:
+            target_weight = min(target_weight, 2.5)
 
         # max_weight is the ceiling stored on the recommendation record.
         # Align to execution-layer limits so downstream readers aren't misled.
-        max_weight = 4.0
+        max_weight = 3.5 if short_scenario else 4.0
         if signal.crowding_risk > 0.75:
             max_weight = 2.5
         if signal.financing_risk > 0.75:
             max_weight = min(max_weight, 2.0)
 
+        stance = "short" if short_scenario and target_weight > 0 else "long" if target_weight > 0 else "avoid"
         target_weight = self._smooth_weight(
             raw_weight=min(target_weight, max_weight),
             previous_recommendation=previous_recommendation,
             signal=signal,
             previous_signal=previous_signal,
+            stance=stance,
         )
         target_weight = min(target_weight, max_weight)
 
         return PortfolioRecommendation(
             ticker=signal.ticker,
             as_of=signal.as_of,
-            stance="long" if target_weight > 0 else "avoid",
+            stance=stance if target_weight > 0 else "avoid",
             target_weight=round(target_weight, 2),
             max_weight=max_weight,
             confidence=round(signal.confidence, 3),
@@ -149,7 +212,7 @@ class PortfolioConstructor:
 
     def top_ideas(self, signals: list[SignalArtifact]) -> list[PortfolioRecommendation]:
         recommendations = [self.recommend(signal) for signal in signals]
-        return sorted(recommendations, key=lambda rec: (rec.target_weight, rec.confidence), reverse=True)
+        return sorted(recommendations, key=lambda rec: (rec.target_weight, rec.confidence, rec.stance == "short"), reverse=True)
 
     @staticmethod
     def _scenario(signal: SignalArtifact, empirical_edge: dict[str, float] | None = None) -> str:
@@ -158,6 +221,12 @@ class PortfolioConstructor:
         catalyst_setup = signal.setup_type in {"hard_catalyst", "soft_catalyst"} or (
             signal.setup_type is None and signal.primary_event_bucket in {"clinical", "regulatory"}
         )
+        near_term_exact_event = False
+        negative_gap = max(-(signal.internal_upside_pct or 0.0), 0.0)
+        if signal.primary_event_bucket in {"clinical", "regulatory"} and signal.primary_event_exact:
+            event_days = _days_to_event(signal.as_of, signal.primary_event_date)
+            if event_days is not None and event_days <= 120:
+                near_term_exact_event = True
         if signal.financing_risk > 0.80:
             return "avoid due to financing"
         if signal.company_state == "pre_commercial" and signal.setup_type == "asymmetry_without_near_term_catalyst":
@@ -168,9 +237,39 @@ class PortfolioConstructor:
             return "watchlist only"
         if (
             catalyst_setup
+            and signal.expected_return < -max(0.10, 0.14 - max(edge_tilt, 0.0))
+            and signal.catalyst_success_prob < min(0.48, 0.45 + max(-edge_score, 0.0) * 0.20)
+            and negative_gap >= 0.12
+            and signal.confidence >= 0.55
+            and (signal.thesis_horizon in {"30d", "90d"} or near_term_exact_event)
+        ):
+            return "pre-catalyst short"
+        if (
+            signal.company_state in {"commercial_launch", "commercialized"}
+            and negative_gap >= 0.50
+            and signal.expected_return < 0.14
+            and signal.catalyst_success_prob < 0.90
+            and signal.confidence >= 0.72
+        ):
+            return "science-vs-street short"
+        if (
+            signal.company_state in {"commercial_launch", "commercialized"}
+            and signal.expected_return < -(0.10 + max(-edge_tilt, 0.0) * 0.5)
+            and negative_gap >= 0.18
+            and signal.confidence >= 0.58
+        ):
+            return "franchise de-rating short"
+        if (
+            signal.expected_return < -(0.08 + max(-edge_tilt, 0.0) * 0.5)
+            and negative_gap >= 0.14
+            and signal.confidence >= 0.55
+        ):
+            return "science-vs-street short"
+        if (
+            catalyst_setup
             and signal.expected_return > max(0.11, 0.16 - max(edge_tilt, 0.0))
             and signal.catalyst_success_prob > max(0.47, 0.52 - max(edge_score, 0.0) * 0.20)
-            and signal.thesis_horizon in {"30d", "90d"}
+            and (signal.thesis_horizon in {"30d", "90d"} or near_term_exact_event)
         ):
             return "pre-catalyst long"
         if (
@@ -198,6 +297,8 @@ class PortfolioConstructor:
             flags.append("no hard catalyst yet")
         if (signal.internal_upside_pct or 0.0) < 0.0:
             flags.append("negative asymmetry")
+        if signal.expected_return < -0.08 and (signal.internal_upside_pct or 0.0) <= -0.12:
+            flags.append("science/street mismatch")
         if empirical_edge is not None:
             if empirical_edge["reliability"] >= 0.35 and empirical_edge["edge_score"] <= 0.02:
                 flags.append("weak historical archetype edge")
@@ -211,22 +312,37 @@ class PortfolioConstructor:
         previous_recommendation: PortfolioRecommendation | None,
         signal: SignalArtifact,
         previous_signal: SignalArtifact | None,
+        stance: str,
     ) -> float:
         if previous_recommendation is None:
             return PortfolioConstructor._quantize_weight(raw_weight)
 
+        if previous_recommendation.stance != stance:
+            return PortfolioConstructor._quantize_weight(raw_weight)
+
         prior_weight = max(previous_recommendation.target_weight, 0.0)
         if raw_weight <= 0.0:
-            if previous_signal is not None and previous_signal.expected_return > 0.05 and signal.confidence > 0.45:
+            previous_directional_edge = 0.0
+            if previous_signal is not None:
+                previous_directional_edge = (
+                    max(-previous_signal.expected_return, 0.0) if stance == "short" else max(previous_signal.expected_return, 0.0)
+                )
+            if previous_signal is not None and previous_directional_edge > 0.05 and signal.confidence > 0.45:
                 return PortfolioConstructor._quantize_weight(min(prior_weight, 0.75))
             return 0.0
 
+        previous_directional_edge = 0.0
+        current_directional_edge = max(-signal.expected_return, 0.0) if stance == "short" else max(signal.expected_return, 0.0)
+        if previous_signal is not None:
+            previous_directional_edge = (
+                max(-previous_signal.expected_return, 0.0) if stance == "short" else max(previous_signal.expected_return, 0.0)
+            )
         if (
             prior_weight >= 1.0
             and raw_weight < 1.0
             and previous_signal is not None
-            and previous_signal.expected_return > 0.06
-            and signal.expected_return > 0.04
+            and previous_directional_edge > 0.06
+            and current_directional_edge > 0.04
         ):
             floor_weight = max(1.0, prior_weight * 0.60)
             return PortfolioConstructor._quantize_weight(min(floor_weight, max(prior_weight, raw_weight)))
@@ -300,8 +416,10 @@ class PortfolioConstructor:
     def _validation_priors(self) -> dict[str, object]:
         if self.store is None:
             return {}
-        payload = self.store.read_latest_raw_payload("validation_audits", "latest_walkforward_audit")
-        if isinstance(payload, dict) and (
+        payload = load_best_validation_payload(self.store)
+        age_days = validation_payload_age_days(payload)
+        payload_is_fresh = age_days is None or age_days <= int(self.settings.validation_max_age_days)
+        if payload_is_fresh and isinstance(payload, dict) and (
             payload.get("setup_type_scorecards") or payload.get("company_state_scorecards") or payload.get("state_setup_scorecards")
         ):
             return payload
@@ -318,7 +436,11 @@ class PortfolioConstructor:
         rank_ic = _clamp(_coerce_float(metrics.get("rank_ic"), 0.0), -0.50, 0.50)
         hit_adj = _clamp(_coerce_float(metrics.get("hit_rate"), 0.50) - 0.50, -0.35, 0.35)
         spread = _clamp(_coerce_float(metrics.get("top_bottom_spread"), 0.0), -0.60, 0.60)
-        beta = _clamp(_coerce_float(metrics.get("mean_return_90d"), 0.0), -0.35, 0.35)
+        beta = _clamp(
+            _coerce_float(metrics.get("beta_adjusted_return", metrics.get("mean_return_90d")), 0.0),
+            -0.35,
+            0.35,
+        )
         edge_score = (rank_ic * 0.45) + (hit_adj * 0.35) + (spread * 0.15) + (beta * 0.05)
         reliability = min(1.0, rows / 30.0) * min(1.0, windows / 6.0)
         if rows < 8.0:
@@ -365,6 +487,7 @@ class PortfolioConstructor:
                 if len(group) > 1
                 else 0.0,
                 "mean_return_90d": float(group["target_return_90d"].mean()),
+                "beta_adjusted_return": float(group["target_return_90d"].mean()),
                 "calibrated_brier": float(((group["catalyst_success_prob"] - group["target_catalyst_success"]) ** 2).mean())
                 if "target_catalyst_success" in group
                 else 1.0,
@@ -491,7 +614,27 @@ def aggregate_signal(
     confidence = sum(pred.confidence * weight for pred, weight in zip(predictions, weights)) / weight_sum
     crowding_risk = sum(pred.crowding_risk * weight for pred, weight in zip(predictions, weights)) / weight_sum
     financing_risk = max(pred.financing_risk for pred in predictions)
-    horizon = Counter(pred.thesis_horizon for pred in predictions).most_common(1)[0][0]
+    event_ranked_predictions: list[tuple[float, int, int, str]] = []
+    for pred, weight in zip(predictions, weights):
+        status = str(pred.metadata.get("event_status") or "")
+        event_date = pred.metadata.get("event_expected_date")
+        event_days = _days_to_event(as_of, event_date)
+        event_priority = 2 if "exact" in status else 1 if status else 0
+        inferred_horizon = pred.thesis_horizon or _horizon_from_days(event_days)
+        if event_days is None:
+            event_days = 365
+        event_ranked_predictions.append(
+            (
+                event_priority,
+                -_horizon_rank(inferred_horizon),
+                -event_days,
+                inferred_horizon,
+            )
+        )
+    if event_ranked_predictions:
+        horizon = max(event_ranked_predictions)[3]
+    else:
+        horizon = Counter(pred.thesis_horizon for pred in predictions).most_common(1)[0][0]
     event_type_weights = Counter()
     for pred, weight in zip(predictions, weights):
         event_type = pred.metadata.get("event_type")

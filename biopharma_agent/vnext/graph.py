@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+import math
+import re
 from typing import Any
 
 from prepare import classify_phase, gather_company_data
@@ -17,7 +19,7 @@ from .entities import (
     Trial,
 )
 from .market_profile import update_snapshot_profile
-from .taxonomy import program_event_type_for_phase
+from .taxonomy import event_timing_priority, program_event_type_for_phase
 
 
 READOUT_KEYWORDS = (
@@ -31,6 +33,42 @@ READOUT_KEYWORDS = (
     "interim",
     "readout",
 )
+
+EVIDENCE_STOPWORDS = {
+    "biopharma",
+    "biotech",
+    "biosciences",
+    "company",
+    "corp",
+    "corporation",
+    "inc",
+    "medicine",
+    "medicines",
+    "pharma",
+    "pharmaceutical",
+    "pharmaceuticals",
+    "therapeutic",
+    "therapeutics",
+}
+
+GENERIC_INTERVENTION_NAMES = {
+    "no intervention",
+    "observation",
+    "observational",
+    "placebo",
+    "screening",
+    "standard of care",
+    "usual care",
+}
+
+GENERIC_PROGRAM_NAMES = {
+    "screening",
+    "unmapped-program",
+    *GENERIC_INTERVENTION_NAMES,
+}
+
+ASSET_CODE_RE = re.compile(r"\b[A-Z]{1,6}-[A-Z0-9]*\d[A-Z0-9]*\b")
+DOSAGE_FORM_RE = re.compile(r"\b\d+\s*mg\b|\boral tablet\b|\bintravenous\b|\bsubcutaneous\b", re.IGNORECASE)
 
 # Stale synthetic: a catalyst the model believes is upcoming, but an 8-K
 # suggests the trial read out recently.  We keep the event but push horizon
@@ -56,25 +94,86 @@ MODALITY_KEYWORDS = {
 }
 
 LOW_SIGNAL_TRIAL_KEYWORDS = (
+    "awareness",
+    "education",
+    "educational",
+    "implementation",
     "non interventional",
     "observational",
+    "natural history",
     "long-term follow-up",
     "long term follow-up",
+    "screening study",
+    "screening",
     "specimen collection",
     "expanded access",
     "registry",
     "follow-up study",
     "healthy volunteer",
     "healthy volunteers",
+    "patient survey",
+    "patient preferences",
+    "quality of life",
+    "quality-of-life",
+    "imaging",
+    "de-escalation",
+    "de escalation",
+    "pre-clinical stage",
+    "preclinical stage",
+    "questionnaire",
+    "peer educator",
+    "peer educators",
+    "school",
+)
+
+OBSERVATIONAL_OUTCOME_KEYWORDS = (
+    "acceptability",
+    "adherence",
+    "awareness",
+    "feasibility",
+    "implementation",
+    "number of participants",
+    "number of patients",
+    "prevalence",
+    "questionnaire",
+    "recruitment",
+    "screening",
+    "survey",
+    "uptake",
 )
 
 APPROVED_PRODUCT_REGISTRY = {
+    "AMGN": [
+        ("TAVNEOS (avacopan)", "ANCA-associated vasculitis"),
+    ],
     "APLS": [
         ("Syfovre", "geographic atrophy"),
         ("Empaveli", "PNH / C3 glomerulopathy"),
     ],
+    "ABBV": [
+        ("Skyrizi (risankizumab)", "Crohn's disease / plaque psoriasis"),
+        ("Venclexta (venetoclax)", "hematologic malignancies"),
+    ],
+    "BMRN": [
+        ("VOXZOGO", "achondroplasia"),
+        ("VIMIZIM", "Morquio A syndrome"),
+        ("NAGLAZYME", "MPS VI"),
+        ("PALYNZIQ", "phenylketonuria"),
+        ("ALDURAZYME", "MPS I"),
+        ("BRINEURA", "CLN2 disease"),
+        ("KUVAN", "phenylketonuria"),
+    ],
     "CRSP": [
         ("CASGEVY", "sickle cell disease / transfusion-dependent beta-thalassemia"),
+    ],
+    "EXAS": [
+        ("Cologuard", "colorectal cancer screening"),
+        ("Oncotype DX", "breast cancer recurrence testing"),
+    ],
+    "GILD": [
+        ("Sunlenca (lenacapavir)", "HIV-1 infection"),
+        ("Epclusa (sofosbuvir/velpatasvir)", "chronic hepatitis C"),
+        ("Tecartus (KTE-X19)", "B-cell malignancies"),
     ],
     "IOVA": [
         ("Amtagvi", "advanced melanoma"),
@@ -88,6 +187,204 @@ APPROVED_PRODUCT_REGISTRY = {
     "NVAX": [
         ("Nuvaxovid", "COVID-19"),
     ],
+    "PTCT": [
+        ("Sephience", "phenylketonuria"),
+    ],
+    "SRPT": [
+        ("ELEVIDYS", "Duchenne muscular dystrophy"),
+        ("EXONDYS 51", "Duchenne muscular dystrophy"),
+        ("VYONDYS 53", "Duchenne muscular dystrophy"),
+        ("AMONDYS 45", "Duchenne muscular dystrophy"),
+    ],
+}
+
+DRIVER_OVERRIDE_REGISTRY: dict[str, dict[str, Any]] = {
+    "APLS": {
+        "label": "Pending Biogen acquisition",
+        "indication": "$41 cash + CVR",
+        "effective_on": "2026-04-01",
+    },
+    "ARVN": {
+        "label": "vepdegestrant",
+        "indication": "ER+/HER2- advanced breast cancer",
+        "effective_on": "2026-02-01",
+    },
+    "NVAX": {
+        "label": "Matrix-M platform",
+        "indication": "partnered vaccines / Sanofi royalties",
+        "effective_on": "2025-10-07",
+    },
+    "PTCT": {
+        "label": "Sephience + votoplam",
+        "indication": "PKU / Huntington disease optionality",
+        "effective_on": "2025-07-29",
+    },
+}
+
+PRIMARY_INDICATION_OVERRIDES: dict[str, dict[str, Any]] = {
+    "ARVN": {"value": "Advanced Breast Cancer", "effective_on": "2026-02-01"},
+    "NVAX": {"value": "partnered vaccine platform", "effective_on": "2025-10-07"},
+    "PTCT": {"value": "Phenylketonuria", "effective_on": "2025-07-29"},
+}
+
+COMPANY_STATE_OVERRIDES: dict[str, dict[str, Any]] = {
+    "ARVN": {"value": "pre_commercial", "effective_on": "2026-02-01"},
+}
+
+SPECIAL_SITUATION_OVERRIDES: dict[str, dict[str, Any]] = {
+    "APLS": {
+        "value": "pending_transaction",
+        "label": "pending transaction",
+        "reason": "Announced Biogen acquisition caps standalone upside largely to the cash consideration, CVR, and deal spread.",
+        "effective_on": "2026-04-01",
+        "expires_on": "2026-09-22",
+    },
+    "NVAX": {
+        "value": "partnered_royalty_transition",
+        "label": "partnered royalty transition",
+        "reason": "Commercial economics are shifting toward Sanofi-led milestones and Matrix-M royalties rather than a standalone vaccine launch.",
+        "effective_on": "2025-10-07",
+    },
+    "ARVN": {
+        "value": "partner_search_overhang",
+        "label": "partner search overhang",
+        "reason": (
+            "Arvinas and Pfizer are seeking a third-party commercialization partner for vepdegestrant after the "
+            "VERITAC-2 program supported a narrower ESR1-mutant opportunity and commercialization roles were reduced."
+        ),
+        "effective_on": "2025-09-17",
+        "risk_flags": [
+            "seeking third-party commercialization partner for vepdegestrant",
+            "VERITAC-2 missed PFS significance in the overall intent-to-treat population",
+            "commercial workforce was reduced after pipeline reprioritization",
+        ],
+        "confidence_haircut": 0.78,
+        "expected_return_haircut": 0.65,
+        "catalyst_success_prob_haircut": 0.88,
+    },
+    "AMGN": {
+        "value": "regulatory_overhang",
+        "label": "TAVNEOS regulatory overhang",
+        "reason": (
+            "FDA requested voluntary withdrawal of TAVNEOS (avacopan) in January 2026 and Amgen has refused, "
+            "leaving a live regulatory overhang on the franchise."
+        ),
+        "effective_on": "2026-01-16",
+        "risk_flags": [
+            "FDA requested voluntary TAVNEOS withdrawal in January 2026",
+            "avacopan now carries regulatory dispute risk, not just routine commercial execution risk",
+        ],
+    },
+}
+
+CURATED_EVENT_OVERRIDES: dict[str, list[dict[str, Any]]] = {
+    "APLS": [
+        {
+            "event_type": "strategic_transaction",
+            "title": "Biogen acquisition agreement pending under merger terms",
+            "expected_date": "2026-09-22",
+            "probability": 0.90,
+            "importance": 0.98,
+            "crowdedness": 0.18,
+            "status": "guided_company_event",
+            "source": "company_curated",
+            "effective_on": "2026-04-01",
+            "expires_on": "2026-09-22",
+        }
+    ],
+    "ARVN": [
+        {
+            "event_type": "pdufa",
+            "title": "Vepdegestrant PDUFA decision in ER+/HER2- metastatic breast cancer",
+            "expected_date": "2026-06-05",
+            "probability": 0.88,
+            "importance": 0.98,
+            "crowdedness": 0.42,
+            "status": "exact_company_calendar",
+            "source": "company_curated",
+            "effective_on": "2026-02-01",
+        }
+    ],
+}
+
+PROGRAM_CURATION_RULES: dict[str, list[dict[str, Any]]] = {
+    "ARVN": [
+        {
+            "match_any": ("vepdegestrant", "arv-471", "pf-07850327"),
+            "name": "vepdegestrant",
+            "conditions": ["ER+/HER2- advanced or metastatic breast cancer with ESR1 mutation"],
+        },
+    ],
+    "AMGN": [
+        {
+            "match_any": ("familial hypercholesterolemia canada", "hypercholesterolemie familiale canada"),
+            "exclude": True,
+        },
+        {
+            "match_any": ("rocatinlimab",),
+            "name": "Rocatinlimab",
+            "phase": "PHASE3",
+            "conditions": ["Moderate-to-severe atopic dermatitis"],
+        },
+        {
+            "match_any": ("avacopan", "tavneos"),
+            "name": "Avacopan",
+            "phase": "APPROVED",
+            "conditions": ["Antineutrophil Cytoplasmic Antibody-associated Vasculitis"],
+        },
+    ],
+    "GILD": [
+        {"match_any": ("dolutegravir", "tivicay"), "exclude": True},
+        {"match_any": ("digital health coaching program", "hiv team implementation", "prep awareness and uptake educational program"), "exclude": True},
+        {
+            "match_any": ("sofosbuvir/velpatasvir", "epclusa"),
+            "name": "Sofosbuvir/Velpatasvir",
+            "phase": "APPROVED",
+            "conditions": ["Chronic hepatitis C"],
+        },
+        {
+            "match_any": ("lenacapavir", "sunlenca"),
+            "name": "Lenacapavir",
+            "phase": "APPROVED",
+            "conditions": ["HIV-1 infection"],
+        },
+        {
+            "match_any": ("kte-x19", "tecartus"),
+            "name": "KTE-X19",
+            "conditions": [
+                "Relapsed/Refractory Mantle Cell Lymphoma",
+                "Relapsed/Refractory B-precursor Acute Lymphoblastic Leukemia",
+            ],
+        },
+    ],
+    "EXAS": [
+        {"match_any": ("study ct/mri imaging", "patient survey", "de-escalation"), "exclude": True},
+        {
+            "match_any": ("cologuard",),
+            "name": "Cologuard",
+            "phase": "APPROVED",
+            "conditions": ["Colorectal cancer screening"],
+        },
+        {
+            "match_any": ("mrd", "ctdna", "b-64"),
+            "name": "ctDNA MRD platform",
+            "phase": "APPROVED",
+            "conditions": ["Molecular residual disease monitoring"],
+        },
+    ],
+    "ABBV": [
+        {
+            "match_any": (
+                "the ccp study: coordinated programme to prevent arthritis",
+                "quality of life of risankizumab",
+            ),
+            "exclude": True,
+        },
+        {"match_any": ("risankizumab", "skyrizi"), "name": "Risankizumab", "phase": "APPROVED"},
+    ],
+    "EDIT": [
+        {"match_any": ("safety and efficacy assessments",), "exclude": True},
+    ],
 }
 
 PHASE_HORIZONS = {
@@ -97,6 +394,18 @@ PHASE_HORIZONS = {
     "PHASE2": 180,
     "PHASE1": 270,
     "EARLY_PHASE1": 360,
+}
+
+TRIAL_STATUS_PRIORITY = {
+    "ACTIVE_NOT_RECRUITING": 1.00,
+    "RECRUITING": 0.96,
+    "ENROLLING_BY_INVITATION": 0.90,
+    "NOT_YET_RECRUITING": 0.82,
+    "COMPLETED": 0.62,
+    "AVAILABLE": 0.58,
+    "SUSPENDED": 0.18,
+    "WITHDRAWN": 0.05,
+    "TERMINATED": 0.0,
 }
 
 
@@ -126,6 +435,293 @@ def infer_runway_months(revenue: float, cash: float, debt: float, num_trials: in
     return min((net_cash / net_burn) * 12.0, 120.0)
 
 
+def _trial_status_priority(status: str) -> float:
+    return TRIAL_STATUS_PRIORITY.get(str(status or "").upper(), 0.45)
+
+
+def _trial_endpoint_priority(primary_outcomes: list[str]) -> float:
+    outcome_text = " ".join(str(item or "") for item in primary_outcomes).lower()
+    if any(marker in outcome_text for marker in ("overall survival", "death from any")):
+        return 0.95
+    if any(marker in outcome_text for marker in ("progression-free survival", "event-free survival", "relapse-free")):
+        return 0.82
+    if any(marker in outcome_text for marker in ("hemoglobin", "vaso-occlusive", "transfusion independence", "bleed")):
+        return 0.84
+    if any(marker in outcome_text for marker in ("forced expiratory", "lung function", "forced vital capacity", "fev1")):
+        return 0.78
+    if any(marker in outcome_text for marker in ("functional independence", "activities of daily living", "disability")):
+        return 0.65
+    if any(marker in outcome_text for marker in ("objective response", "response rate", "complete response", "partial response")):
+        return 0.52
+    if any(marker in outcome_text for marker in ("pharmacokinetic", "pharmacodynamic", "biomarker", "dose-limiting")):
+        return 0.30
+    if any(marker in outcome_text for marker in ("safety", "adverse", "tolerability", "maximum tolerated")):
+        return 0.25
+    return 0.42
+
+
+def _trial_scientific_priority(trial: Trial) -> tuple[float, float, float, float, float]:
+    title = str(trial.title or "").lower()
+    phase_score = PHASE_BASE.get(trial.phase, 0.01)
+    endpoint_score = _trial_endpoint_priority(trial.primary_outcomes)
+    status_score = _trial_status_priority(trial.status)
+    pivotal_bonus = 0.08 if any(marker in title for marker in ("pivotal", "registrational")) else 0.0
+    extension_penalty = -0.12 if any(marker in title for marker in ("extension", "follow-up", "follow up")) else 0.0
+    enrollment_score = math.log10(max(int(trial.enrollment or 0), 0) + 1.0)
+    return (
+        phase_score + pivotal_bonus + extension_penalty,
+        status_score,
+        endpoint_score,
+        enrollment_score,
+        float(len(trial.primary_outcomes)),
+    )
+
+
+def select_lead_trial(program: Program) -> Trial | None:
+    if not program.trials:
+        return None
+    program_phase_score = PHASE_BASE.get(program.phase, 0.01)
+    return max(
+        program.trials,
+        key=lambda trial: (
+            -abs(PHASE_BASE.get(trial.phase, 0.01) - program_phase_score),
+            *_trial_scientific_priority(trial),
+        ),
+    )
+
+
+def _evidence_tokens(*values: str) -> set[str]:
+    tokens: set[str] = set()
+    for value in values:
+        for token in re.findall(r"[a-z0-9][a-z0-9-]{1,}", str(value or "").lower()):
+            normalized = token.strip("-")
+            if normalized in EVIDENCE_STOPWORDS:
+                continue
+            if len(normalized) >= 4 or any(ch.isdigit() for ch in normalized):
+                tokens.add(normalized)
+    return tokens
+
+
+def _normalize_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _clean_intervention_name(name: str) -> str:
+    cleaned = re.sub(r"^(placebo|standard of care)\s+(for|plus)\s+", "", str(name or "").strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -")
+    return cleaned or str(name or "").strip()
+
+
+def _curation_rule_for(ticker: str, *values: Any) -> dict[str, Any] | None:
+    text = " ".join(_normalize_text(value) for value in values if value).strip()
+    if not text:
+        return None
+    for rule in PROGRAM_CURATION_RULES.get(ticker.upper(), []):
+        if any(str(token).lower() in text for token in rule.get("match_any", ())):
+            return rule
+    return None
+
+
+def _extract_asset_code(*values: str) -> str | None:
+    for value in values:
+        match = ASSET_CODE_RE.search(str(value or "").upper())
+        if match:
+            return match.group(0)
+    return None
+
+
+def _is_generic_intervention(name: str) -> bool:
+    normalized = " ".join(str(name or "").strip().lower().split())
+    if not normalized:
+        return True
+    if normalized in GENERIC_INTERVENTION_NAMES:
+        return True
+    return any(marker in normalized for marker in ("placebo", "standard of care"))
+
+
+def _normalize_trial_phase(phase_list: list[str]) -> str:
+    joined = " ".join(str(item or "") for item in phase_list).upper()
+    if "PHASE4" in joined or "PHASE 4" in joined:
+        return "APPROVED"
+    return classify_phase(phase_list)
+
+
+def _derive_program_name(trial: dict[str, Any]) -> str:
+    title = str(trial.get("title") or "").strip()
+    interventions = [_clean_intervention_name(str(item).strip()) for item in trial.get("interventions", []) if str(item or "").strip()]
+
+    asset_code = _extract_asset_code(*interventions, title)
+    if asset_code:
+        return asset_code
+
+    for candidate in interventions:
+        if _is_generic_intervention(candidate):
+            continue
+        if len(candidate) <= 80:
+            return candidate
+
+    return title or "unmapped-program"
+
+
+def _program_match_tokens(program: Program) -> tuple[set[str], set[str], set[str]]:
+    program_tokens = _evidence_tokens(program.name)
+    condition_tokens = _evidence_tokens(" ".join(program.conditions))
+    trial_tokens = _evidence_tokens(
+        " ".join(trial.title for trial in program.trials),
+        " ".join(" ".join(trial.interventions) for trial in program.trials),
+        " ".join(" ".join(trial.primary_outcomes) for trial in program.trials),
+    )
+    return program_tokens, condition_tokens, trial_tokens
+
+
+def select_program_evidence(
+    program: Program,
+    snapshot: CompanySnapshot | None = None,
+    *,
+    evidence_pool: list[EvidenceSnippet] | None = None,
+    limit: int = 3,
+) -> list[EvidenceSnippet]:
+    candidates = list(evidence_pool if evidence_pool is not None else (snapshot.evidence if snapshot is not None else []))
+    if not candidates:
+        return []
+    program_tokens, condition_tokens, trial_tokens = _program_match_tokens(program)
+    normalized_program_name = re.sub(r"[^a-z0-9]+", "", str(program.name or "").lower())
+    scored: list[tuple[float, float, EvidenceSnippet]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for snippet in candidates:
+        text = " ".join(
+            [
+                str(snippet.title or ""),
+                str(snippet.excerpt or ""),
+                str(snippet.source_id or ""),
+                str(snippet.url or ""),
+            ]
+        ).lower()
+        text_tokens = _evidence_tokens(text)
+        normalized_text = re.sub(r"[^a-z0-9]+", "", text)
+        shared_program = len(program_tokens & text_tokens)
+        shared_condition = len(condition_tokens & text_tokens)
+        shared_trial = len(trial_tokens & text_tokens)
+        score = (shared_program * 3.0) + (shared_condition * 2.0) + (shared_trial * 1.5)
+        if normalized_program_name and normalized_program_name in normalized_text:
+            score += 4.0
+        if str(snippet.source or "") == "pubmed" and shared_program <= 0 and normalized_program_name not in normalized_text:
+            continue
+        if score <= 0.0:
+            continue
+        dedupe_key = (str(snippet.source), str(snippet.source_id), str(snippet.title))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        scored.append((score, float(snippet.confidence or 0.0), snippet))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item[2] for item in scored[:limit]]
+
+
+def canonical_program_name(program: Program) -> str:
+    overlay = curated_program_overlay(program)
+    if overlay.get("exclude"):
+        return str(program.name or "").strip() or "unmapped-program"
+    if overlay.get("name"):
+        return str(overlay["name"])
+    asset_code = _extract_asset_code(program.name)
+    if asset_code:
+        return asset_code
+    lead_trial = select_lead_trial(program)
+    if lead_trial is not None:
+        trial_code = _extract_asset_code(
+            lead_trial.title,
+            " ".join(lead_trial.interventions),
+        )
+        if trial_code:
+            return trial_code
+    name = str(program.name or "").strip()
+    if name:
+        return name
+    if lead_trial is not None and lead_trial.title:
+        return str(lead_trial.title)
+    return "unmapped-program"
+
+
+def select_company_evidence(
+    snapshot: CompanySnapshot,
+    *,
+    evidence_pool: list[EvidenceSnippet] | None = None,
+    limit: int = 5,
+) -> list[EvidenceSnippet]:
+    candidates = list(evidence_pool if evidence_pool is not None else snapshot.evidence)
+    if not candidates:
+        return []
+
+    company_tokens = _evidence_tokens(snapshot.company_name, str(snapshot.metadata.get("driver_label") or ""))
+    ticker_token = str(snapshot.ticker or "").lower().strip()
+    if len(ticker_token) >= 3:
+        company_tokens.add(ticker_token)
+    program_tokens: set[str] = set()
+    condition_tokens: set[str] = set()
+    for program in snapshot.programs:
+        program_tokens.update(_evidence_tokens(canonical_program_name(program), program.name))
+        condition_tokens.update(_evidence_tokens(" ".join(program.conditions)))
+    for product in snapshot.approved_products:
+        program_tokens.update(_evidence_tokens(product.name, product.indication))
+
+    scored: list[tuple[float, float, EvidenceSnippet]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for snippet in candidates:
+        text = " ".join(
+            [
+                str(snippet.title or ""),
+                str(snippet.excerpt or ""),
+                str(snippet.source_id or ""),
+                str(snippet.url or ""),
+            ]
+        ).lower()
+        text_tokens = _evidence_tokens(text)
+        shared_company = len(company_tokens & text_tokens)
+        shared_program = len(program_tokens & text_tokens)
+        shared_condition = len(condition_tokens & text_tokens)
+        score = (shared_company * 2.5) + (shared_program * 3.0) + (shared_condition * 1.5)
+        source = str(snippet.source or "")
+        if source == "pubmed" and shared_company <= 0 and shared_program <= 0:
+            continue
+        if source == "sec":
+            score += 5.0
+        elif source in {"eodhd_news", "external_event", "company_curated", "press_release"}:
+            score += 2.5
+        elif source == "pubmed" and score <= 0.0:
+            continue
+        if score <= 0.0:
+            continue
+        dedupe_key = (str(snippet.source), str(snippet.source_id), str(snippet.title))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        scored.append((score, float(snippet.confidence or 0.0), snippet))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item[2] for item in scored[:limit]]
+
+
+def refresh_program_evidence(snapshot: CompanySnapshot, limit: int = 3) -> CompanySnapshot:
+    if not snapshot.programs or not snapshot.evidence:
+        return snapshot
+    for program in snapshot.programs:
+        matched = select_program_evidence(program, snapshot, evidence_pool=snapshot.evidence, limit=limit)
+        if matched:
+            program.evidence = matched
+    return snapshot
+
+
+def refresh_snapshot_evidence(
+    snapshot: CompanySnapshot,
+    *,
+    company_limit: int = 5,
+    program_limit: int = 3,
+) -> CompanySnapshot:
+    if snapshot.evidence:
+        snapshot.evidence = select_company_evidence(snapshot, evidence_pool=snapshot.evidence, limit=company_limit)
+    return refresh_program_evidence(snapshot, limit=program_limit)
+
+
 def _trial_text(trial: Trial) -> str:
     return " ".join(
         item
@@ -133,6 +729,7 @@ def _trial_text(trial: Trial) -> str:
             trial.title,
             " ".join(trial.conditions),
             " ".join(trial.interventions),
+            " ".join(trial.primary_outcomes),
         ]
         if item
     ).lower()
@@ -140,7 +737,68 @@ def _trial_text(trial: Trial) -> str:
 
 def _is_low_signal_trial(trial: Trial) -> bool:
     text = _trial_text(trial)
-    return any(keyword in text for keyword in LOW_SIGNAL_TRIAL_KEYWORDS)
+    if any(keyword in text for keyword in LOW_SIGNAL_TRIAL_KEYWORDS):
+        return True
+
+    has_asset_code = bool(_extract_asset_code(trial.title, " ".join(trial.interventions)))
+    has_specific_intervention = any(not _is_generic_intervention(item) for item in trial.interventions)
+    outcome_text = " ".join(str(item or "") for item in trial.primary_outcomes).lower()
+    title_text = str(trial.title or "").lower()
+
+    if not has_specific_intervention and not has_asset_code:
+        if any(keyword in outcome_text for keyword in OBSERVATIONAL_OUTCOME_KEYWORDS):
+            return True
+        if any(keyword in title_text for keyword in ("natural history", "registry", "screening", "awareness", "implementation")):
+            return True
+    return False
+
+
+def is_low_signal_program(program: Program) -> bool:
+    overlay = curated_program_overlay(program)
+    if overlay.get("exclude"):
+        return True
+    name_text = str(program.name or "").strip().lower()
+    if not name_text:
+        return True
+    if name_text in GENERIC_PROGRAM_NAMES:
+        return True
+    if name_text.startswith("study "):
+        return True
+    if DOSAGE_FORM_RE.search(name_text) and not _extract_asset_code(program.name):
+        return True
+    if any(keyword in name_text for keyword in ("awareness", "education", "educational", "implementation", "screening")):
+        return True
+    if any(
+        keyword in name_text
+        for keyword in (
+            "patient survey",
+            "patient preferences",
+            "quality of life",
+            "questionnaire",
+            "imaging",
+            "de-escalation",
+            "de escalation",
+            "pre-clinical stage",
+            "preclinical stage",
+        )
+    ):
+        return True
+    lead_trial = select_lead_trial(program)
+    if lead_trial is None:
+        return True
+    return _is_low_signal_trial(lead_trial)
+
+
+def curated_program_overlay(program: Program) -> dict[str, Any]:
+    ticker = str(program.program_id or "").split(":", 1)[0].upper()
+    lead_trial = select_lead_trial(program)
+    return _curation_rule_for(
+        ticker,
+        program.name,
+        " ".join(program.conditions),
+        lead_trial.title if lead_trial is not None else "",
+        " ".join(lead_trial.interventions) if lead_trial is not None else "",
+    ) or {}
 
 
 def _program_catalyst_title(program_name: str, phase: str, conditions: list[str]) -> str:
@@ -173,6 +831,135 @@ def _approved_products_for_company(ticker: str, revenue: float, growth_signal: f
         )
         for index, (name, indication) in enumerate(registered, start=1)
     ]
+
+
+def _parse_override_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    if "T" not in normalized:
+        normalized = f"{normalized}T00:00:00+00:00"
+    elif normalized.endswith("Z"):
+        normalized = normalized.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _override_is_active(config: dict[str, Any] | None, as_of: datetime) -> bool:
+    if not config:
+        return False
+    reference = as_of.astimezone(timezone.utc) if as_of.tzinfo is not None else as_of.replace(tzinfo=timezone.utc)
+    start = _parse_override_datetime(str(config.get("effective_on") or "")) if config.get("effective_on") else None
+    end = _parse_override_datetime(str(config.get("expires_on") or "")) if config.get("expires_on") else None
+    if start is not None and reference < start:
+        return False
+    if end is not None and reference > end:
+        return False
+    return True
+
+
+def _sort_catalyst_events(events: list[CatalystEvent]) -> list[CatalystEvent]:
+    return sorted(
+        events,
+        key=lambda event: (
+            -event_timing_priority(event.status, event.expected_date, event.title),
+            -event.importance,
+            event.horizon_days,
+            event.crowdedness,
+        ),
+    )
+
+
+def apply_curated_company_overrides(snapshot: CompanySnapshot, as_of: datetime | None = None) -> CompanySnapshot:
+    as_of = as_of or _parse_override_datetime(snapshot.as_of) or datetime.now(timezone.utc)
+    ticker = snapshot.ticker.upper()
+
+    if not snapshot.approved_products:
+        snapshot.approved_products = _approved_products_for_company(ticker, snapshot.revenue, float(snapshot.momentum_3mo or 0.0))
+    snapshot.metadata["approved_product_registry_hit"] = bool(snapshot.approved_products)
+
+    state_override = COMPANY_STATE_OVERRIDES.get(ticker)
+    if _override_is_active(state_override, as_of):
+        snapshot.metadata["company_state_override"] = str(state_override["value"])
+
+    indication_override = PRIMARY_INDICATION_OVERRIDES.get(ticker)
+    if _override_is_active(indication_override, as_of):
+        snapshot.metadata["primary_indication_override"] = str(indication_override["value"])
+
+    driver_override = DRIVER_OVERRIDE_REGISTRY.get(ticker)
+    if _override_is_active(driver_override, as_of):
+        snapshot.metadata["driver_label"] = str(driver_override["label"])
+        snapshot.metadata["driver_indication"] = str(driver_override.get("indication") or "")
+
+    special_override = SPECIAL_SITUATION_OVERRIDES.get(ticker)
+    if _override_is_active(special_override, as_of):
+        snapshot.metadata["special_situation"] = str(special_override["value"])
+        snapshot.metadata["special_situation_label"] = str(special_override.get("label") or str(special_override["value"]).replace("_", " "))
+        snapshot.metadata["special_situation_reason"] = str(special_override.get("reason") or "")
+        snapshot.metadata["bear_case_flags"] = list(special_override.get("risk_flags") or [])
+        if special_override.get("confidence_haircut") is not None:
+            snapshot.metadata["confidence_haircut"] = float(special_override["confidence_haircut"])
+        if special_override.get("expected_return_haircut") is not None:
+            snapshot.metadata["expected_return_haircut"] = float(special_override["expected_return_haircut"])
+        if special_override.get("catalyst_success_prob_haircut") is not None:
+            snapshot.metadata["catalyst_success_prob_haircut"] = float(special_override["catalyst_success_prob_haircut"])
+        special_title = f"{ticker} special situation: {snapshot.metadata['special_situation_label']}"
+        if not any(str(item.source_id or "") == f"{ticker}:special:{special_override['value']}" for item in snapshot.evidence):
+            snapshot.evidence.append(
+                EvidenceSnippet(
+                    source="company_curated",
+                    source_id=f"{ticker}:special:{special_override['value']}",
+                    title=special_title,
+                    excerpt=str(special_override.get("reason") or ""),
+                    as_of=str(special_override.get("effective_on") or snapshot.as_of),
+                    confidence=0.82,
+                )
+            )
+
+    existing_keys = {
+        (event.event_type, event.expected_date, event.title)
+        for event in snapshot.catalyst_events
+    }
+    for override in CURATED_EVENT_OVERRIDES.get(ticker, []):
+        if not _override_is_active(override, as_of):
+            continue
+        key = (str(override["event_type"]), str(override["expected_date"]), str(override["title"]))
+        if key in existing_keys:
+            continue
+        expected_at = _parse_override_datetime(str(override["expected_date"]))
+        if expected_at is None:
+            continue
+        reference = as_of.astimezone(timezone.utc) if as_of.tzinfo is not None else as_of.replace(tzinfo=timezone.utc)
+        horizon_days = max((expected_at.date() - reference.date()).days, 0)
+        snapshot.catalyst_events.append(
+            CatalystEvent(
+                event_id=f"{ticker}:curated:{override['event_type']}:{override['expected_date']}",
+                program_id=None,
+                event_type=str(override["event_type"]),
+                title=str(override["title"]),
+                expected_date=str(override["expected_date"]),
+                horizon_days=horizon_days,
+                probability=float(override.get("probability", 0.8) or 0.8),
+                importance=float(override.get("importance", 0.75) or 0.75),
+                crowdedness=float(override.get("crowdedness", 0.3) or 0.3),
+                status=str(override.get("status") or "guided_company_event"),
+                source=str(override.get("source") or "company_curated"),
+                timing_exact=str(override.get("status") or "").startswith("exact"),
+                timing_synthetic=False,
+            )
+        )
+        existing_keys.add(key)
+
+    if snapshot.catalyst_events:
+        snapshot.catalyst_events = _sort_catalyst_events(snapshot.catalyst_events)
+    return snapshot
 
 
 def _build_catalyst(
@@ -309,6 +1096,7 @@ def _flag_stale_catalysts(
 
 def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -> CompanySnapshot:
     as_of = as_of or datetime.now(timezone.utc)
+    ticker = str(raw.get("ticker") or "").upper()
     finance = raw.get("finance", {})
     trials_by_program: dict[str, list[Trial]] = defaultdict(list)
     conditions_by_program: dict[str, set[str]] = defaultdict(set)
@@ -326,15 +1114,29 @@ def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -
         )
 
     for trial in raw.get("trials", []):
-        interventions = [item for item in trial.get("interventions", []) if item]
-        program_name = interventions[0] if interventions else (trial.get("title") or "unmapped-program")
-        phase = classify_phase(trial.get("phase", []))
+        interventions = [_clean_intervention_name(item) for item in trial.get("interventions", []) if item]
+        program_name = _derive_program_name(trial)
+        rule = _curation_rule_for(
+            ticker,
+            program_name,
+            trial.get("title"),
+            " ".join(interventions),
+            " ".join(trial.get("conditions", [])),
+        )
+        if rule and rule.get("exclude"):
+            continue
+        if rule and rule.get("name"):
+            program_name = str(rule["name"])
+        phase = _normalize_trial_phase(list(trial.get("phase", [])))
+        if rule and rule.get("phase"):
+            phase = str(rule["phase"])
+        conditions = list(rule.get("conditions") or trial.get("conditions", [])) if rule else list(trial.get("conditions", []))
         trial_entity = Trial(
             trial_id=trial.get("nct_id") or program_name,
             title=trial.get("title") or program_name,
             phase=phase,
             status=trial.get("overall_status") or "UNKNOWN",
-            conditions=list(trial.get("conditions", [])),
+            conditions=conditions,
             interventions=interventions,
             enrollment=int(trial.get("enrollment") or 0),
             primary_outcomes=list(trial.get("primary_outcomes", [])),
@@ -351,8 +1153,13 @@ def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -
         text = f"{program_name} {' '.join(conditions_by_program[program_name])} {finance.get('description') or ''}"
         modality = infer_modality(text)
         phase = max(program_trials, key=lambda item: PHASE_BASE.get(item.phase, 0.01)).phase
+        rule = _curation_rule_for(ticker, program_name, " ".join(conditions_by_program[program_name]))
+        if rule and rule.get("exclude"):
+            continue
+        if rule and rule.get("phase"):
+            phase = str(rule["phase"])
         pos_prior = min(0.99, PHASE_BASE.get(phase, 0.07) + min(len(program_trials) * 0.03, 0.12))
-        conditions = sorted(conditions_by_program[program_name])
+        conditions = sorted(rule.get("conditions") or conditions_by_program[program_name]) if rule else sorted(conditions_by_program[program_name])
         tam_estimate = float(_estimate_indication_tam(conditions))
 
         program_catalysts = [
@@ -376,13 +1183,24 @@ def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -
                 modality=modality,
                 phase=phase,
                 conditions=conditions,
-                trials=sorted(program_trials, key=lambda item: item.enrollment, reverse=True),
+                trials=sorted(program_trials, key=_trial_scientific_priority, reverse=True),
                 pos_prior=pos_prior,
                 tam_estimate=tam_estimate,
                 catalyst_events=program_catalysts,
                 evidence=evidence[:3],
             )
         )
+
+    programs.sort(
+        key=lambda program: (
+            -PHASE_BASE.get(program.phase, 0.0),
+            -program.tam_estimate,
+            -program.pos_prior,
+            -len(program.trials),
+            -sum(max(trial.enrollment or 0, 0) for trial in program.trials),
+            program.name,
+        )
+    )
 
     revenue = float(finance.get("totalRevenue") or 0.0)
     growth_signal = float(finance.get("momentum_3mo") or 0.0)
@@ -472,6 +1290,8 @@ def build_company_snapshot(raw: dict[str, Any], as_of: datetime | None = None) -
         evidence=evidence,
         metadata=snapshot_metadata,
     )
+    snapshot = refresh_snapshot_evidence(snapshot)
+    snapshot = apply_curated_company_overrides(snapshot, as_of=as_of)
     return update_snapshot_profile(snapshot)
 
 

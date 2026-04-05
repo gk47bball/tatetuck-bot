@@ -87,7 +87,7 @@ INDICATION_LANDSCAPES: list[tuple[tuple[str, ...], dict[str, Any]]] = [
     ),
 ]
 
-HARD_CATALYST_TYPES = {"phase1_readout", "phase2_readout", "phase3_readout", "pdufa", "clinical_readout"}
+HARD_CATALYST_TYPES = {"phase1_readout", "phase2_readout", "phase3_readout", "pdufa", "adcom", "clinical_readout"}
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -104,6 +104,11 @@ def _all_conditions(snapshot: CompanySnapshot) -> list[str]:
 
 
 def primary_indication(snapshot: CompanySnapshot) -> str:
+    override = str(snapshot.metadata.get("primary_indication_override") or "").strip()
+    if override:
+        return override
+    if snapshot.approved_products and classify_company_state(snapshot) in {"commercial_launch", "commercialized"}:
+        return str(snapshot.approved_products[0].indication or "unspecified")
     conditions = _all_conditions(snapshot)
     if conditions:
         return max(set(conditions), key=lambda item: (conditions.count(item), len(item)))
@@ -129,6 +134,9 @@ def competitive_landscape(indication: str) -> dict[str, Any]:
 
 
 def classify_company_state(snapshot: CompanySnapshot) -> str:
+    override = str(snapshot.metadata.get("company_state_override") or "").strip()
+    if override in {"pre_commercial", "commercial_launch", "commercialized"}:
+        return override
     approved_products = len(snapshot.approved_products)
     revenue = float(snapshot.revenue or 0.0)
     if approved_products <= 0 and revenue < 75_000_000:
@@ -186,6 +194,15 @@ def build_snapshot_profile(snapshot: CompanySnapshot) -> dict[str, Any]:
         "commercial_launch": "The core question is whether launch velocity, lifecycle expansion, and competitive positioning can beat expectations.",
         "commercialized": "The core question is franchise durability plus pipeline, BD/M&A, and capital deployment optionality.",
     }[state]
+    special_situation = str(snapshot.metadata.get("special_situation") or "")
+    if special_situation == "pending_transaction":
+        state_focus = "The core question is closing certainty and deal-spread capture rather than standalone product execution."
+    elif special_situation == "partnered_royalty_transition":
+        state_focus = "The core question is how much value now comes from partner-led milestones and royalties rather than a standalone commercial franchise."
+    elif special_situation == "partner_search_overhang":
+        state_focus = "The core question is whether the catalyst still matters once partner appetite, commercial ownership, and subgroup breadth are stress-tested."
+    elif special_situation == "regulatory_overhang":
+        state_focus = "The core question is whether the franchise can absorb an active regulatory dispute without a lasting de-rating."
 
     return {
         "company_state": state,
@@ -245,6 +262,14 @@ def classify_setup_type(
         and primary_event.horizon_days <= 180
     ):
         return "soft_catalyst"
+    if (
+        event_bucket == "strategic"
+        and primary_event is not None
+        and primary_event.horizon_days <= 180
+        and not is_synthetic_event(event_status, primary_event.title if primary_event is not None else None)
+        and state in {"commercial_launch", "commercialized"}
+    ):
+        return "capital_allocation"
     if state == "commercial_launch":
         return "launch_asymmetry"
     if state == "commercialized" and float(profile.get("capital_deployment_score", 0.0) or 0.0) >= 0.55:
@@ -406,6 +431,8 @@ def build_expectation_lens(
         market_view += " The current downside is partly cushioned by balance-sheet and franchise support."
     if setup_type in {"hard_catalyst", "soft_catalyst"}:
         market_view += " A meaningful event window still matters to closing the gap."
+    if setup_type == "capital_allocation" and event_type_bucket(primary_event.event_type if primary_event is not None else signal.primary_event_type) == "strategic":
+        market_view += " A meaningful strategic event window still matters to closing the gap."
 
     asymmetry_summary = (
         f"Peer-anchored value view is {internal_upside_pct * 100:+.1f}% versus current market cap; "

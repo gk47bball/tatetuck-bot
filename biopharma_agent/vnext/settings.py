@@ -28,6 +28,9 @@ class VNextSettings:
     store_dir: str = ".tatetuck_store"
     eodhd_api_key: str | None = None
     sec_user_agent: str = "TatetuckBot/1.0 support@tatetuck.local"
+    biopharmcatalyst_api_url: str | None = None
+    biopharmcatalyst_api_key: str | None = None
+    biopharmcatalyst_calendar_path: str | None = None
     discord_token: str | None = None
     discord_channel_id: str | None = None
     discord_trade_log_channel_id: str | None = None
@@ -61,10 +64,36 @@ class VNextSettings:
     execution_max_launch_weight_pct: float = 3.0
     execution_max_franchise_weight_pct: float = 3.0
     execution_max_floor_weight_pct: float = 1.5
+    execution_validation_min_windows: int = 4
+    execution_validation_min_rows: int = 12
+    execution_validation_min_hit_rate: float = 0.45
+    execution_validation_block_spread: float = 0.0
+    execution_validation_caution_spread: float = 0.05
+    execution_validation_caution_weight_scale: float = 0.5
+    validation_max_age_days: int = 7
     evaluation_rebalance_spacing_days: int = 21
     evaluation_min_names_per_window: int = 3
     evaluation_turnover_book_weight_floor: float = 1.0
     evaluation_max_snapshot_staleness_days: int = 120
+    rolling_validation_windows: int = 8
+    catalyst_pre_event_min_rows: int = 80
+    catalyst_pre_event_min_windows: int = 8
+    catalyst_pre_event_min_rank_ic: float = 0.0
+    catalyst_pre_event_min_net_spread: float = 0.0
+    catalyst_pre_event_min_hit_rate: float = 0.5
+    catalyst_pre_event_min_non_negative_trailing_windows: int = 2
+    catalyst_post_event_min_rows: int = 80
+    catalyst_post_event_min_windows: int = 8
+    catalyst_post_event_min_rank_ic: float = 0.0
+    catalyst_post_event_min_net_spread: float = 0.0
+    catalyst_short_min_rows: int = 40
+    catalyst_short_min_windows: int = 6
+    catalyst_short_min_rank_ic: float = 0.0
+    catalyst_short_min_net_spread: float = 0.0
+    catalyst_family_min_rows: int = 20
+    catalyst_family_min_windows: int = 6
+    catalyst_exact_timing_rate_min: float = 0.6
+    catalyst_exact_outcome_rate_min: float = 0.6
     allow_blocked_paper_trading: bool = False
     simulated_paper_equity: float = 100000.0
     execution_adv_pct_cap: float = 0.05  # max 5% of 20-day dollar ADV per order
@@ -76,6 +105,9 @@ class VNextSettings:
             store_dir=os.environ.get("TATETUCK_STORE_DIR", ".tatetuck_store"),
             eodhd_api_key=os.environ.get("EODHD_API_KEY"),
             sec_user_agent=os.environ.get("SEC_USER_AGENT", "TatetuckBot/1.0 support@tatetuck.local"),
+            biopharmcatalyst_api_url=os.environ.get("BIOPHARMCATALYST_API_URL"),
+            biopharmcatalyst_api_key=os.environ.get("BIOPHARMCATALYST_API_KEY"),
+            biopharmcatalyst_calendar_path=os.environ.get("BIOPHARMCATALYST_CALENDAR_PATH"),
             discord_token=os.environ.get("DISCORD_TOKEN") or os.environ.get("DISCORD_BOT_TOKEN"),
             discord_channel_id=os.environ.get("DISCORD_CHANNEL_ID") or os.environ.get("TATETUCK_DISCORD_CHANNEL_ID"),
             discord_trade_log_channel_id=os.environ.get("DISCORD_TRADE_LOG_CHANNEL_ID"),
@@ -131,10 +163,47 @@ class VNextSettings:
             execution_max_floor_weight_pct=float(
                 os.environ.get("TATETUCK_EXECUTION_MAX_FLOOR_WEIGHT_PCT", "1.5")
             ),
+            execution_validation_min_windows=_env_int("TATETUCK_EXECUTION_VALIDATION_MIN_WINDOWS", 4),
+            execution_validation_min_rows=_env_int("TATETUCK_EXECUTION_VALIDATION_MIN_ROWS", 12),
+            execution_validation_min_hit_rate=float(
+                os.environ.get("TATETUCK_EXECUTION_VALIDATION_MIN_HIT_RATE", "0.45")
+            ),
+            execution_validation_block_spread=float(
+                os.environ.get("TATETUCK_EXECUTION_VALIDATION_BLOCK_SPREAD", "0.0")
+            ),
+            execution_validation_caution_spread=float(
+                os.environ.get("TATETUCK_EXECUTION_VALIDATION_CAUTION_SPREAD", "0.05")
+            ),
+            execution_validation_caution_weight_scale=float(
+                os.environ.get("TATETUCK_EXECUTION_VALIDATION_CAUTION_WEIGHT_SCALE", "0.5")
+            ),
+            validation_max_age_days=_env_int("TATETUCK_VALIDATION_MAX_AGE_DAYS", 7),
             evaluation_rebalance_spacing_days=_env_int("TATETUCK_EVAL_REBALANCE_SPACING_DAYS", 21),
             evaluation_min_names_per_window=_env_int("TATETUCK_EVAL_MIN_NAMES_PER_WINDOW", 3),
             evaluation_turnover_book_weight_floor=float(os.environ.get("TATETUCK_EVAL_TURNOVER_BOOK_WEIGHT_FLOOR", "1.0")),
             evaluation_max_snapshot_staleness_days=_env_int("TATETUCK_EVAL_MAX_SNAPSHOT_STALENESS_DAYS", 120),
+            rolling_validation_windows=_env_int("TATETUCK_ROLLING_VALIDATION_WINDOWS", 8),
+            catalyst_pre_event_min_rows=_env_int("TATETUCK_CATALYST_PRE_EVENT_MIN_ROWS", 80),
+            catalyst_pre_event_min_windows=_env_int("TATETUCK_CATALYST_PRE_EVENT_MIN_WINDOWS", 8),
+            catalyst_pre_event_min_rank_ic=float(os.environ.get("TATETUCK_CATALYST_PRE_EVENT_MIN_RANK_IC", "0.0")),
+            catalyst_pre_event_min_net_spread=float(os.environ.get("TATETUCK_CATALYST_PRE_EVENT_MIN_NET_SPREAD", "0.0")),
+            catalyst_pre_event_min_hit_rate=float(os.environ.get("TATETUCK_CATALYST_PRE_EVENT_MIN_HIT_RATE", "0.5")),
+            catalyst_pre_event_min_non_negative_trailing_windows=_env_int(
+                "TATETUCK_CATALYST_PRE_EVENT_MIN_NON_NEGATIVE_TRAILING_WINDOWS",
+                2,
+            ),
+            catalyst_post_event_min_rows=_env_int("TATETUCK_CATALYST_POST_EVENT_MIN_ROWS", 80),
+            catalyst_post_event_min_windows=_env_int("TATETUCK_CATALYST_POST_EVENT_MIN_WINDOWS", 8),
+            catalyst_post_event_min_rank_ic=float(os.environ.get("TATETUCK_CATALYST_POST_EVENT_MIN_RANK_IC", "0.0")),
+            catalyst_post_event_min_net_spread=float(os.environ.get("TATETUCK_CATALYST_POST_EVENT_MIN_NET_SPREAD", "0.0")),
+            catalyst_short_min_rows=_env_int("TATETUCK_CATALYST_SHORT_MIN_ROWS", 40),
+            catalyst_short_min_windows=_env_int("TATETUCK_CATALYST_SHORT_MIN_WINDOWS", 6),
+            catalyst_short_min_rank_ic=float(os.environ.get("TATETUCK_CATALYST_SHORT_MIN_RANK_IC", "0.0")),
+            catalyst_short_min_net_spread=float(os.environ.get("TATETUCK_CATALYST_SHORT_MIN_NET_SPREAD", "0.0")),
+            catalyst_family_min_rows=_env_int("TATETUCK_CATALYST_FAMILY_MIN_ROWS", 20),
+            catalyst_family_min_windows=_env_int("TATETUCK_CATALYST_FAMILY_MIN_WINDOWS", 6),
+            catalyst_exact_timing_rate_min=float(os.environ.get("TATETUCK_CATALYST_EXACT_TIMING_RATE_MIN", "0.6")),
+            catalyst_exact_outcome_rate_min=float(os.environ.get("TATETUCK_CATALYST_EXACT_OUTCOME_RATE_MIN", "0.6")),
             allow_blocked_paper_trading=_env_flag("TATETUCK_ALLOW_BLOCKED_PAPER_TRADING", False),
             simulated_paper_equity=float(os.environ.get("TATETUCK_SIMULATED_PAPER_EQUITY", "100000.0")),
             execution_adv_pct_cap=float(os.environ.get("TATETUCK_EXECUTION_ADV_PCT_CAP", "0.05")),

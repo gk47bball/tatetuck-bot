@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import math
+import os
+import re
 
 import pandas as pd
 
 from .entities import CompanySnapshot, FeatureVector, Program
-from .market_profile import build_snapshot_profile
-from .taxonomy import event_timing_priority, event_type_bucket, event_type_priority, is_clinical_event_type
+from .graph import select_lead_trial
+from .market_profile import build_snapshot_profile, classify_company_state
+from .taxonomy import event_timing_priority, event_type_bucket, event_type_priority, is_clinical_event_type, is_synthetic_event
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -18,6 +22,12 @@ EVENT_TYPE_FEATURES = (
     "phase2_readout",
     "phase3_readout",
     "pdufa",
+    "adcom",
+    "regulatory_update",
+    "strategic_transaction",
+    "portfolio_repositioning",
+    "label_expansion",
+    "capital_allocation",
     "commercial_update",
     "earnings",
 )
@@ -26,7 +36,7 @@ EVENT_TYPE_FEATURES = (
 class FeatureEngineer:
     def build_program_features(self, snapshot: CompanySnapshot, program: Program) -> FeatureVector:
         profile = build_snapshot_profile(snapshot)
-        lead_trial = program.trials[0] if program.trials else None
+        lead_trial = select_lead_trial(program)
         enrollment = float(lead_trial.enrollment if lead_trial else 0)
         top_catalyst = program.catalyst_events[0] if program.catalyst_events else None
         company_primary_event = self._primary_company_event(snapshot)
@@ -292,33 +302,54 @@ class FeatureEngineer:
         endpoint type: OS-powered trials have ~10% CRL rate, surrogate-only
         trials have ~35% CRL rate, safety trials are not yet at approval stage.
         """
-        outcome_text = " ".join(outcomes).lower()
+        endpoint_scores = [
+            FeatureEngineer._single_endpoint_score(str(outcome or ""))
+            for outcome in outcomes
+            if str(outcome or "").strip()
+        ]
+        if not endpoint_scores:
+            return 0.40
+        if len(endpoint_scores) == 1:
+            return endpoint_scores[0]
+
+        # Co-primary designs are constrained by the weakest clinically relevant
+        # endpoint, so we do not let a single strong endpoint fully dominate.
+        weakest = min(endpoint_scores)
+        strongest = max(endpoint_scores)
+        return _clamp((0.65 * weakest) + (0.35 * strongest), 0.25, 0.90)
+
+    @staticmethod
+    def _single_endpoint_score(outcome: str) -> float:
+        outcome_text = f" {outcome.lower()} "
 
         # Hard clinical endpoints — direct patient benefit, FDA gold standard
-        if any(kw in outcome_text for kw in ("overall survival", " os ", "death from any")):
+        if "overall survival" in outcome_text or re.search(r"\bos\b", outcome_text) or "death from any" in outcome_text:
             return 0.90
-        if any(kw in outcome_text for kw in ("progression-free survival", "pfs", "event-free survival", "efs", "relapse-free")):
+        if any(
+            marker in outcome_text
+            for marker in ("progression-free survival", "event-free survival", "relapse-free", "forced vital capacity")
+        ) or re.search(r"\bpfs\b", outcome_text) or re.search(r"\befs\b", outcome_text):
             return 0.75
         # Disease-specific hard endpoints with established FDA precedent
-        if any(kw in outcome_text for kw in ("hemoglobin", "vaso-occlusive", "transfusion independence", "bleed")):
+        if any(marker in outcome_text for marker in ("hemoglobin", "vaso-occlusive", "transfusion independence", "bleed")):
             return 0.80
-        if any(kw in outcome_text for kw in ("forced expiratory", "fev1", "lung function", "forced vital capacity")):
+        if any(marker in outcome_text for marker in ("forced expiratory", "fev1", "lung function")):
             return 0.75
-        if any(kw in outcome_text for kw in ("major adverse cardiovascular", "mace", "cardiovascular death")):
+        if any(marker in outcome_text for marker in ("major adverse cardiovascular", "cardiovascular death")) or re.search(r"\bmace\b", outcome_text):
             return 0.80
         # Functional / patient-reported outcomes — FDA accepted but higher CRL risk
-        if any(kw in outcome_text for kw in ("functional independence", "activities of daily", "disability")):
+        if any(marker in outcome_text for marker in ("functional independence", "activities of daily", "disability")):
             return 0.65
         # Surrogate endpoints — approvable but vulnerable to confirmatory failure
-        if any(kw in outcome_text for kw in ("objective response", "response rate", "orr", "complete response", "partial response")):
+        if any(marker in outcome_text for marker in ("objective response", "response rate", "complete response", "partial response")) or re.search(r"\borr\b", outcome_text):
             return 0.55
-        if any(kw in outcome_text for kw in ("viral load", "hba1c", "ldl", "bone mineral density")):
+        if any(marker in outcome_text for marker in ("viral load", "hba1c", "ldl", "bone mineral density")):
             return 0.60
         # Biomarker / pharmacodynamic — typically Phase 1/2; not independently approvable
-        if any(kw in outcome_text for kw in ("pharmacokinetic", "pharmacodynamic", "biomarker", "dose-limiting")):
+        if any(marker in outcome_text for marker in ("pharmacokinetic", "pharmacodynamic", "biomarker", "dose-limiting")):
             return 0.30
         # Safety / tolerability only — Phase 1 standard; no efficacy claim
-        if any(kw in outcome_text for kw in ("safety", "adverse", "tolerability", "maximum tolerated")):
+        if any(marker in outcome_text for marker in ("safety", "adverse", "tolerability", "maximum tolerated")):
             return 0.25
 
         return 0.40  # unknown endpoint — conservative prior
@@ -371,6 +402,7 @@ class FeatureEngineer:
         return payload
 
     @staticmethod
+    @lru_cache(maxsize=512)
     def _fetch_iv_implied_move(ticker: str, catalyst_date: str | None) -> float:
         """
         Estimate the options market's implied move for the catalyst window.
@@ -385,6 +417,14 @@ class FeatureEngineer:
         conservative (buy-side) implied move estimate — appropriate since we are
         evaluating whether buying the catalyst is attractively priced.
         """
+        live_market_data_enabled = os.environ.get("TATETUCK_ENABLE_LIVE_MARKET_DATA", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not live_market_data_enabled:
+            return 0.0
         try:
             import yfinance as yf
             from datetime import date, timedelta
@@ -455,8 +495,54 @@ class FeatureEngineer:
     def _primary_company_event(snapshot: CompanySnapshot):
         if not snapshot.catalyst_events:
             return None
+        candidates = list(snapshot.catalyst_events)
+        reference_ts = pd.to_datetime(snapshot.as_of, errors="coerce", utc=True, format="mixed")
+        if not pd.isna(reference_ts):
+            reference_ts = reference_ts.tz_convert(None)
+            upcoming = []
+            for event in candidates:
+                event_ts = pd.to_datetime(event.expected_date, errors="coerce", utc=True, format="mixed")
+                if pd.isna(event_ts):
+                    continue
+                event_ts = event_ts.tz_convert(None)
+                if "T" not in str(event.expected_date or "") and len(str(event.expected_date or "")) <= 10:
+                    if event_ts.date() >= reference_ts.date():
+                        upcoming.append(event)
+                elif event_ts >= reference_ts:
+                    upcoming.append(event)
+            if upcoming:
+                candidates = upcoming
+        state = classify_company_state(snapshot)
+        if state in {"commercial_launch", "commercialized"}:
+            strategic = [
+                event
+                for event in candidates
+                if event_type_bucket(event.event_type) == "strategic"
+                and not is_synthetic_event(event.status, event.title)
+                and event.horizon_days <= 180
+            ]
+            exact_hard = [
+                event
+                for event in candidates
+                if event_type_bucket(event.event_type) in {"clinical", "regulatory"}
+                and not is_synthetic_event(event.status, event.title)
+                and event.horizon_days <= 180
+            ]
+            if strategic:
+                strategic_with_timing = [
+                    event
+                    for event in strategic
+                    if event_timing_priority(event.status, event.expected_date, event.title) >= 1
+                ]
+                candidates = strategic_with_timing or strategic
+            elif exact_hard:
+                candidates = exact_hard
+            else:
+                near_term = [event for event in candidates if event.horizon_days <= 90]
+                if near_term:
+                    candidates = near_term
         return min(
-            snapshot.catalyst_events,
+            candidates,
             key=lambda event: (
                 -event_timing_priority(event.status, event.expected_date, event.title),
                 -event_type_priority(event.event_type),

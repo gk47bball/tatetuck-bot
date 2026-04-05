@@ -33,6 +33,15 @@ def _safe_mean(values: list[float]) -> float:
     return float(sum(values) / len(values)) if values else 0.0
 
 
+def _percentile_interval(values: list[float], lower: float = 10.0, upper: float = 90.0) -> tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+    series = pd.Series(values, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+    if series.empty:
+        return 0.0, 0.0
+    return float(np.percentile(series, lower)), float(np.percentile(series, upper))
+
+
 @dataclass(slots=True)
 class WalkForwardSummary:
     num_rows: int
@@ -62,6 +71,10 @@ class WalkForwardSummary:
     state_setup_scorecards: dict[str, dict[str, float]] = field(default_factory=dict)
     factor_attribution: dict[str, dict[str, float]] = field(default_factory=dict)
     momentum_ablation: dict[str, float] = field(default_factory=dict)
+    rank_ic_ci_low: float = 0.0
+    rank_ic_ci_high: float = 0.0
+    top_bottom_spread_ci_low: float = 0.0
+    top_bottom_spread_ci_high: float = 0.0
 
 
 class WalkForwardEvaluator:
@@ -116,26 +129,41 @@ class WalkForwardEvaluator:
                     aggregate = aggregate.iloc[0:0].copy()
                 frame = pd.concat([non_aggregate, aggregate], ignore_index=True)
 
-        # Augment with failure universe to correct survivorship bias
-        try:
-            from .failure_universe import load_failure_frame
-            failure_frame = load_failure_frame()
-            if not failure_frame.empty:
-                frame = pd.concat([frame, failure_frame], ignore_index=True, sort=False)
-                frame = frame.fillna(0.0)  # fill missing feature columns with 0
-                # Normalize date columns to Timestamp so mixed str/Timestamp doesn't
-                # break downstream sort comparisons
-                for _dc in ("as_of", "evaluation_date"):
-                    if _dc in frame.columns:
-                        frame[_dc] = pd.to_datetime(frame[_dc], utc=False, errors="coerce")
-        except ImportError:
-            pass
+        # Only splice in the curated failure universe once there is enough
+        # genuine history for it to act as a bias corrector rather than dominate
+        # tiny unit-test or smoke-test datasets.
+        if self._should_augment_failure_universe(frame):
+            try:
+                from .failure_universe import load_failure_frame
+
+                failure_frame = load_failure_frame()
+                if not failure_frame.empty:
+                    frame = pd.concat([frame, failure_frame], ignore_index=True, sort=False)
+                    for column in frame.columns:
+                        if column in {"as_of", "evaluation_date"}:
+                            continue
+                        if frame[column].dtype.kind in {"b", "i", "u", "f", "c"}:
+                            frame[column] = frame[column].fillna(0.0)
+                    for _dc in ("as_of", "evaluation_date"):
+                        if _dc in frame.columns:
+                            frame[_dc] = pd.to_datetime(frame[_dc], utc=False, errors="coerce")
+            except ImportError:
+                pass
 
         self._from_failure_universe_rate = float(
             frame["meta_from_failure_universe"].fillna(False).mean()
         ) if "meta_from_failure_universe" in frame.columns else 0.0
 
         return frame
+
+    def _should_augment_failure_universe(self, frame: pd.DataFrame) -> bool:
+        if frame.empty or "ticker" not in frame.columns or "evaluation_date" not in frame.columns:
+            return False
+        num_tickers = int(frame["ticker"].nunique())
+        num_dates = int(pd.Series(frame["evaluation_date"]).dropna().nunique())
+        return num_tickers >= max(self.settings.evaluation_min_names_per_window * 3, 10) and num_dates >= max(
+            self.settings.min_walkforward_windows * 2, 6
+        )
 
     def _feature_frame_from_archived_snapshots(self) -> pd.DataFrame:
         rows: list[dict[str, object]] = []
@@ -464,6 +492,8 @@ class WalkForwardEvaluator:
             "no_momentum_rank_ic": _safe_mean(momentum_ablated_ics),
             "signal_momentum_correlation": _safe_mean(signal_momentum_corrs),
         }
+        rank_ic_ci_low, rank_ic_ci_high = _percentile_interval(rank_ics)
+        spread_ci_low, spread_ci_high = _percentile_interval(spreads)
         institutional_blockers: list[str] = []
         pm_context_coverage = _safe_mean(pm_context_coverages)
         exact_primary_event_rate = _safe_mean(exact_event_rates)
@@ -525,6 +555,10 @@ class WalkForwardEvaluator:
             state_setup_scorecards=state_setup_scorecards,
             factor_attribution=factor_attribution,
             momentum_ablation=momentum_ablation,
+            rank_ic_ci_low=rank_ic_ci_low,
+            rank_ic_ci_high=rank_ic_ci_high,
+            top_bottom_spread_ci_low=spread_ci_low,
+            top_bottom_spread_ci_high=spread_ci_high,
         )
 
     @staticmethod
@@ -552,6 +586,7 @@ class WalkForwardEvaluator:
             "hit_rate": _safe_mean([item["hit_rate"] for item in rows]),
             "top_bottom_spread": _safe_mean([item["top_bottom_spread"] for item in rows]),
             "mean_return_90d": _safe_mean([item["mean_return_90d"] for item in rows]),
+            "beta_adjusted_return": _safe_mean([item["mean_return_90d"] for item in rows]),
             "calibrated_brier": _safe_mean([item["calibrated_brier"] for item in rows]),
         }
 
@@ -666,6 +701,7 @@ class WalkForwardEvaluator:
             primary_event = None
             if snapshot is not None:
                 signal, primary_event = self._enrich_signal_context(snapshot, signal, as_of)
+            signal = self._apply_row_context_fallback(signal=signal, row=label, predictions=program_predictions)
             recommendation = self.portfolio.recommend(
                 signal,
                 previous_recommendation=previous_recommendations.get(ticker),
@@ -757,6 +793,119 @@ class WalkForwardEvaluator:
         except Exception:
             return None
 
+    @staticmethod
+    def _is_missing_value(value: object) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return not value.strip()
+        try:
+            return bool(pd.isna(value))
+        except Exception:
+            return False
+
+    @classmethod
+    def _coerce_row_str(cls, row: pd.Series, key: str) -> str | None:
+        value = row.get(key)
+        if cls._is_missing_value(value):
+            return None
+        return str(value)
+
+    @classmethod
+    def _coerce_row_float(cls, row: pd.Series, key: str) -> float | None:
+        value = row.get(key)
+        if cls._is_missing_value(value):
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if np.isnan(parsed):
+            return None
+        return parsed
+
+    @classmethod
+    def _infer_company_state_from_row(cls, row: pd.Series) -> str:
+        meta_state = cls._coerce_row_str(row, "meta_company_state")
+        if meta_state in {"pre_commercial", "commercial_launch", "commercialized"}:
+            return meta_state
+        commercialized = cls._coerce_row_float(row, "state_profile_commercialized") or 0.0
+        commercial_launch = cls._coerce_row_float(row, "state_profile_commercial_launch") or 0.0
+        if commercialized >= 0.5:
+            return "commercialized"
+        if commercial_launch >= 0.5:
+            return "commercial_launch"
+        return "pre_commercial"
+
+    @classmethod
+    def _infer_setup_type_from_row(cls, row: pd.Series, company_state: str, signal: SignalArtifact) -> str:
+        meta_setup = cls._coerce_row_str(row, "meta_setup_type")
+        if meta_setup:
+            return meta_setup
+        event_type = signal.primary_event_type or cls._coerce_row_str(row, "meta_event_type")
+        event_bucket = event_type_bucket(event_type) if event_type else signal.primary_event_bucket
+        hard_event = bool(event_type and event_type in {"phase1_readout", "phase2_readout", "phase3_readout", "pdufa", "adcom", "clinical_readout"})
+        if company_state == "pre_commercial" and event_bucket in {"clinical", "regulatory"} and hard_event:
+            return "hard_catalyst"
+        if company_state == "pre_commercial":
+            return "asymmetry_without_near_term_catalyst"
+        if event_bucket == "strategic":
+            return "capital_allocation"
+        if company_state == "commercial_launch":
+            return "launch_asymmetry"
+        if company_state == "commercialized":
+            pipeline_optionality = cls._coerce_row_float(row, "state_profile_pipeline_optionality_score") or 0.0
+            capital_deployment = cls._coerce_row_float(row, "state_profile_capital_deployment_score") or 0.0
+            if capital_deployment >= 0.55:
+                return "capital_allocation"
+            if pipeline_optionality >= 0.35:
+                return "pipeline_optionality"
+        floor_support = cls._coerce_row_float(row, "state_profile_floor_support_pct") or cls._coerce_row_float(row, "balance_sheet_floor_support_pct") or 0.0
+        momentum = cls._coerce_row_float(row, "market_flow_momentum_3mo") or 0.0
+        if momentum <= -0.12 and floor_support >= 0.20:
+            return "sentiment_floor"
+        return "watchful"
+
+    @classmethod
+    def _apply_row_context_fallback(
+        cls,
+        signal: SignalArtifact,
+        row: pd.Series,
+        predictions: list[ModelPrediction],
+    ) -> SignalArtifact:
+        if signal.company_state is None:
+            signal.company_state = cls._infer_company_state_from_row(row)
+        if signal.setup_type is None:
+            signal.setup_type = cls._infer_setup_type_from_row(row, signal.company_state or "pre_commercial", signal)
+        if signal.floor_support_pct is None:
+            signal.floor_support_pct = (
+                cls._coerce_row_float(row, "meta_floor_support_pct")
+                or cls._coerce_row_float(row, "state_profile_floor_support_pct")
+                or cls._coerce_row_float(row, "balance_sheet_floor_support_pct")
+            )
+        if signal.internal_upside_pct is None:
+            signal.internal_upside_pct = (
+                cls._coerce_row_float(row, "meta_internal_upside_pct")
+                or cls._coerce_row_float(row, "state_profile_precommercial_value_gap")
+                or 0.0
+            )
+        if signal.primary_event_type is None:
+            signal.primary_event_type = cls._coerce_row_str(row, "meta_event_type")
+            if signal.primary_event_type:
+                signal.primary_event_bucket = event_type_bucket(signal.primary_event_type)
+        if signal.primary_event_status is None:
+            signal.primary_event_status = cls._coerce_row_str(row, "meta_event_status")
+        if signal.primary_event_date is None:
+            signal.primary_event_date = cls._coerce_row_str(row, "meta_event_expected_date")
+        if signal.primary_event_type is None and predictions:
+            for pred in predictions:
+                event_type = pred.metadata.get("event_type")
+                if not cls._is_missing_value(event_type):
+                    signal.primary_event_type = str(event_type)
+                    signal.primary_event_bucket = event_type_bucket(signal.primary_event_type)
+                    break
+        return signal
+
     def _enrich_signal_context(self, snapshot, signal: SignalArtifact, as_of: pd.Timestamp) -> tuple[SignalArtifact, object]:
         company_state = classify_company_state(snapshot)
         signal.company_state = company_state
@@ -770,6 +919,22 @@ class WalkForwardEvaluator:
         )
         signal.internal_upside_pct = float(expectation_lens["internal_upside_pct"])
         signal.floor_support_pct = float(expectation_lens["floor_support_pct"])
+        if primary_event is not None:
+            signal.primary_event_type = primary_event.event_type
+            signal.primary_event_bucket = event_type_bucket(primary_event.event_type, primary_event.title)
+            signal.primary_event_status = primary_event.status
+            signal.primary_event_date = primary_event.expected_date
+            signal.primary_event_exact = bool(
+                event_timing_priority(primary_event.status, primary_event.expected_date, primary_event.title) >= 2
+            )
+            signal.primary_event_synthetic = is_synthetic_event(primary_event.status, primary_event.title)
+            signal.primary_event_source = getattr(primary_event, "source", None)
+            if primary_event.horizon_days <= 45:
+                signal.thesis_horizon = "30d"
+            elif primary_event.horizon_days <= 120:
+                signal.thesis_horizon = "90d"
+            else:
+                signal.thesis_horizon = "180d"
         return signal, primary_event
 
     @staticmethod

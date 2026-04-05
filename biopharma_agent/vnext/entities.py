@@ -58,6 +58,9 @@ class CatalystEvent:
     importance: float
     crowdedness: float
     status: str = "anticipated"
+    source: str = ""
+    timing_exact: bool = False
+    timing_synthetic: bool = False
 
 
 @dataclass(slots=True)
@@ -180,6 +183,11 @@ class SignalArtifact:
     supporting_evidence: list[EvidenceSnippet] = field(default_factory=list)
     primary_event_type: str | None = None
     primary_event_bucket: str | None = None
+    primary_event_status: str | None = None
+    primary_event_date: str | None = None
+    primary_event_exact: bool | None = None
+    primary_event_synthetic: bool | None = None
+    primary_event_source: str | None = None
     company_state: str | None = None
     setup_type: str | None = None
     internal_value: float | None = None
@@ -210,6 +218,11 @@ class SignalArtifact:
             "supporting_evidence": [asdict(item) for item in self.supporting_evidence],
             "supporting_evidence_count": len(self.supporting_evidence),
             "program_prediction_count": len(self.program_predictions),
+            "primary_event_status": self.primary_event_status,
+            "primary_event_date": self.primary_event_date,
+            "primary_event_exact": self.primary_event_exact,
+            "primary_event_synthetic": self.primary_event_synthetic,
+            "primary_event_source": self.primary_event_source,
         }
 
 

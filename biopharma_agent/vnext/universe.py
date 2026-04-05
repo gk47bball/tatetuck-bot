@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 
 import pandas as pd
 
@@ -55,13 +56,9 @@ class UniverseResolver:
         return fallback
 
     def archived_scored_universe(self, limit: int = 0) -> list[tuple[str, str]]:
-        snapshots = self.store.read_table("company_snapshots")
-        if snapshots.empty:
+        latest = self._archived_snapshot_frame()
+        if latest.empty:
             return []
-        latest = snapshots.sort_values("as_of").drop_duplicates(subset=["ticker"], keep="last").copy()
-        latest["num_catalysts"] = pd.to_numeric(latest.get("num_catalysts"), errors="coerce").fillna(0.0)
-        latest["market_cap"] = pd.to_numeric(latest.get("market_cap"), errors="coerce").fillna(0.0)
-        latest["revenue"] = pd.to_numeric(latest.get("revenue"), errors="coerce").fillna(0.0)
         latest["archive_score"] = (
             latest["num_catalysts"] * 3.0
             + (latest["revenue"] > 0.0).astype(float)
@@ -75,6 +72,45 @@ class UniverseResolver:
         if limit and limit > 0:
             return rows[:limit]
         return rows
+
+    def _archived_snapshot_frame(self) -> pd.DataFrame:
+        latest_by_ticker: dict[str, dict[str, object]] = {}
+        for path in self.store.list_raw_payload_paths("snapshots"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            ticker = str(payload.get("ticker") or "").upper()
+            if not ticker:
+                continue
+            as_of_ts = pd.to_datetime(payload.get("as_of"), errors="coerce", utc=True, format="mixed")
+            if pd.isna(as_of_ts):
+                continue
+            as_of_ts = as_of_ts.tz_convert(None)
+            existing = latest_by_ticker.get(ticker)
+            if existing is not None and as_of_ts <= existing["as_of_ts"]:
+                continue
+            latest_by_ticker[ticker] = {
+                "ticker": ticker,
+                "company_name": str(payload.get("company_name") or ticker),
+                "as_of": payload.get("as_of"),
+                "as_of_ts": as_of_ts,
+                "num_catalysts": float(len(payload.get("catalyst_events") or [])),
+                "market_cap": float(payload.get("market_cap") or 0.0),
+                "revenue": float(payload.get("revenue") or 0.0),
+            }
+
+        if latest_by_ticker:
+            return pd.DataFrame(latest_by_ticker.values()).sort_values("as_of_ts")
+
+        snapshots = self.store.read_table("company_snapshots")
+        if snapshots.empty:
+            return pd.DataFrame()
+        latest = snapshots.sort_values("as_of").drop_duplicates(subset=["ticker"], keep="last").copy()
+        latest["num_catalysts"] = pd.to_numeric(latest.get("num_catalysts"), errors="coerce").fillna(0.0)
+        latest["market_cap"] = pd.to_numeric(latest.get("market_cap"), errors="coerce").fillna(0.0)
+        latest["revenue"] = pd.to_numeric(latest.get("revenue"), errors="coerce").fillna(0.0)
+        return latest
 
     def live_biopharma_candidates(self, limit: int = 0) -> list[tuple[str, str]]:
         membership = self.store.read_table("universe_membership")

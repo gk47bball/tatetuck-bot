@@ -147,7 +147,11 @@ class EventDrivenEnsemble:
         if frame.empty or not required.issubset(frame.columns):
             return None
         usable = frame.dropna(subset=["target_return_90d", "target_catalyst_success"])
-        if len(usable) < 30:
+        # Walk-forward windows and unit-test fixtures can be materially smaller
+        # than the full production training set. Keep a floor so we still reject
+        # toy samples, but do not hard-fail medium-sized windows that are large
+        # enough to fit a simple ridge model.
+        if len(usable) < 20:
             return None
 
         # Prefer benchmark-relative alpha as the regression target when it is

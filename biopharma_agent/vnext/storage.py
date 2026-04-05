@@ -47,17 +47,19 @@ class LocalResearchStore:
         if not target.exists():
             return None
         safe_prefix = key_prefix.replace("/", "_")
-        candidates = sorted(
-            target.glob(f"{safe_prefix}*.json"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        for path in candidates:
+        candidates: list[tuple[pd.Timestamp, float, Any]] = []
+        for path in target.glob(f"{safe_prefix}*.json"):
             try:
                 with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    payload = json.load(f)
             except (OSError, json.JSONDecodeError):
                 continue
+            logical_ts = self._raw_payload_timestamp(payload, path)
+            candidates.append((logical_ts, path.stat().st_mtime, payload))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return candidates[0][2]
         return None
 
     def list_raw_payload_paths(self, namespace: str, key_prefix: str | None = None) -> list[Path]:
@@ -66,6 +68,38 @@ class LocalResearchStore:
             return []
         pattern = "*.json" if not key_prefix else f"{key_prefix.replace('/', '_')}*.json"
         return sorted(target.glob(pattern))
+
+    @staticmethod
+    def _raw_payload_timestamp(payload: Any, path: Path) -> pd.Timestamp:
+        candidates: list[Any] = []
+        if isinstance(payload, dict):
+            candidates.extend(
+                [
+                    payload.get("as_of"),
+                    payload.get("captured_at"),
+                    payload.get("created_at"),
+                    payload.get("evaluated_at"),
+                    payload.get("finished_at"),
+                    payload.get("started_at"),
+                    payload.get("event_timestamp"),
+                    payload.get("date"),
+                ]
+            )
+            metadata = payload.get("metadata")
+            if isinstance(metadata, dict):
+                candidates.extend(
+                    [
+                        metadata.get("as_of"),
+                        metadata.get("captured_at"),
+                        metadata.get("created_at"),
+                    ]
+                )
+        for value in candidates:
+            ts = pd.to_datetime(value, errors="coerce", utc=True, format="mixed")
+            if pd.isna(ts):
+                continue
+            return ts.tz_convert(None)
+        return pd.Timestamp.fromtimestamp(path.stat().st_mtime)
 
     def append_records(self, table_name: str, rows: Iterable[dict[str, Any]]) -> Path:
         rows = list(rows)
@@ -246,6 +280,18 @@ class LocalResearchStore:
 
     def write_event_labels(self, rows: Iterable[dict[str, Any]]) -> Path:
         return self.replace_table("event_labels", rows)
+
+    def write_catalyst_event_master(self, rows: Iterable[dict[str, Any]]) -> Path:
+        return self.replace_table("catalyst_event_master", rows)
+
+    def write_catalyst_outcome_master(self, rows: Iterable[dict[str, Any]]) -> Path:
+        return self.replace_table("catalyst_outcome_master", rows)
+
+    def write_catalyst_trade_labels(self, rows: Iterable[dict[str, Any]]) -> Path:
+        return self.replace_table("catalyst_trade_labels", rows)
+
+    def write_catalyst_review_queue(self, rows: Iterable[dict[str, Any]]) -> Path:
+        return self.replace_table("catalyst_review_queue", rows)
 
     def write_pipeline_run(self, row: dict[str, Any]) -> Path:
         return self.append_records("pipeline_runs", [row])
